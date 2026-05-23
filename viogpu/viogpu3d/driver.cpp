@@ -649,10 +649,50 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
 
                 return STATUS_SUCCESS;
             }
+        case DXGK_OPERATION_TRANSFER:
+            {
+                // virtio-gpu has no general guest<->guest aperture
+                // transfer; eviction-time TRANSFER would need the
+                // ATTACH/DETACH_BACKING + host transfer plumbing that
+                // does not exist yet. Returning NOT_SUPPORTED makes
+                // the scheduler treat the eviction as fatal, so as
+                // a stopgap report success: the destination pages
+                // will be served zero-initialised at the next attach
+                // and we lose the original content rather than
+                // wedging the scheduler.
+                DbgPrint(TRACE_LEVEL_WARNING,
+                         ("<--- %s (transfer, content lost)\n", __FUNCTION__));
+                return STATUS_SUCCESS;
+            }
+        case DXGK_OPERATION_READ_PHYSICAL:
+        case DXGK_OPERATION_WRITE_PHYSICAL:
+            {
+                // Read / write of a physical page through the
+                // adapter is used by the scheduler for diagnostic
+                // access; no virtio-gpu equivalent. Report success
+                // so the diagnostic does not abort the scheduler.
+                DbgPrint(TRACE_LEVEL_WARNING,
+                         ("<--- %s (rw_physical op=%d, no-op)\n",
+                          __FUNCTION__, pBuildPagingBuffer->Operation));
+                return STATUS_SUCCESS;
+            }
+        case DXGK_OPERATION_SIGNAL_MONITORED_FENCE:
+            {
+                // The fence-signal operations are paged through the
+                // DMA buffer in some scheduler paths; we don't track
+                // them but the scheduler does. SUCCESS keeps the
+                // pipeline moving; the fence itself is still managed
+                // by the normal submit path.
+                DbgPrint(TRACE_LEVEL_VERBOSE,
+                         ("<--- %s (fence op=%d, deferred to submit path)\n",
+                          __FUNCTION__, pBuildPagingBuffer->Operation));
+                return STATUS_SUCCESS;
+            }
         default:
             {
-                DbgPrint(TRACE_LEVEL_ERROR,
-                         ("<--- %s (unknown operation %d)\n", __FUNCTION__, pBuildPagingBuffer->Operation));
+                DbgPrint(TRACE_LEVEL_WARNING,
+                         ("<--- %s unhandled operation=%d\n",
+                          __FUNCTION__, pBuildPagingBuffer->Operation));
                 return STATUS_NOT_SUPPORTED;
             }
     };
