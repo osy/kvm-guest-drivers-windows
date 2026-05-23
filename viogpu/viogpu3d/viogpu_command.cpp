@@ -15,6 +15,7 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
     m_pDevice = NULL;
 
     m_FenceId = 0;
+    m_NullRendering = FALSE;
     m_pDmaBuffer = NULL;
     m_pCommand = NULL;
     m_pEnd = NULL;
@@ -37,6 +38,14 @@ void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
         m_pEnd = (char *)m_pDmaBuffer + pSubmitCommand->DmaBufferSubmissionEndOffset;
     }
     m_pDevice = VioGpuDevice::FromHandle(pSubmitCommand->hContext);
+
+    // Capture the only submit flag we react to. Paging / ContextSwitch /
+    // Flip can legitimately arrive with an empty DMA range; Run() falls
+    // through to the fence-completion arm in that case, so they need
+    // no special handling. NullRendering does need to short-circuit so
+    // the runtime's submission-overhead profiling does not actually
+    // execute the body.
+    m_NullRendering = pSubmitCommand->Flags.NullRendering ? TRUE : FALSE;
 }
 
 #pragma code_seg(pop)
@@ -47,6 +56,18 @@ void VioGpuCommand::Run()
 {
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
+    if (m_NullRendering)
+    {
+        // The runtime asked us to simulate insertion of the DMA buffer
+        // without executing its body. Skip straight to the fence
+        // completion at `end:` so the submission is timed without the
+        // host running anything.
+        DbgPrint(TRACE_LEVEL_VERBOSE,
+                 ("<---> %s fence_id=%d NullRendering: skipping body\n",
+                  __FUNCTION__, m_FenceId));
+        goto end;
+    }
 
     while (m_pCommand < m_pEnd)
     {

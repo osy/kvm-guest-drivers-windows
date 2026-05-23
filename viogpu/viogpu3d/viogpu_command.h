@@ -39,6 +39,10 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     UINT m_allocationsLength;
 
     UINT m_FenceId;
+    // DXGK_SUBMITCOMMANDFLAGS.NullRendering: the runtime is timing
+    // the submission path itself (profiling) and wants the fence to
+    // complete without executing the DMA body.
+    BOOLEAN m_NullRendering;
 
     char *m_pDmaBuffer;
     char *m_pCommand;
