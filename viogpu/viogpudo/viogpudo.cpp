@@ -3592,6 +3592,25 @@ VOID VioGpuAdapter::DpcRoutine(_In_ PDXGKRNL_INTERFACE pDxgkInterface)
                 PGPU_CTRL_HDR pcmd = (PGPU_CTRL_HDR)pvbuf->buf;
                 PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)pvbuf->resp_buf;
 
+                // resp_buf should never be NULL in normal flow but
+                // guard before dereferencing -- a malformed vbuf
+                // without a response would NULL-deref below.
+                if (!resp)
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR,
+                             ("<--> %s pvbuf=%p has no resp_buf for cmd_type=0x%x\n",
+                              __FUNCTION__, pvbuf, pcmd ? pcmd->type : 0));
+                    if (pvbuf->complete_cb != NULL)
+                    {
+                        pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, NULL);
+                    }
+                    if (pvbuf->auto_release)
+                    {
+                        m_CtrlQueue.ReleaseBuffer(pvbuf);
+                    }
+                    continue;
+                }
+
                 if (resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC)
                 {
                     DbgPrint(TRACE_LEVEL_FATAL, ("!!!!! Command failed %d", resp->type));

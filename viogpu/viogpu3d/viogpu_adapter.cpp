@@ -980,21 +980,26 @@ VOID VioGpuAdapter::DpcRoutine(VOID)
                 PGPU_CTRL_HDR pcmd = (PGPU_CTRL_HDR)pvbuf->buf;
                 PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)pvbuf->resp_buf;
 
-                /*if (pcmd->type == VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB)
+                // resp_buf is allocated in GetBuf alongside the vbuf,
+                // so in normal flow it's never NULL -- but defensive:
+                // a vbuf rebuilt without a response (zero resp_size)
+                // would land here with resp == NULL, and the error
+                // check below would deref it.
+                if (!resp)
                 {
-                    PGPU_RES_CREATE_BLOB blob_req = (PGPU_RES_CREATE_BLOB)pvbuf->buf;
-                    DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s ctrlQueue res_id=%d create blob fence_id=%llu\n", __FUNCTION__, blob_req->resource_id, resp->fence_id));
+                    DbgPrint(TRACE_LEVEL_ERROR,
+                             ("<--> %s pvbuf=%p has no resp_buf for cmd_type=0x%x\n",
+                              __FUNCTION__, pvbuf, pcmd ? pcmd->type : 0));
+                    if (pvbuf->complete_cb != NULL)
+                    {
+                        pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, NULL);
+                    }
+                    if (pvbuf->auto_release)
+                    {
+                        ctrlQueue.ReleaseBuffer(pvbuf);
+                    }
+                    continue;
                 }
-                else if(pcmd->type == VIRTIO_GPU_CMD_RESOURCE_UNREF)
-                {
-                    PGPU_RES_UNREF unref_req = (PGPU_RES_UNREF)pvbuf->buf;
-                    DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s ctrlQueue res_id=%d unref resource fence_id=%llu\n", __FUNCTION__, unref_req->resource_id, resp->fence_id));
-                }
-                else if (pcmd->type == VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB)
-                {
-                    PGPU_RESP_MAP_INFO map_resp = (PGPU_RESP_MAP_INFO)pvbuf->resp_buf;
-                    DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s ctrlQueue pvbuf = %p len = %d fence_id=%llu blob mapped as %u\n", __FUNCTION__, pvbuf, len, map_resp->hdr.fence_id, map_resp->map_info));
-                }*/
 
                 if (resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC)
                 {
@@ -1013,6 +1018,15 @@ VOID VioGpuAdapter::DpcRoutine(VOID)
                     {
                         DbgPrint(TRACE_LEVEL_FATAL, ("!!!!! Command %x failed: %x\n", pcmd->type, resp->type));
                     }
+                    // The completion callback fires unconditionally
+                    // below: callbacks that care about host-side
+                    // failure (Ask*/Create*) must inspect resp->type
+                    // before treating the call as successful. The
+                    // command-submission path (QueueRunningCb) does
+                    // not yet surface the error to DXGK; without the
+                    // per-fence tracking that lives in the venus
+                    // backend, the fence still completes from DXGK's
+                    // point of view.
                 }
                 if (resp->type != VIRTIO_GPU_RESP_OK_NODATA)
                 {
