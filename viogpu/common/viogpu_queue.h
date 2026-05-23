@@ -186,8 +186,11 @@ class VioGpuQueue
                _In_opt_ void *va_indirect,
                _In_ ULONGLONG phys_indirect)
     {
+        // Return -1 on a closed queue so callers can distinguish it
+        // from success: virtqueue_add_buf returns the number of free
+        // descriptors remaining (>= 0) on success.
         return m_pVirtQueue ? virtqueue_add_buf(m_pVirtQueue, sg, out_num, in_num, data, va_indirect, phys_indirect)
-                            : 0;
+                            : -1;
     }
     void *GetBuf(_Out_ UINT *len)
     {
