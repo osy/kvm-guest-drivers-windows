@@ -44,11 +44,6 @@ static BOOLEAN BuildSGElement(VirtIOBufferDescriptor *sg, PVOID buf, ULONG size)
     return FALSE;
 }
 
-static void NotifyEventCompleteCB(void *ctx, void *, void *)
-{
-    KeSetEvent((PKEVENT)ctx, IO_NO_INCREMENT, FALSE);
-}
-
 //
 // Heap-allocated wait context used by synchronous Ask* helpers. A stack
 // KEVENT lets the DPC dereference a returned-stack address after the
@@ -670,27 +665,35 @@ bool CtrlQueue::CreateResourceBlob(UINT res_id, UINT ctx_id, VIOGPU_RESOURCE_BLO
     // TODO
     cmd->nr_entries = 0;
 
-    KEVENT event;
     NTSTATUS status;
-    KeInitializeEvent(&event, NotificationEvent, FALSE);
-    vbuf->complete_cb = NotifyEventCompleteCB;
-    vbuf->complete_ctx = &event;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
     vbuf->auto_release = false;
 
     LARGE_INTEGER timeout = {0};
     timeout.QuadPart = Int32x32To64(1000, -10000);
 
-    // FIXME!!! if
     QueueBuffer(vbuf);
 
-    status = KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, &timeout);
+    status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
 
     if (status == STATUS_TIMEOUT)
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to create blob (timeout)\n"));
-        VioGpuDbgBreak();
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out res_id=0x%x\n", __FUNCTION__, res_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
         return FALSE;
     }
+
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
 
     PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
 
