@@ -10,10 +10,24 @@ class VioGpuContext;
 class VioGpuAllocation;
 class VioGpuCommander;
 
+// Lifetime invariant: VioGpuCommand passes `this` as the complete_ctx
+// of SubmitCommand / TransferHostCmd / MapBlob / UnmapBlob, which the
+// host responds to from a DPC. The object must outlive every such
+// in-flight callback.
+//
+// In the current flow this holds because Run() is the only path that
+// frees the object (the `end:` arm) and Run() is only re-entered via
+// QueueRunningCb -> QueueRunning -> commander queue -> Run(), so a
+// cmd that submitted is never deleted while its callback is in flight.
+// AddPending / DropPending track outstanding async submissions and the
+// dtor asserts the count is zero -- a future change that frees a cmd
+// from another path would trip the assert before the host's DPC could
+// dereference freed memory.
 class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
 {
   public:
     VioGpuCommand(VioGpuAdapter *adapter);
+    ~VioGpuCommand();
 
     void Run();
 
@@ -43,6 +57,13 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     // the submission path itself (profiling) and wants the fence to
     // complete without executing the DMA body.
     BOOLEAN m_NullRendering;
+
+    // Outstanding async submissions where `this` is the complete_ctx.
+    // Tracked so the dtor can assert no callback is still pending.
+    volatile LONG m_pendingCallbacks;
+
+    void AddPending();
+    void DropPending();
 
     char *m_pDmaBuffer;
     char *m_pCommand;

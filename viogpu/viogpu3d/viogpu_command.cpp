@@ -16,6 +16,7 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
 
     m_FenceId = 0;
     m_NullRendering = FALSE;
+    m_pendingCallbacks = 0;
     m_pDmaBuffer = NULL;
     m_pCommand = NULL;
     m_pEnd = NULL;
@@ -26,6 +27,44 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
     list_entry.Blink = NULL;
     list_entry.Flink = NULL;
 };
+
+VioGpuCommand::~VioGpuCommand()
+{
+    // Tripping this means a cmd was freed while a queue completion
+    // callback was still going to dereference `this`. In the current
+    // code the only delete path is Run() -> `end:`, reached only when
+    // the body is fully drained and the last submit's callback has
+    // already fired and re-queued the cmd onto the running list --
+    // so the count must be zero. A future caller that frees the cmd
+    // from a different path (an error tearing down a partially-
+    // submitted command) would need to wait for outstanding callbacks
+    // first.
+    LONG pending = m_pendingCallbacks;
+    if (pending != 0)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s cmd=%p destroyed with %d outstanding callbacks\n",
+                  __FUNCTION__, this, pending));
+        ASSERT(pending == 0);
+    }
+}
+
+void VioGpuCommand::AddPending()
+{
+    InterlockedIncrement(&m_pendingCallbacks);
+}
+
+void VioGpuCommand::DropPending()
+{
+    LONG remaining = InterlockedDecrement(&m_pendingCallbacks);
+    if (remaining < 0)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("%s cmd=%p pending underflow %d\n",
+                  __FUNCTION__, this, remaining));
+        InterlockedExchange(&m_pendingCallbacks, 0);
+    }
+}
 
 void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
 {
@@ -96,6 +135,7 @@ void VioGpuCommand::Run()
                     }
                     RtlCopyMemory(submitCmd, cmdBody, cmdHdr->size);
 
+                    AddPending();
                     m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
                                                         cmdHdr->size,
                                                         (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
@@ -111,6 +151,7 @@ void VioGpuCommand::Run()
                 {
                     VIOGPU_TRANSFER_CMD *transferCmd = (VIOGPU_TRANSFER_CMD *)cmdBody;
 
+                    AddPending();
                     m_pAdapter->ctrlQueue.TransferHostCmd(cmdHdr->type == VIOGPU_CMD_TRANSFER_TO_HOST,
                                                           (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
                                                           false,
@@ -158,11 +199,19 @@ void VioGpuCommand::Run()
 
                         if (cmdHdr->type == VIOGPU_CMD_MAP_BLOB && !allocation->IsMapped()) {
                             DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s fence_id=%d running map blob res_id=%d\n", __FUNCTION__, m_FenceId, allocation->GetId()));
+                            if (i == num_maps - 1)
+                            {
+                                AddPending();
+                            }
                             allocation->MapBlob(m_pDevice->m_Context.GetId(),
                                                 i == num_maps - 1 ? VioGpuCommand::QueueRunningCb : NULL,
                                                 i == num_maps - 1 ? this : NULL);
                         } else if (cmdHdr->type == VIOGPU_CMD_UNMAP_BLOB && allocation->IsMapped()) {
                             DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s fence_id=%d running unmap blob res_id=%d\n", __FUNCTION__, m_FenceId, allocation->GetId()));
+                            if (i == num_maps - 1)
+                            {
+                                AddPending();
+                            }
                             allocation->UnmapBlob(m_pDevice->m_Context.GetId(),
                                                 i == num_maps - 1 ? VioGpuCommand::QueueRunningCb : NULL,
                                                 i == num_maps - 1 ? this : NULL);
@@ -249,7 +298,16 @@ void VioGpuCommand::QueueRunning()
 
 void VioGpuCommand::QueueRunningCb(void *cmd, void *, void *)
 {
-    ((VioGpuCommand *)cmd)->QueueRunning();
+    VioGpuCommand *self = (VioGpuCommand *)cmd;
+    // Pair with the AddPending() that ran before the matching submit.
+    // The order is important: drop first, then queue, so the dtor's
+    // assertion can't observe a transient non-zero count if Run() on
+    // the commander thread races ahead to `end:`. In the current
+    // single-runner design the race can't happen (the cmd has to be
+    // dequeued and re-Run before it can hit `end:`), but the order
+    // is the right invariant either way.
+    self->DropPending();
+    self->QueueRunning();
 }
 
 #pragma code_seg(pop)
