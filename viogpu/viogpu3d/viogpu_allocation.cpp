@@ -130,6 +130,12 @@ void NotifyResourceDestroyed(void *ctx, void *cmd, void *)
 
 VioGpuAllocation::~VioGpuAllocation(void)
 {
+    // m_DeviceAllocations.clear() invokes ~VioGpuDeviceAllocation, which is
+    // PAGED_CODE(). Any caller that drops the last ref from IRQL >=
+    // DISPATCH_LEVEL must funnel through ReleaseDeferred so the destructor
+    // lands here at PASSIVE_LEVEL.
+    PAGED_CODE();
+
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d IsBlob=%d alloc=%p size=%zu\n", __FUNCTION__, m_Id, m_IsBlob, this, m_DeviceAllocations.size()));
 
     if (m_deferReleaseItem)
