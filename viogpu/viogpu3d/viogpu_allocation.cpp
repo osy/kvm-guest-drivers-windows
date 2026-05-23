@@ -232,6 +232,10 @@ VOID VioGpuAllocation::MapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, 
 
     if (!m_IsBlob) return;
 
+    // m_Blob.Mapped is mutated under m_Lock by MapBlobLocked /
+    // UnmapBlobLocked, so the already-mapped check must run under
+    // the same lock to avoid racing a concurrent unmap into a stale
+    // skip-the-map decision.
     auto lock_guard = LockGuard();
     if (m_Blob.Mapped) return;
     MapBlobLocked(ctx_id, complete_cb, complete_ctx);
