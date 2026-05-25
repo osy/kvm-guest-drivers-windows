@@ -327,6 +327,7 @@ typedef struct virtio_gpu_cmd_get_capset_info
 #define VIRTIO_GPU_CAPSET_GFXSTREAM    3
 #define VIRTIO_GPU_CAPSET_VENUS        4
 #define VIRTIO_GPU_CAPSET_CROSS_DOMAIN 5
+#define VIRTIO_GPU_CAPSET_NEPTUNE      7
 #pragma pack(1)
 typedef struct virtio_gpu_resp_capset_info
 {

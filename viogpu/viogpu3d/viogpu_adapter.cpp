@@ -853,7 +853,8 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 }
                 pDevice->m_Context.Init(&pVioGpuEscape->CtxInit);
 
-                if (pVioGpuEscape->CtxInit.CapsetID == VIRTIO_GPU_CAPSET_VENUS)
+                if (pVioGpuEscape->CtxInit.CapsetID == VIRTIO_GPU_CAPSET_VENUS ||
+                    pVioGpuEscape->CtxInit.CapsetID == VIRTIO_GPU_CAPSET_NEPTUNE)
                 {
                     bool has_virgl  = !!(m_supportedCapsetIDs & (1llu << VIRTIO_GPU_CAPSET_VIRGL));
                     bool has_virgl2 = !!(m_supportedCapsetIDs & (1llu << VIRTIO_GPU_CAPSET_VIRGL2));
