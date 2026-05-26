@@ -53,6 +53,13 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     UINT m_allocationsLength;
 
     UINT m_FenceId;
+    // The node/engine dxgkrnl submitted this DMA buffer on. The
+    // DMA_COMPLETED interrupt must report these back unchanged so the
+    // scheduler matches the completion to the right engine; reporting a
+    // fixed 0/0 strands submissions on any non-zero engine and the
+    // scheduler eventually declares the engine hung (TDR).
+    UINT m_NodeOrdinal;
+    UINT m_EngineOrdinal;
     // DXGK_SUBMITCOMMANDFLAGS.NullRendering: the runtime is timing
     // the submission path itself (profiling) and wants the fence to
     // complete without executing the DMA body.

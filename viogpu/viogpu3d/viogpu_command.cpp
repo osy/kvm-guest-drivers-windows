@@ -15,6 +15,8 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
     m_pDevice = NULL;
 
     m_FenceId = 0;
+    m_NodeOrdinal = 0;
+    m_EngineOrdinal = 0;
     m_NullRendering = FALSE;
     m_pendingCallbacks = 0;
     m_pDmaBuffer = NULL;
@@ -73,6 +75,8 @@ void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
 
     m_FenceId = pSubmitCommand->SubmissionFenceId;
+    m_NodeOrdinal = pSubmitCommand->NodeOrdinal;
+    m_EngineOrdinal = pSubmitCommand->EngineOrdinal;
     if (m_pDmaBuffer)
     {
         m_pCommand = (char *)m_pDmaBuffer + pSubmitCommand->DmaBufferSubmissionStartOffset;
@@ -268,11 +272,11 @@ end:
         delete m_allocations;
     }
 
-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt;
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
     interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
     interrupt.DmaCompleted.SubmissionFenceId = m_FenceId;
-    interrupt.DmaCompleted.NodeOrdinal = 0;
-    interrupt.DmaCompleted.EngineOrdinal = 0;
+    interrupt.DmaCompleted.NodeOrdinal = m_NodeOrdinal;
+    interrupt.DmaCompleted.EngineOrdinal = m_EngineOrdinal;
     m_pAdapter->NotifyInterrupt(&interrupt, true);
 
     m_pCommander->CommandFinished();

@@ -2042,7 +2042,7 @@ void VioGpuVidPN::Flip()
             res->Release();
         }
     }
-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt;
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
     interrupt.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
 
     interrupt.CrtcVsync.VidPnTargetId = 0;
@@ -2122,6 +2122,7 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
     }
 
     InterlockedOr(&m_shouldFlip, 1);
+
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d isBlob=%d, vidPnSrcId=%d, duration=%lld\n",
                                    __FUNCTION__,
