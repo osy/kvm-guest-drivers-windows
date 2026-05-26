@@ -505,7 +505,7 @@
       <PackageRelativeDirectory>
       </PackageRelativeDirectory>
     </FilesToPackage>
-    <FilesToPackage Include="$(MESA_PREFIX)\bin\viogpu_d3d10.dll">
+    <FilesToPackage Include="$(MESA_PREFIX)\bin\neptune_umd.dll">
       <PackageRelativeDirectory>
       </PackageRelativeDirectory>
     </FilesToPackage>
@@ -517,7 +517,7 @@
     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.pdb" />
     <PackOne_Files Include="$(ProjectDir)icd\virtio_icd.json" />
     <PackOne_Files Include="$(MESA_PREFIX)\bin\vulkan_virtio.dll" />
-    <PackOne_Files Include="$(MESA_PREFIX)\bin\viogpu_d3d10.dll" />
+    <PackOne_Files Include="$(MESA_PREFIX)\bin\neptune_umd.dll" />
   </ItemGroup>
   <Target Name="UpdateVulkanIcdJsons" BeforeTargets="PrepareForBuild" Condition="'$(MESA_PREFIX)' != '' AND Exists('$(ProjectDir)tools\update_icd_jsons.ps1')">
     <Message Text="Updating Vulkan ICD JSONs from $(MESA_PREFIX)" Importance="High" />

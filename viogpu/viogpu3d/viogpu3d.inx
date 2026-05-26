@@ -26,7 +26,7 @@ VioGpu3D_Files.Usermode = 13 ; DriverStore
 
 [SourceDisksFiles]
 viogpu3d.sys = 1,,f
-viogpu_d3d10.dll = 1,,
+neptune_umd.dll = 1,,
 ;viogpu_wgl.dll = 1,,
 z.dll = 1,,
 virtio_icd.json = 1,,
@@ -42,7 +42,7 @@ vulkan_virtio.dll = 1,,
 viogpu3d.sys,,,2
 
 [VioGpu3D_Files.Usermode]
-viogpu_d3d10.dll,,,0
+neptune_umd.dll,,,0
 ;viogpu_wgl.dll,,,0
 ;z.dll,,,0
 vulkan_virtio.dll,,,0
@@ -79,7 +79,7 @@ HKR,,TypesSupported,%REG_DWORD%,7
 HKR,, HWCursor,                    %REG_DWORD%, 0
 HKR,, FlexResolution,              %REG_DWORD%, 1
 HKR,, UsePhysicalMemory,           %REG_DWORD%, 0
-HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll,%13%\viogpu_d3d10.dll
+HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\neptune_umd.dll,%13%\neptune_umd.dll,%13%\neptune_umd.dll,%13%\neptune_umd.dll
 HKR,, VulkanDriverName,            %REG_SZ%,       %13%\virtio_icd.json
 
 HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,%REG_DWORD%,0
