@@ -485,6 +485,7 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
 
     DXGK_ALLOCATIONINFO *allocationInfo = pCreateAllocation->pAllocationInfo;
 
+
     if (max(allocationInfo->PrivateDriverDataSize, pCreateAllocation->PrivateDriverDataSize) <
         sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE))
     {
@@ -569,16 +570,22 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             }
             else
             {
-                // Use segment 2 as the eviction aperture for blob allocations.
-                // EvictionSegmentSet=0 routes VidMm through the direct-transfer
-                // path, which BuildPagingBuffer here doesn't implement, so shmem
-                // would never free.
-                allocationInfo->EvictionSegmentSet = 0b10;
+                // EvictionSegmentSet lists the segments an allocation may be
+                // evicted TO, which must be aperture/system memory. Segment 2
+                // is the non-aperture host shmem BAR (the residence, not an
+                // eviction target); naming it here is invalid and the video
+                // memory manager rejects the allocation (STATUS_INVALID_-
+                // PARAMETER). Leave it 0, matching the guest-blob branch:
+                // these host-backed BAR blobs are effectively pinned.
                 allocationInfo->PreferredSegment.SegmentId0 = 2;
                 allocationInfo->PreferredSegment.Direction0 = 0;
                 allocationInfo->Flags.CpuVisible = !!(resourceExchange->OptionsBlob.blob_flags & VIOGPU_BLOB_FLAG_USE_MAPPABLE);
-                allocationInfo->Flags.AccessedPhysically = TRUE;
-                allocationInfo->Flags.ExplicitResidencyNotification = TRUE;
+                // AccessedPhysically + ExplicitResidencyNotification were both
+                // rejected by the video memory manager here (STATUS_INVALID_-
+                // PARAMETER on D3DKMTCreateAllocation, observed on the Neptune
+                // ring). The working 3D/guest-blob branches set neither, so
+                // mirror them: a CpuVisible allocation in the CpuVisible shmem
+                // segment is addressed through its CpuTranslatedAddress.
                 // allocationInfo->Flags.Swizzled = TRUE;
                 allocationInfo->SupportedReadSegmentSet = 0b10;
                 allocationInfo->SupportedWriteSegmentSet = 0b10;
