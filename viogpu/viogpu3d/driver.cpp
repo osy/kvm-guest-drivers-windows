@@ -1092,7 +1092,6 @@ VioGpu3DDdiControlInterrupt(_In_ CONST HANDLE hAdapter,
     UNREFERENCED_PARAMETER(InterruptType);
     UNREFERENCED_PARAMETER(EnableInterrupt);
 
-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s not implemented\n", __FUNCTION__));
     return STATUS_SUCCESS;
 };
 
@@ -1280,9 +1279,21 @@ APIENTRY
 VioGpu3DDdiQueryEngineStatus(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYENGINESTATUS *pQueryEngineStatus)
 {
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pQueryEngineStatus);
 
-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
+    // The scheduler calls this when it suspects a node has stopped making
+    // progress (before declaring a TDR). The out parameter MUST be filled:
+    // leaving EngineStatus untouched lets the scheduler read an
+    // uninitialized Responsive bit and treat the engine as hung.
+    //
+    // This engine is paravirtual -- a worker thread draining a virtqueue
+    // against the host renderer, not real hardware that can wedge. Command
+    // completion is driven by host fence responses, so the engine is always
+    // able to report progress. Report Responsive.
+    if (pQueryEngineStatus)
+    {
+        pQueryEngineStatus->EngineStatus.Value = 0;
+        pQueryEngineStatus->EngineStatus.Responsive = 1;
+    }
 
     return STATUS_SUCCESS;
 };
