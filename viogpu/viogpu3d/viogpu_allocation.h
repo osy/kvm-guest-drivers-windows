@@ -137,8 +137,13 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     NTSTATUS EscapeResourceBlobSetInfo(VIOGPU_RES_BLOB_SET_INFO_REQ *resBlob);
 
     VOID CreateBlob(UINT ctx_id);
-    VOID MapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
-    VOID UnmapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    // Return TRUE if a host map/unmap command was actually issued (so
+    // complete_cb will fire from the queue-completion DPC), FALSE if the
+    // blob was already in the requested state and no host round-trip --
+    // and therefore no callback -- happened. The caller relies on this to
+    // keep its outstanding-callback accounting exact.
+    BOOLEAN MapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    BOOLEAN UnmapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
 
   protected:
     BOOL m_IsBlob;
@@ -167,8 +172,8 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     void Close(VioGpuDeviceAllocation *pDeviceAllocation);
   private:
     inline LinkedList<VioGpuDeviceAllocation>::Entry *Find(VioGpuDevice *pDevice);
-    inline VOID MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
-    inline VOID UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    inline BOOLEAN MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    inline BOOLEAN UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
 
     static VOID NTAPI DeferredReleaseWorker(PDEVICE_OBJECT DeviceObject, PVOID Context);
 

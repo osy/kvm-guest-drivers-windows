@@ -220,42 +220,46 @@ VOID VioGpuAllocation::CreateBlob(UINT ctx_id)
     m_Blob.Created = ok;
 }
 
-VOID VioGpuAllocation::MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+BOOLEAN VioGpuAllocation::MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     m_adapter->ctrlQueue.ResourceMapBlob(m_Id, ctx_id, m_Blob.MapOffset, complete_cb, complete_ctx);
     m_Blob.Mapped = TRUE;
+    return TRUE;
 }
 
-VOID VioGpuAllocation::UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+BOOLEAN VioGpuAllocation::UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     m_adapter->ctrlQueue.ResourceUnmapBlob(m_Id, ctx_id, complete_cb, complete_ctx);
     m_Blob.Mapped = FALSE;
+    return TRUE;
 }
 
-VOID VioGpuAllocation::MapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+BOOLEAN VioGpuAllocation::MapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d IsBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));
 
-    if (!m_IsBlob) return;
+    if (!m_IsBlob) return FALSE;
 
     // m_Blob.Mapped is mutated under m_Lock by MapBlobLocked /
     // UnmapBlobLocked, so the already-mapped check must run under
     // the same lock to avoid racing a concurrent unmap into a stale
-    // skip-the-map decision.
+    // skip-the-map decision. Already mapped: no host command issued, so
+    // complete_cb will not fire -- report FALSE so the caller's pending
+    // count stays balanced.
     auto lock_guard = LockGuard();
-    if (m_Blob.Mapped) return;
-    MapBlobLocked(ctx_id, complete_cb, complete_ctx);
+    if (m_Blob.Mapped) return FALSE;
+    return MapBlobLocked(ctx_id, complete_cb, complete_ctx);
 }
 
-VOID VioGpuAllocation::UnmapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+BOOLEAN VioGpuAllocation::UnmapBlob(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d IsBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));
 
-    if (!m_IsBlob) return;
+    if (!m_IsBlob) return FALSE;
 
     auto lock_guard = LockGuard();
-    if (!m_Blob.Mapped) return;
-    UnmapBlobLocked(ctx_id, complete_cb, complete_ctx);
+    if (!m_Blob.Mapped) return FALSE;
+    return UnmapBlobLocked(ctx_id, complete_cb, complete_ctx);
 }
 
 VioGpuAllocationLockGuard::VioGpuAllocationLockGuard(VioGpuAllocation *allocation) : m_Allocation(allocation)

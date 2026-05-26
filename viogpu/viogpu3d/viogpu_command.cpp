@@ -54,7 +54,7 @@ void VioGpuCommand::AddPending()
     InterlockedIncrement(&m_pendingCallbacks);
 }
 
-void VioGpuCommand::DropPending()
+LONG VioGpuCommand::DropPending()
 {
     LONG remaining = InterlockedDecrement(&m_pendingCallbacks);
     if (remaining < 0)
@@ -63,7 +63,9 @@ void VioGpuCommand::DropPending()
                  ("%s cmd=%p pending underflow %d\n",
                   __FUNCTION__, this, remaining));
         InterlockedExchange(&m_pendingCallbacks, 0);
+        return 0;
     }
+    return remaining;
 }
 
 void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
@@ -167,56 +169,78 @@ void VioGpuCommand::Run()
                 {
                     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s fence_id=%d running map/unmap blob, next=%d, curr=%p, end=%p\n", __FUNCTION__, m_FenceId, ((VIOGPU_COMMAND_HDR *)m_pCommand)->type, m_pCommand, m_pEnd));
 
+                    const BOOLEAN isMap = (cmdHdr->type == VIOGPU_CMD_MAP_BLOB);
                     ULONG *map_idx = (ULONG *)cmdBody;
 
                     size_t num_maps = cmdHdr->size / sizeof(ULONG);
 
+                    // Validate every index -- bounds, non-NULL, blob, and
+                    // mappability -- before issuing anything. Doing the
+                    // mappability check here (rather than in the issue loop)
+                    // keeps the issue loop free of any early exit that could
+                    // leave host ops in flight while we jump to `end:`.
+                    BOOLEAN valid = TRUE;
                     for (size_t i = 0; i < num_maps; i++) {
                         if (map_idx[i] >= m_allocationsLength)
                         {
                             DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s fence_id=%d map/unmap blob %d: invalid index=%u\n", __FUNCTION__, m_FenceId, i, map_idx[i]));
-                            goto end;
+                            valid = FALSE; break;
                         }
-                        if (m_allocations[map_idx[i]] == NULL)
+                        VioGpuAllocation *a = m_allocations[map_idx[i]];
+                        if (a == NULL)
                         {
                             DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s fence_id=%d map/unmap blob %d: allocation %d is NULL\n", __FUNCTION__, m_FenceId, i, map_idx[i]));
-                            goto end;
+                            valid = FALSE; break;
                         }
-                        if (!m_allocations[map_idx[i]]->IsBlob())
+                        if (!a->IsBlob())
                         {
                             DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s fence_id=%d map/unmap blob %d: allocation %d is not blob\n", __FUNCTION__, m_FenceId, i, map_idx[i]));
-                            goto end;
+                            valid = FALSE; break;
                         }
-
+                        if (!a->IsMappable())
+                        {
+                            DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s fence_id=%d res_id=%d cannot map unmappable blob (flags=%d)\n", __FUNCTION__, m_FenceId, a->GetId(), a->m_Blob.Options.blob_flags));
+                            valid = FALSE; break;
+                        }
                     }
+                    if (!valid)
+                        goto end;
 
+                    // Issue each map/unmap that actually changes state, every
+                    // one carrying QueueRunningCb. A loop guard holds one
+                    // pending ref so a host response arriving mid-issue cannot
+                    // re-queue this command before the whole batch is posted.
+                    // Whoever drops the count to zero -- the guard release below
+                    // when nothing is in flight, otherwise the final host
+                    // completion -- re-enters Run() exactly once to reach `end:`.
+                    // The guard guarantees the DMA fence is always completed,
+                    // including the case where every blob is already in the
+                    // requested state and no host command is issued at all.
+                    AddPending();
                     for (size_t i = 0; i < num_maps; i++) {
                         VioGpuAllocation *allocation = m_allocations[map_idx[i]];
-                        if (!allocation->IsMappable()) {
-                            DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s fence_id=%d res_id=%d cannot map unmappable blob (flags=%d)\n", __FUNCTION__, m_FenceId, allocation->GetId(), allocation->m_Blob.Options.blob_flags));
-                            goto end;
-                        }
-
-                        if (cmdHdr->type == VIOGPU_CMD_MAP_BLOB && !allocation->IsMapped()) {
-                            DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s fence_id=%d running map blob res_id=%d\n", __FUNCTION__, m_FenceId, allocation->GetId()));
-                            if (i == num_maps - 1)
-                            {
-                                AddPending();
-                            }
-                            allocation->MapBlob(m_pDevice->m_Context.GetId(),
-                                                i == num_maps - 1 ? VioGpuCommand::QueueRunningCb : NULL,
-                                                i == num_maps - 1 ? this : NULL);
-                        } else if (cmdHdr->type == VIOGPU_CMD_UNMAP_BLOB && allocation->IsMapped()) {
-                            DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s fence_id=%d running unmap blob res_id=%d\n", __FUNCTION__, m_FenceId, allocation->GetId()));
-                            if (i == num_maps - 1)
-                            {
-                                AddPending();
-                            }
-                            allocation->UnmapBlob(m_pDevice->m_Context.GetId(),
-                                                i == num_maps - 1 ? VioGpuCommand::QueueRunningCb : NULL,
-                                                i == num_maps - 1 ? this : NULL);
+                        UINT ctxId = m_pDevice->m_Context.GetId();
+                        AddPending();
+                        BOOLEAN issued = isMap
+                            ? allocation->MapBlob(ctxId, VioGpuCommand::QueueRunningCb, this)
+                            : allocation->UnmapBlob(ctxId, VioGpuCommand::QueueRunningCb, this);
+                        DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s fence_id=%d %s blob res_id=%d issued=%d\n", __FUNCTION__, m_FenceId, isMap ? "map" : "unmap", allocation->GetId(), issued));
+                        if (!issued)
+                        {
+                            // Already in the requested state: no host round-trip
+                            // and therefore no callback -- undo the tentative ref.
+                            DropPending();
                         }
                     }
+                    if (DropPending() == 0)
+                    {
+                        // Nothing was actually issued to the host (all blobs
+                        // already in the requested state). No callback will
+                        // re-queue us, so fall through to complete the fence.
+                        break;
+                    }
+                    // At least one host map/unmap is in flight; the completion
+                    // that drops the count to zero re-queues us to reach `end:`.
                     return;
                 }
 
@@ -300,14 +324,15 @@ void VioGpuCommand::QueueRunningCb(void *cmd, void *, void *)
 {
     VioGpuCommand *self = (VioGpuCommand *)cmd;
     // Pair with the AddPending() that ran before the matching submit.
-    // The order is important: drop first, then queue, so the dtor's
-    // assertion can't observe a transient non-zero count if Run() on
-    // the commander thread races ahead to `end:`. In the current
-    // single-runner design the race can't happen (the cmd has to be
-    // dequeued and re-Run before it can hit `end:`), but the order
-    // is the right invariant either way.
-    self->DropPending();
-    self->QueueRunning();
+    // Re-queue only when this was the LAST outstanding submission: a
+    // single DMA body can issue several async ops (e.g. a multi-index
+    // MAP_BLOB), and Run() must re-enter exactly once -- when they have
+    // all completed -- to advance past the command and reach `end:`.
+    // Dropping to zero is the unique edge that re-queues; an earlier
+    // completion just decrements. Drop before queue so the dtor's
+    // zero-pending assertion can't observe a transient count.
+    if (self->DropPending() == 0)
+        self->QueueRunning();
 }
 
 #pragma code_seg(pop)

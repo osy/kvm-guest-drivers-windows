@@ -63,7 +63,9 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     volatile LONG m_pendingCallbacks;
 
     void AddPending();
-    void DropPending();
+    // Returns the post-decrement count so callers can re-queue the command
+    // exactly once -- when the last outstanding async submission completes.
+    LONG DropPending();
 
     char *m_pDmaBuffer;
     char *m_pCommand;
