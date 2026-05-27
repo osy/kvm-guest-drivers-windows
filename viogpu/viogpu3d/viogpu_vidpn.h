@@ -103,6 +103,13 @@ class VioGpuVidPN
 
     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
 
+    // Override the source-0 scanout to an arbitrary allocation (a standing
+    // dmabuf primary the UMD blits the composited frame into), independent of
+    // dxgkrnl's flip. The vsync Flip thread then scans it out continuously.
+    // Used by the blt-present path where dxgkrnl issues no SetVidPnSourceAddress
+    // for the windowed present source.
+    void SetScanoutSource(VioGpuAllocation *res);
+
     // Currently-committed refresh rate, or {0,0} if no source mode is
     // pinned. Caller is responsible for choosing a default.
     D3DDDI_RATIONAL GetActiveRefreshRate() const;

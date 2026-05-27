@@ -2029,7 +2029,11 @@ void VioGpuVidPN::Flip()
         KeReleaseSpinLock(&m_sourceLock, oldIrql);
 
         DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] Flip handling addr=%llx res_id=%d isBlob=%d\n", address.QuadPart, res ? res->GetId() : 0, res ? res->IsBlob() : 0)); // [bringup-tdr]
-        if (address.QuadPart != 0 && res != NULL)
+        // Blob primaries (the blt-present standing dmabuf set via
+        // SetScanoutSource) scan out by res_id through SetScanoutBlob and carry
+        // no guest PrimaryAddress, so flush them regardless of address; only 3D
+        // primaries are gated on a non-zero MMIO-flip address.
+        if (res != NULL && (address.QuadPart != 0 || res->IsBlob()))
         {
             res->FlushToScreen(0);
         }
@@ -2136,6 +2140,33 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
 
     return STATUS_SUCCESS;
 };
+
+void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res)
+{
+    // Mirror SetVidPnSourceAddress's refcount/swap discipline. Blob scanout is
+    // keyed by res_id, so there is no guest PrimaryAddress; zero it.
+    if (res)
+    {
+        res->AddRef();
+    }
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&m_sourceLock, &oldIrql);
+    VioGpuAllocation *oldRes = m_sourceRes;
+    m_sourceAddress.QuadPart = 0;
+    m_sourceRes = res;
+    KeReleaseSpinLock(&m_sourceLock, oldIrql);
+
+    if (oldRes)
+    {
+        oldRes->ReleaseDeferred();
+    }
+
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] SetScanoutSource res_id=%d isBlob=%d\n",
+                                       res ? res->GetId() : 0, res ? res->IsBlob() : 0)); // [bringup-tdr]
+
+    InterlockedOr(&m_shouldFlip, 1);
+}
 
 D3DDDI_VIDEO_PRESENT_SOURCE_ID VioGpuVidPN::FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
                                                                 BOOLEAN DefaultToZero)

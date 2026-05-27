@@ -83,6 +83,7 @@ typedef struct _VIOGPU_ADAPTERINFO
 #define VIOGPU_RES_INFO              0x100
 #define VIOGPU_RES_BUSY              0x101
 #define VIOGPU_RES_BLOB_SET_INFO     0x102
+#define VIOGPU_SET_SCANOUT_SOURCE    0x103
 
 #define VIOGPU_CTX_INIT              0x200
 
@@ -158,6 +159,17 @@ typedef struct {
 } VIOGPU_RES_BLOB_SET_INFO_REQ, *PVIOGPU_RES_BLOB_SET_INFO_REQ;
 #pragma pack()
 
+// Override VidPn source-0 scanout to this allocation (a standing dmabuf primary
+// the UMD blits the composited frame into); the KMD's vsync Flip then scans it
+// out via SetScanoutBlob.  For the blt-present path where dxgkrnl issues no
+// SetVidPnSourceAddress for the present source.  Lockstep wddm_hw.h <-> viogpum.h.
+#pragma pack(1)
+typedef struct _VIOGPU_SET_SCANOUT_SOURCE_REQ
+{
+    D3DKMT_HANDLE ResHandle;
+} VIOGPU_SET_SCANOUT_SOURCE_REQ;
+#pragma pack()
+
 #pragma pack(1)
 typedef struct _VIOGPU_CTX_INIT_REQ
 {
@@ -193,6 +205,7 @@ typedef struct _VIOGPU_ESCAPE
         VIOGPU_RES_INFO_REQ ResourceInfo;
         VIOGPU_RES_BUSY_REQ ResourceBusy;
         VIOGPU_RES_BLOB_SET_INFO_REQ BlobInfoSet;
+        VIOGPU_SET_SCANOUT_SOURCE_REQ SetScanoutSource;
 
         VIOGPU_CTX_INIT_REQ CtxInit;
 
