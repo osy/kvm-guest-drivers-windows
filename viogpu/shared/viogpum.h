@@ -241,8 +241,23 @@ typedef struct _VIOGPU_CREATE_RESOURCE_EXCHANGE
 } VIOGPU_CREATE_RESOURCE_EXCHANGE;
 #pragma pack()
 
-#define VIOGPU_RESOURCE_TYPE_3D   0
-#define VIOGPU_RESOURCE_TYPE_BLOB 1
+// Adopt an existing host res_id (a HOST3D blob already created and owned by
+// another device's allocation, e.g. the Neptune transport device's swapchain
+// dmabuf claim) as a runtime-device scanout source.  The KMD does NOT mint a
+// res_id, issue RESOURCE_CREATE_BLOB, or destroy the resource for an import
+// allocation: ownership stays with the creating allocation.  Blob info
+// (w/h/format/stride) is published separately via VIOGPU_RES_BLOB_SET_INFO.
+// Keep in lockstep with virtio-win-mesa/src/virtio/virtio-gpu/wddm_hw.h.
+#pragma pack(1)
+typedef struct _VIOGPU_RESOURCE_IMPORT_OPTIONS
+{
+    ULONG res_id;
+} VIOGPU_RESOURCE_IMPORT_OPTIONS;
+#pragma pack()
+
+#define VIOGPU_RESOURCE_TYPE_3D     0
+#define VIOGPU_RESOURCE_TYPE_BLOB   1
+#define VIOGPU_RESOURCE_TYPE_IMPORT 2
 #pragma pack(1)
 typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
 {
@@ -250,6 +265,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
     union {
         VIOGPU_RESOURCE_3D_OPTIONS Options3D;
         VIOGPU_RESOURCE_BLOB_OPTIONS OptionsBlob;
+        VIOGPU_RESOURCE_IMPORT_OPTIONS OptionsImport;
     };
     ULONGLONG Size;
 } VIOGPU_CREATE_ALLOCATION_EXCHANGE;

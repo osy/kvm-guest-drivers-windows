@@ -11,6 +11,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_
 
     m_adapter = adapter;
     m_Id = m_adapter->resourceIdr.GetId();
+    m_IsImport = FALSE;
     memcpy(&m_Blob.Options, options, sizeof(*options));
     RtlZeroMemory(&m_Blob.Info, sizeof(m_Blob.Info));
     // TODO: find a way to make valid
@@ -44,6 +45,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_3D_OP
 
     m_adapter = adapter;
     m_Id = m_adapter->resourceIdr.GetId();
+    m_IsImport = FALSE;
     memcpy(&m_3dOptions, options, sizeof(*options));
     m_Size = size;
     m_IsBlob = FALSE;
@@ -66,6 +68,49 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_3D_OP
     m_deferReleaseItem = IoAllocateWorkItem(m_adapter->GetPhysicalDevice());
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s res_id=%d 3D\n", __FUNCTION__, m_Id));
+}
+
+VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPORT_OPTIONS *options, ULONGLONG size)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s IMPORT res_id=%d\n", __FUNCTION__, options->res_id));
+
+    m_adapter = adapter;
+    // Adopt the existing host res_id; do NOT mint one. The owning allocation
+    // (the Neptune transport device's swapchain dmabuf claim) created the
+    // resource on its context and owns the id's lifetime.
+    m_Id = options->res_id;
+    m_IsImport = TRUE;
+
+    // Present as a host-backed HOST3D blob so DxgkCreateAllocation's segment
+    // selection and FlushToScreen (SetScanoutBlob) treat it exactly like the
+    // dmabuf it aliases.
+    RtlZeroMemory(&m_Blob.Options, sizeof(m_Blob.Options));
+    m_Blob.Options.blob_mem = VIOGPU_BLOB_MEM_HOST3D;
+    RtlZeroMemory(&m_Blob.Info, sizeof(m_Blob.Info));
+    m_Blob.MapOffset = 0;
+    m_Blob.InfoValid = FALSE;
+    // The host resource already exists (created on the owning context), so
+    // Open() must not re-issue RESOURCE_CREATE_BLOB.
+    m_Blob.Created = TRUE;
+    m_Blob.Mapped = FALSE;
+    m_Size = size;
+    m_IsBlob = TRUE;
+
+    m_pMDL = NULL;
+    m_pageCount = 0;
+    m_pageOffset = 0;
+    m_DxPhysicalAddress = 0;
+
+    KeInitializeEvent(&m_busyNotification, NotificationEvent, TRUE);
+    m_busy = 0;
+    KeInitializeSpinLock(&m_busyLock);
+
+    ExInitializeFastMutex(&m_Lock);
+
+    m_refCount = 1;
+    m_deferReleaseItem = IoAllocateWorkItem(m_adapter->GetPhysicalDevice());
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s IMPORT res_id=%d size=%lld\n", __FUNCTION__, m_Id, size));
 }
 
 void VioGpuAllocation::AddRef()
@@ -154,8 +199,20 @@ VioGpuAllocation::~VioGpuAllocation(void)
         //m_adapter->ctrlQueue.ResourceUnmapBlob(m_Id, 0, NULL, NULL);
     }
 
-    m_adapter->ctrlQueue.DestroyResource(m_Id, NotifyResourceDestroyed, &m_adapter->resourceIdr);
-    // m_adapter->resourceIdr.PutId(m_Id);
+    if (m_IsImport)
+    {
+        // The adopted res_id is owned by another allocation (the transport
+        // device's swapchain claim). RES_UNREF + PutId here would free a host
+        // resource that is still referenced and double-free the id; the owning
+        // allocation's destructor performs the single destroy. m_DeviceAllocations
+        // was already cleared above, detaching the id from this device's context.
+        DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s IMPORT res_id=%d: skip DestroyResource (not owner)\n", __FUNCTION__, m_Id));
+    }
+    else
+    {
+        m_adapter->ctrlQueue.DestroyResource(m_Id, NotifyResourceDestroyed, &m_adapter->resourceIdr);
+        // m_adapter->resourceIdr.PutId(m_Id);
+    }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
@@ -514,6 +571,10 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             // Actual resource creation is deferred to a later time (render)
             allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->OptionsBlob, resourceExchange->Size);
             break;
+        case VIOGPU_RESOURCE_TYPE_IMPORT:
+            // Adopts an existing host res_id; no mint, no RESOURCE_CREATE_BLOB.
+            allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->OptionsImport, resourceExchange->Size);
+            break;
         default:
             DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s invalid resource type %d\n", __FUNCTION__, resourceExchange->Type));
             return STATUS_INVALID_PARAMETER;
@@ -590,6 +651,20 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                 allocationInfo->SupportedReadSegmentSet = 0b10;
                 allocationInfo->SupportedWriteSegmentSet = 0b10;
             }
+            break;
+        case VIOGPU_RESOURCE_TYPE_IMPORT:
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s import res_id=%d size=%d\n",
+                                           __FUNCTION__,
+                                           allocation->GetId(),
+                                           allocationInfo->Size));
+            // Host-backed alias of an existing dmabuf res_id: residency matches
+            // a non-mappable HOST3D blob (host shmem BAR segment, pinned; not
+            // CpuVisible -- the guest never maps the host scanout dmabuf).
+            allocationInfo->PreferredSegment.SegmentId0 = 2;
+            allocationInfo->PreferredSegment.Direction0 = 0;
+            allocationInfo->Flags.CpuVisible = FALSE;
+            allocationInfo->SupportedReadSegmentSet = 0b10;
+            allocationInfo->SupportedWriteSegmentSet = 0b10;
             break;
     }
 

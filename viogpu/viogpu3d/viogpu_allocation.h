@@ -41,6 +41,13 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_OPTIONS *options, ULONGLONG size);
     VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_3D_OPTIONS *options, ULONGLONG size);
 
+    // Import: adopt an already-created host res_id owned by another
+    // allocation. Behaves like a HOST3D blob for residency/scanout, but
+    // mints no id, issues no RESOURCE_CREATE_BLOB, and (m_IsImport) skips
+    // DestroyResource at teardown so the owning allocation's res_id is not
+    // unref'd or freed twice.
+    VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPORT_OPTIONS *options, ULONGLONG size);
+
     ~VioGpuAllocation(void);
 
     // Refcounting. Constructor starts at 1 (the DXGK reference). AddRef
@@ -147,6 +154,9 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
 
   protected:
     BOOL m_IsBlob;
+    // Import allocation: m_Id is adopted (owned by another allocation), so
+    // the destructor must not DestroyResource it. See the import ctor.
+    BOOL m_IsImport;
     union {
         VIOGPU_RESOURCE_3D_OPTIONS m_3dOptions;
         struct {
