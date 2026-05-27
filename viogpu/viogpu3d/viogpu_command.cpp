@@ -124,6 +124,7 @@ void VioGpuCommand::Run()
         m_pCommand += cmdHdr->size;
 
         DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s fence_id=%d running command=%d\n", __FUNCTION__, m_FenceId, cmdHdr->type));
+        DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] Run issue fence=%d cmd_type=%d flags=0x%x ctx=%u\n", m_FenceId, cmdHdr->type, cmdHdr->flags, (m_pDevice ? ((cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId()) : 0))); // [bringup-tdr]
 
         switch (cmdHdr->type)
         {
@@ -259,6 +260,7 @@ void VioGpuCommand::Run()
 
 end:
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s finished fence_id=%d, this=%p, m_pAdapter=%p\n", __FUNCTION__, m_FenceId, this, m_pAdapter));
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] Run DONE fence=%d\n", m_FenceId)); // [bringup-tdr]
 
     if (m_allocations)
     {

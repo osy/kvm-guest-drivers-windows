@@ -2028,6 +2028,7 @@ void VioGpuVidPN::Flip()
         address = m_sourceAddress;
         KeReleaseSpinLock(&m_sourceLock, oldIrql);
 
+        DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] Flip handling addr=%llx res_id=%d isBlob=%d\n", address.QuadPart, res ? res->GetId() : 0, res ? res->IsBlob() : 0)); // [bringup-tdr]
         if (address.QuadPart != 0 && res != NULL)
         {
             res->FlushToScreen(0);
@@ -2120,6 +2121,8 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
         // Release must drop to PASSIVE_LEVEL before running it.
         oldRes->ReleaseDeferred();
     }
+
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] SetVidPnSourceAddress res_id=%d isBlob=%d srcId=%d addr=%llx\n", newRes ? newRes->GetId() : 0, newRes ? newRes->IsBlob() : 0, pSetVidPnSourceAddress->VidPnSourceId, pSetVidPnSourceAddress->PrimaryAddress.QuadPart)); // [bringup-tdr]
 
     InterlockedOr(&m_shouldFlip, 1);
 
