@@ -286,6 +286,13 @@ BOOLEAN VioGpuAllocation::MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *,
 
 BOOLEAN VioGpuAllocation::UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
+    // The host treats RESOURCE_UNMAP_BLOB as a per-(res_id) operation rather
+    // than per-(res_id, ctx_id): the first UNMAP releases the host mapping,
+    // any subsequent UNMAP — whether from a cross-context sharer (TYPE_IMPORT
+    // adopting the same res_id) or a duplicate Close path — returns
+    // INVALID_RESOURCE_ID. Gating on the local Mapped flag matches the host
+    // semantics and makes Close idempotent across cross-context sharers.
+    if (!m_Blob.Mapped) return FALSE;
     m_adapter->ctrlQueue.ResourceUnmapBlob(m_Id, ctx_id, complete_cb, complete_ctx);
     m_Blob.Mapped = FALSE;
     return TRUE;
