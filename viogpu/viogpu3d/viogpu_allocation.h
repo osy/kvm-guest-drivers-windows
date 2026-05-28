@@ -48,6 +48,14 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // unref'd or freed twice.
     VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPORT_OPTIONS *options, ULONGLONG size);
 
+    // Shared: a host-COM-backed texture made cross-process shareable. Carries
+    // no virtio res_id (m_Id == 0) and creates no host virtio resource -- the
+    // pixels live in the host D3D11 texture reached via the Neptune COM
+    // transport. The allocation is only a WDDM sharing token + private-data
+    // carrier; the destructor skips DestroyResource and Open skips the context
+    // attach.
+    VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARED_OPTIONS *options, ULONGLONG size);
+
     ~VioGpuAllocation(void);
 
     // Refcounting. Constructor starts at 1 (the DXGK reference). AddRef
@@ -132,6 +140,13 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
         return m_IsPrimary;
     }
 
+    // Host-COM-backed shared allocation: no virtio res_id, no context attach,
+    // no DestroyResource. Exists only as a WDDM sharing token.
+    inline BOOL IsShared() const
+    {
+        return m_IsShared;
+    }
+
     void AttachBacking(MDL *pMdl, size_t pageCount, size_t pageOffset);
     void DetachBacking();
 
@@ -166,6 +181,13 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // VioGpuDevice::Present updates VioGpuVidPN's m_sourceRes when it sees
     // this allocation as the blt-present source.
     BOOL m_IsPrimary;
+    // Host-COM-backed cross-process shared allocation (no virtio res_id, no
+    // context attach, no DestroyResource). Dimensions/format are retained for
+    // DxgkDdiDescribeAllocation when another process opens the share.
+    BOOL m_IsShared;
+    UINT m_SharedWidth;
+    UINT m_SharedHeight;
+    UINT m_SharedFormat; // DXGI_FORMAT
     union {
         VIOGPU_RESOURCE_3D_OPTIONS m_3dOptions;
         struct {

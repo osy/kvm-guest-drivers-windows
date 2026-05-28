@@ -269,9 +269,32 @@ typedef struct _VIOGPU_RESOURCE_IMPORT_OPTIONS
 } VIOGPU_RESOURCE_IMPORT_OPTIONS;
 #pragma pack()
 
+// Emulated D3D11 shared resource.  DXVK on Linux cannot honor Win32 shared
+// handles, so cross-process sharing is emulated: the producer's texture is a
+// normal host resource registered under shared_key, and a consumer's
+// OpenResource binds a host-side mirror of it.  The descriptor lets the
+// consumer UMD rebuild its resource state without a kernel round-trip.
+// Keep in lockstep with virtio-win-mesa/src/virtio/virtio-gpu/wddm_hw.h.
+#pragma pack(1)
+typedef struct _VIOGPU_RESOURCE_SHARED_OPTIONS
+{
+    ULONGLONG shared_key;   // Neptune 64-bit identity, minted by the producer UMD
+    ULONG width;
+    ULONG height;
+    ULONG format;           // DXGI_FORMAT
+    ULONG mip_levels;
+    ULONG array_size;
+    ULONG sample_count;
+    ULONG bind_flags;       // D3D11 bind flags chosen for the host texture
+    ULONG misc_flags;       // original DDI misc flags (incl. keyed-mutex) for the consumer
+    ULONG is_producer;      // 1 when created by the producer, 0 when opened by a consumer
+} VIOGPU_RESOURCE_SHARED_OPTIONS;
+#pragma pack()
+
 #define VIOGPU_RESOURCE_TYPE_3D     0
 #define VIOGPU_RESOURCE_TYPE_BLOB   1
 #define VIOGPU_RESOURCE_TYPE_IMPORT 2
+#define VIOGPU_RESOURCE_TYPE_SHARED 3
 #pragma pack(1)
 typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
 {
@@ -280,6 +303,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
         VIOGPU_RESOURCE_3D_OPTIONS Options3D;
         VIOGPU_RESOURCE_BLOB_OPTIONS OptionsBlob;
         VIOGPU_RESOURCE_IMPORT_OPTIONS OptionsImport;
+        VIOGPU_RESOURCE_SHARED_OPTIONS OptionsShared;
     };
     ULONGLONG Size;
 } VIOGPU_CREATE_ALLOCATION_EXCHANGE;

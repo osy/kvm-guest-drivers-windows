@@ -13,6 +13,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_
     m_Id = m_adapter->resourceIdr.GetId();
     m_IsImport = FALSE;
     m_IsPrimary = FALSE;
+    m_IsShared = FALSE;
     memcpy(&m_Blob.Options, options, sizeof(*options));
     RtlZeroMemory(&m_Blob.Info, sizeof(m_Blob.Info));
     // TODO: find a way to make valid
@@ -48,6 +49,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_3D_OP
     m_Id = m_adapter->resourceIdr.GetId();
     m_IsImport = FALSE;
     m_IsPrimary = FALSE;
+    m_IsShared = FALSE;
     memcpy(&m_3dOptions, options, sizeof(*options));
     m_Size = size;
     m_IsBlob = FALSE;
@@ -83,6 +85,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPOR
     m_Id = options->res_id;
     m_IsImport = TRUE;
     m_IsPrimary = !!options->primary;
+    m_IsShared = FALSE;
 
     // Present as a host-backed HOST3D blob so DxgkCreateAllocation's segment
     // selection and FlushToScreen (SetScanoutBlob) treat it exactly like the
@@ -114,6 +117,45 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPOR
     m_deferReleaseItem = IoAllocateWorkItem(m_adapter->GetPhysicalDevice());
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s IMPORT res_id=%d size=%lld\n", __FUNCTION__, m_Id, size));
+}
+
+VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARED_OPTIONS *options, ULONGLONG size)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s SHARED key=0x%llx %dx%d\n", __FUNCTION__,
+                                   options->shared_key, options->width, options->height));
+
+    m_adapter = adapter;
+    // Host-COM-backed: the pixels live in the host D3D11 texture reached via
+    // the Neptune COM transport, not a virtio resource. Mint no res_id and
+    // create no host resource. m_IsImport makes the destructor skip
+    // DestroyResource, and m_IsShared makes Open skip the context attach.
+    m_Id = 0;
+    m_IsImport = TRUE;
+    m_IsPrimary = FALSE;
+    m_IsShared = TRUE;
+    m_SharedWidth = options->width;
+    m_SharedHeight = options->height;
+    m_SharedFormat = options->format;
+    m_IsBlob = FALSE;
+    RtlZeroMemory(&m_3dOptions, sizeof(m_3dOptions));
+    m_Size = size;
+
+    m_pMDL = NULL;
+    m_pageCount = 0;
+    m_pageOffset = 0;
+    m_DxPhysicalAddress = 0;
+
+    KeInitializeEvent(&m_busyNotification, NotificationEvent, TRUE);
+    m_busy = 0;
+    KeInitializeSpinLock(&m_busyLock);
+
+    ExInitializeFastMutex(&m_Lock);
+
+    m_refCount = 1;
+    m_deferReleaseItem = IoAllocateWorkItem(m_adapter->GetPhysicalDevice());
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s SHARED key=0x%llx size=%lld\n", __FUNCTION__,
+                                   options->shared_key, size));
 }
 
 void VioGpuAllocation::AddRef()
@@ -585,6 +627,11 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             // Adopts an existing host res_id; no mint, no RESOURCE_CREATE_BLOB.
             allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->OptionsImport, resourceExchange->Size);
             break;
+        case VIOGPU_RESOURCE_TYPE_SHARED:
+            // Host-COM-backed shareable texture; a phantom WDDM sharing token
+            // with no virtio resource of its own.
+            allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->OptionsShared, resourceExchange->Size);
+            break;
         default:
             DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s invalid resource type %d\n", __FUNCTION__, resourceExchange->Type));
             return STATUS_INVALID_PARAMETER;
@@ -697,9 +744,42 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                 allocationInfo->SupportedWriteSegmentSet = 0b10;
             }
             break;
+        case VIOGPU_RESOURCE_TYPE_SHARED:
+            // Reside in the CPU-visible aperture (segment 1) with DXGK-supplied
+            // backing pages, like a 3D allocation. The pages are never used --
+            // the content is the host D3D11 texture -- but they satisfy the
+            // video memory manager for a shareable allocation whose private
+            // data conveys the Neptune key + descriptor to the opening process.
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s shared key=0x%llx size=%d %dx%d\n",
+                                           __FUNCTION__,
+                                           resourceExchange->OptionsShared.shared_key,
+                                           allocationInfo->Size,
+                                           resourceExchange->OptionsShared.width,
+                                           resourceExchange->OptionsShared.height));
+            allocationInfo->EvictionSegmentSet = 1;
+            allocationInfo->PreferredSegment.SegmentId0 = 1;
+            allocationInfo->PreferredSegment.Direction0 = 0;
+            allocationInfo->Flags.CpuVisible = TRUE;
+            allocationInfo->SupportedReadSegmentSet = 0b1;
+            allocationInfo->SupportedWriteSegmentSet = 0b1;
+            break;
     }
 
     return STATUS_SUCCESS;
+}
+
+// Minimal DXGI_FORMAT -> D3DDDIFORMAT mapping for the shared-allocation
+// describe path. Numeric DXGI values avoid an interface-only dxgiformat.h
+// dependency in the miniport. Unknown formats fall back to A8R8G8B8, the
+// layout DWM's shared surfaces use.
+static D3DDDIFORMAT VioGpuDxgiFormatToD3DDDI(UINT dxgiFormat)
+{
+    switch (dxgiFormat) {
+    case 87: /* DXGI_FORMAT_B8G8R8A8_UNORM */ return D3DDDIFMT_A8R8G8B8;
+    case 88: /* DXGI_FORMAT_B8G8R8X8_UNORM */ return D3DDDIFMT_X8R8G8B8;
+    case 28: /* DXGI_FORMAT_R8G8B8A8_UNORM */ return D3DDDIFMT_A8B8G8R8;
+    default:                                  return D3DDDIFMT_A8R8G8B8;
+    }
 }
 
 NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescribeAllocation)
@@ -708,6 +788,20 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d\n", __FUNCTION__, m_Id));
 
     auto lock_guard = LockGuard();
+
+    if (m_IsShared) {
+        // Host-COM-backed share: dimensions/format come from the producer's
+        // descriptor; there is no virtio resource to query.
+        pDescribeAllocation->Width = m_SharedWidth;
+        pDescribeAllocation->Height = m_SharedHeight;
+        pDescribeAllocation->PrivateDriverFormatAttribute = 0;
+        pDescribeAllocation->Format = VioGpuDxgiFormatToD3DDDI(m_SharedFormat);
+        pDescribeAllocation->MultisampleMethod.NumQualityLevels = 0;
+        pDescribeAllocation->MultisampleMethod.NumSamples = 1;
+        pDescribeAllocation->RefreshRate.Numerator = 60;
+        pDescribeAllocation->RefreshRate.Denominator = 1;
+        return STATUS_SUCCESS;
+    }
 
     if (m_IsBlob) {
         if (!m_Blob.InfoValid) {

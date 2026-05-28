@@ -727,8 +727,14 @@ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAlloc
         m_pAllocation->m_Blob.Created = ok;
     }
 
-    m_pDevice->GetCtrlQueue()->CtxResource(true, m_pDevice->m_Context.GetId(), m_pAllocation->GetId());
-    m_attached = true;
+    // A shared allocation is host-COM-backed and carries no virtio res_id, so
+    // there is nothing to attach to the context; leave m_attached false so the
+    // destructor issues no detach either.
+    if (!m_pAllocation->IsShared())
+    {
+        m_pDevice->GetCtrlQueue()->CtxResource(true, m_pDevice->m_Context.GetId(), m_pAllocation->GetId());
+        m_attached = true;
+    }
     m_AttachedToVirgl = false;
 }
 
