@@ -265,6 +265,7 @@ typedef struct _VIOGPU_CREATE_RESOURCE_EXCHANGE
 typedef struct _VIOGPU_RESOURCE_IMPORT_OPTIONS
 {
     ULONG res_id;
+    ULONG primary;   // non-zero: place in the CPU-visible aperture (segment 1) as a flippable primary
 } VIOGPU_RESOURCE_IMPORT_OPTIONS;
 #pragma pack()
 

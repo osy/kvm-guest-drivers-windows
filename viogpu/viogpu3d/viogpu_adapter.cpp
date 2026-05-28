@@ -538,13 +538,18 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 pDriverCaps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_NONE;
                 pDriverCaps->PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_NONE;
 
-                pDriverCaps->FlipCaps.FlipOnVSyncMmIo = TRUE;
+                // Blt-present model (VBox-faithful): advertise NO flip support so
+                // dxgkrnl issues per-present Blt (DxgkDdiPresent) instead of an
+                // MMIO/direct flip. A host-rendering driver cannot satisfy a
+                // VidPnSource-address flip (its scanout dmabuf has no guest
+                // address), but it CAN retire a Blt present via the DMA fence.
+                pDriverCaps->FlipCaps.FlipOnVSyncMmIo = FALSE;
 
-                pDriverCaps->MaxQueuedFlipOnVSync = 1;
+                pDriverCaps->MaxQueuedFlipOnVSync = 0;
 
                 pDriverCaps->MemoryManagementCaps.SectionBackedPrimary = TRUE;
 
-                pDriverCaps->SupportDirectFlip = 1;
+                pDriverCaps->SupportDirectFlip = 0;
                 pDriverCaps->SchedulingCaps.MultiEngineAware = 1;
                 pDriverCaps->SchedulingCaps.PreemptionAware = 1;
 

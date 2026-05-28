@@ -653,18 +653,34 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             }
             break;
         case VIOGPU_RESOURCE_TYPE_IMPORT:
-            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s import res_id=%d size=%d\n",
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s import res_id=%d size=%d primary=%d\n",
                                            __FUNCTION__,
                                            allocation->GetId(),
-                                           allocationInfo->Size));
-            // Host-backed alias of an existing dmabuf res_id: residency matches
-            // a non-mappable HOST3D blob (host shmem BAR segment, pinned; not
-            // CpuVisible -- the guest never maps the host scanout dmabuf).
-            allocationInfo->PreferredSegment.SegmentId0 = 2;
-            allocationInfo->PreferredSegment.Direction0 = 0;
-            allocationInfo->Flags.CpuVisible = FALSE;
-            allocationInfo->SupportedReadSegmentSet = 0b10;
-            allocationInfo->SupportedWriteSegmentSet = 0b10;
+                                           allocationInfo->Size,
+                                           resourceExchange->OptionsImport.primary));
+            if (resourceExchange->OptionsImport.primary)
+            {
+                // Flippable primary: reside in the CPU-visible aperture (segment 1)
+                // like a 3D primary so dxgkrnl accepts it as a VidPnSource flip
+                // target; the vsync Flip still scans out the bound dmabuf res_id.
+                allocationInfo->EvictionSegmentSet = 1;
+                allocationInfo->PreferredSegment.SegmentId0 = 1;
+                allocationInfo->PreferredSegment.Direction0 = 0;
+                allocationInfo->Flags.CpuVisible = TRUE;
+                allocationInfo->SupportedReadSegmentSet = 0b1;
+                allocationInfo->SupportedWriteSegmentSet = 0b1;
+            }
+            else
+            {
+                // Host-backed alias of an existing dmabuf res_id: residency matches
+                // a non-mappable HOST3D blob (host shmem BAR segment, pinned; not
+                // CpuVisible -- the guest never maps the host scanout dmabuf).
+                allocationInfo->PreferredSegment.SegmentId0 = 2;
+                allocationInfo->PreferredSegment.Direction0 = 0;
+                allocationInfo->Flags.CpuVisible = FALSE;
+                allocationInfo->SupportedReadSegmentSet = 0b10;
+                allocationInfo->SupportedWriteSegmentSet = 0b10;
+            }
             break;
     }
 
