@@ -12,6 +12,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_
     m_adapter = adapter;
     m_Id = m_adapter->resourceIdr.GetId();
     m_IsImport = FALSE;
+    m_IsPrimary = FALSE;
     memcpy(&m_Blob.Options, options, sizeof(*options));
     RtlZeroMemory(&m_Blob.Info, sizeof(m_Blob.Info));
     // TODO: find a way to make valid
@@ -46,6 +47,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_3D_OP
     m_adapter = adapter;
     m_Id = m_adapter->resourceIdr.GetId();
     m_IsImport = FALSE;
+    m_IsPrimary = FALSE;
     memcpy(&m_3dOptions, options, sizeof(*options));
     m_Size = size;
     m_IsBlob = FALSE;
@@ -80,6 +82,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPOR
     // resource on its context and owns the id's lifetime.
     m_Id = options->res_id;
     m_IsImport = TRUE;
+    m_IsPrimary = !!options->primary;
 
     // Present as a host-backed HOST3D blob so DxgkCreateAllocation's segment
     // selection and FlushToScreen (SetScanoutBlob) treat it exactly like the
@@ -660,7 +663,7 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             }
             break;
         case VIOGPU_RESOURCE_TYPE_IMPORT:
-            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s import res_id=%d size=%d primary=%d\n",
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s import res_id=%d size=%lld primary=%d\n",
                                            __FUNCTION__,
                                            allocation->GetId(),
                                            allocationInfo->Size,
@@ -668,14 +671,19 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             if (resourceExchange->OptionsImport.primary)
             {
                 // Flippable primary: reside in the CPU-visible aperture (segment 1)
-                // like a 3D primary so dxgkrnl accepts it as a VidPnSource flip
-                // target; the vsync Flip still scans out the bound dmabuf res_id.
+                // so dxgkrnl accepts it as a VidPnSource scanout target; the
+                // vsync Flip scans out the bound dmabuf res_id.
                 allocationInfo->EvictionSegmentSet = 1;
                 allocationInfo->PreferredSegment.SegmentId0 = 1;
                 allocationInfo->PreferredSegment.Direction0 = 0;
                 allocationInfo->Flags.CpuVisible = TRUE;
                 allocationInfo->SupportedReadSegmentSet = 0b1;
                 allocationInfo->SupportedWriteSegmentSet = 0b1;
+                // Promote to the active scanout source as soon as the runtime
+                // mints it: the runtime owns rotation between back buffers,
+                // and the most recently created primary is what the runtime
+                // is currently presenting from.
+                adapter->vidpn.SetScanoutSource(allocation);
             }
             else
             {

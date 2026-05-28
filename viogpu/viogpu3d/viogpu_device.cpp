@@ -442,6 +442,18 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
 
     if (pPresent->Flags.Flip)
     {
+        // Flip-model present: the runtime advances the swapchain by making
+        // src the new active primary.  Latch m_sourceRes so the next vsync
+        // Flip scans out the back buffer the runtime just made current.
+        DXGK_ALLOCATIONLIST *dxgk_src = &pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX];
+        if (dxgk_src->hDeviceSpecificAllocation)
+        {
+            VioGpuDeviceAllocation *srcDev =
+                VioGpuDeviceAllocation::FromHandle(dxgk_src->hDeviceSpecificAllocation);
+            VioGpuAllocation *srcAlloc = srcDev ? srcDev->GetAllocation() : NULL;
+            if (srcAlloc && srcAlloc->IsPrimary())
+                m_pAdapter->vidpn.SetScanoutSource(srcAlloc);
+        }
         return STATUS_SUCCESS;
     }
 
@@ -535,6 +547,16 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
 
     if (pPresent->Flags.Blt)
     {
+        // The blt-present src is the back buffer DWM just rendered into.
+        // When it is a flip primary, latch it as the active VidPnSource so
+        // the vsync FlushToScreen scans out the resource directly -- no
+        // out-of-band signalling.
+        if (src)
+        {
+            VioGpuAllocation *srcAlloc = src->GetAllocation();
+            if (srcAlloc && srcAlloc->IsPrimary())
+                m_pAdapter->vidpn.SetScanoutSource(srcAlloc);
+        }
         if (pPresent->pDmaBuffer && dst && src)
         {
             if (true /*m_Context.IsVirgl()*/) {

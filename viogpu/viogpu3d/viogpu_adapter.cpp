@@ -538,11 +538,10 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 pDriverCaps->PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_NONE;
                 pDriverCaps->PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_NONE;
 
-                // Blt-present model (VBox-faithful): advertise NO flip support so
-                // dxgkrnl issues per-present Blt (DxgkDdiPresent) instead of an
-                // MMIO/direct flip. A host-rendering driver cannot satisfy a
-                // VidPnSource-address flip (its scanout dmabuf has no guest
-                // address), but it CAN retire a Blt present via the DMA fence.
+                // Flip-model presents arrive via DxgkDdiPresent with Flags.Flip
+                // (no MMIO PhysicalAddress is required); VioGpuDevice::Present
+                // latches the new primary in m_sourceRes and the vsync Flip
+                // scans it out by res_id.
                 pDriverCaps->FlipCaps.FlipOnVSyncMmIo = FALSE;
 
                 pDriverCaps->MaxQueuedFlipOnVSync = 0;
@@ -835,29 +834,6 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_INVALID_PARAMETER;
                 }
                 status = allocation->EscapeResourceBlobSetInfo(&pVioGpuEscape->BlobInfoSet);
-
-                break;
-            }
-        case VIOGPU_SET_SCANOUT_SOURCE:
-            {
-                size = sizeof(VIOGPU_SET_SCANOUT_SOURCE_REQ);
-                if (pVioGpuEscape->DataLength < size)
-                {
-                    DbgPrint(TRACE_LEVEL_ERROR,
-                             ("%s buffer too small %d, should be at least %d\n",
-                              __FUNCTION__,
-                              pVioGpuEscape->DataLength,
-                              size));
-                    return STATUS_INVALID_BUFFER_SIZE;
-                }
-                VioGpuAllocation *allocation = AllocationFromHandle(pVioGpuEscape->SetScanoutSource.ResHandle);
-                if (allocation == NULL)
-                {
-                    DbgPrint(TRACE_LEVEL_ERROR, ("%s invalid handle\n", __FUNCTION__));
-                    return STATUS_INVALID_PARAMETER;
-                }
-                vidpn.SetScanoutSource(allocation);
-                status = STATUS_SUCCESS;
 
                 break;
             }

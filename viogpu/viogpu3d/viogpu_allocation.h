@@ -127,6 +127,11 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
         return m_IsBlob && m_Blob.Created && m_Blob.Mapped;
     }
 
+    inline BOOL IsPrimary() const
+    {
+        return m_IsPrimary;
+    }
+
     void AttachBacking(MDL *pMdl, size_t pageCount, size_t pageOffset);
     void DetachBacking();
 
@@ -157,6 +162,10 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // Import allocation: m_Id is adopted (owned by another allocation), so
     // the destructor must not DestroyResource it. See the import ctor.
     BOOL m_IsImport;
+    // Flippable primary: the allocation is a VidPnSource scanout target and
+    // VioGpuDevice::Present updates VioGpuVidPN's m_sourceRes when it sees
+    // this allocation as the blt-present source.
+    BOOL m_IsPrimary;
     union {
         VIOGPU_RESOURCE_3D_OPTIONS m_3dOptions;
         struct {
