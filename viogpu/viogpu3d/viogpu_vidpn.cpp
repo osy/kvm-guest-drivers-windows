@@ -2143,6 +2143,33 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
 
 void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res)
 {
+    // Only the full-screen desktop primary may become the scanout source.
+    // DWM presents its cursor (e.g. 32x32) and individual windows (sub-screen)
+    // as their OWN "primary" BIND_PRESENT IMPORT allocations as well; without
+    // this gate the most-recently-created/flipped one clobbers the desktop and
+    // the screen scans out a cursor/window surface (black/garbage desktop).
+    //
+    // IMPORT primaries carry no blob dimensions (m_Blob.Info is zeroed and no
+    // RES_BLOB_SET_INFO is issued on the import adopter), so the framebuffer
+    // BYTE SIZE -- which IS populated on every allocation, imports included --
+    // is the discriminator: the desktop primary backs the whole screen
+    // (>= mode_w * mode_h * 4), the cursor / per-window primaries are far
+    // smaller.  A 0 mode (before CommitVidPn) bypasses the gate so the boot
+    // primary still promotes.
+    if (res != NULL)
+    {
+        UINT mw = m_CurrentModes[0].DispInfo.Width;
+        UINT mh = m_CurrentModes[0].DispInfo.Height;
+        ULONGLONG modeBytes = (ULONGLONG)mw * (ULONGLONG)mh * 4ull;
+        ULONGLONG resBytes = res->GetSize();
+        // 95% margin tolerates stride / height padding on the desktop dmabuf
+        // while still excluding sub-screen surfaces.
+        if (mw != 0 && mh != 0 && resBytes * 100ull < modeBytes * 95ull)
+        {
+            return;
+        }
+    }
+
     // Mirror SetVidPnSourceAddress's refcount/swap discipline. Blob scanout is
     // keyed by res_id, so there is no guest PrimaryAddress; zero it.
     if (res)

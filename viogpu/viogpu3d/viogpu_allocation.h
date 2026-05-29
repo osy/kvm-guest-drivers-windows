@@ -140,6 +140,15 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
         return m_IsPrimary;
     }
 
+    // Backing byte size of the allocation (framebuffer bytes for a primary).
+    // Always populated, including for IMPORT primaries, so it is the reliable
+    // discriminator between the full-screen desktop primary and DWM's
+    // sub-screen cursor / per-window primaries when gating scanout promotion.
+    inline ULONGLONG GetSize() const
+    {
+        return m_Size;
+    }
+
     // Host-COM-backed shared allocation: no virtio res_id, no context attach,
     // no DestroyResource. Exists only as a WDDM sharing token.
     inline BOOL IsShared() const
