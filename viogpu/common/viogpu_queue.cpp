@@ -558,7 +558,17 @@ BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_si
     LARGE_INTEGER timeout = {0};
     timeout.QuadPart = Int32x32To64(1000, -10000);
 
-    QueueBuffer(vbuf);
+    if (QueueBuffer(vbuf) == (UINT)-1)
+    {
+        // Submission failed: QueueBuffer already fired complete_cb (satisfying
+        // the wait) and left this non-auto_release vbuf to us. Drop our wait-ctx
+        // ref, free the vbuf, and report failure instead of returning an
+        // unfilled response (*buf stays NULL).
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s submit failed capset_id=%lu\n", __FUNCTION__, capset_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_SUCCESS);
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
 
     status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
 

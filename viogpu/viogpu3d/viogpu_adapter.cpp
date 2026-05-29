@@ -730,11 +730,20 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_INVALID_PARAMETER_2;
                 };
 
-                PGPU_VBUFFER vbuf;
-                ctrlQueue.AskCapset(&vbuf,
-                                    pVioGpuEscape->Capset.CapsetId,
-                                    pCapsetInfo->max_size,
-                                    pVioGpuEscape->Capset.Version);
+                PGPU_VBUFFER vbuf = NULL;
+                if (!ctrlQueue.AskCapset(&vbuf,
+                                         pVioGpuEscape->Capset.CapsetId,
+                                         pCapsetInfo->max_size,
+                                         pVioGpuEscape->Capset.Version) ||
+                    vbuf == NULL)
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR,
+                             ("%s AskCapset failed for capset id %llu\n",
+                              __FUNCTION__,
+                              (ULONGLONG)pVioGpuEscape->Capset.CapsetId));
+                    status = STATUS_IO_TIMEOUT;
+                    break;
+                }
                 __try
                 {
                     UCHAR *buf = ((PGPU_RESP_CAPSET)vbuf->resp_buf)->capset_data;
