@@ -865,6 +865,9 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_INVALID_PARAMETER;
                 }
                 pDevice->m_Context.Init(&pVioGpuEscape->CtxInit);
+                // The UMD references the context by its virtio id when it
+                // targets cross-device submits (IMPORT present_ctx_id).
+                pVioGpuEscape->CtxInit.CtxId = pDevice->m_Context.GetId();
 
                 if (pVioGpuEscape->CtxInit.CapsetID == VIRTIO_GPU_CAPSET_VENUS ||
                     pVioGpuEscape->CtxInit.CapsetID == VIRTIO_GPU_CAPSET_NEPTUNE)

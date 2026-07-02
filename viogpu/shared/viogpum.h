@@ -176,6 +176,7 @@ typedef struct _VIOGPU_CTX_INIT_REQ
     UINT CapsetID;
     UINT NumRings;
     UCHAR DebugName[64];
+    UINT CtxId; // out: virtio context id of the created context
 } VIOGPU_CTX_INIT_REQ;
 #pragma pack()
 
