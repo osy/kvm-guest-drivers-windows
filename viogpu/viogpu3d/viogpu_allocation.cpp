@@ -881,9 +881,14 @@ NTSTATUS VioGpuAllocation::MapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildP
         return STATUS_SUCCESS;
     }
 
-    } else {
-        DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s host-only blob resources cannot be mapped via aperture\n", __FUNCTION__));
-        return STATUS_INVALID_PARAMETER;
+    // Host-only blob (e.g. an IMPORT primary aliasing a host dmabuf): the
+    // content lives host-side and nothing reads it through the aperture,
+    // but VidMm still pages the allocation in when a DMA submission
+    // references it (the flip present's fenced EXECBUF does).  Accept the
+    // map as bookkeeping; failing it fails the paging operation, which
+    // dxgkrnl escalates to a bugcheck.
+    SetDxPhysicalAddress(pBuildPagingBuffer->MapApertureSegment.OffsetInPages * PAGE_SIZE);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS VioGpuAllocation::UnmapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildPagingBuffer)
