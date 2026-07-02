@@ -1204,8 +1204,6 @@ NTSTATUS
 APIENTRY
 VioGpu3DDdiPreemptCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PREEMPTCOMMAND *pPreemptCommand)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
-
     // DxgkDdiPreemptCommand documents that any error return triggers
     // bugcheck 0x119 (arg1=2). A NULL deref here would also AV-crash
     // the host. Guard the argument and return SUCCESS.
@@ -1215,10 +1213,29 @@ VioGpu3DDdiPreemptCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PREEMPT
         return STATUS_SUCCESS;
     }
 
+    // SchedulingCaps.PreemptionAware=1 lets dxgkrnl request engine
+    // preemption.  The engine cannot actually preempt (PreemptionCaps
+    // granularity is NONE), and the host executes everything submitted, so
+    // any command dxgkrnl believes is in flight has effectively completed.
+    // WDDM requires acknowledging the request by raising
+    // DXGK_INTERRUPT_DMA_PREEMPTED with the preemption fence id and the
+    // latest completed fence id; without it the GPU scheduler waits on the
+    // preempt forever and declares a hardware hang (TDR).
+    VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
+
     DbgPrint(TRACE_LEVEL_ERROR,
-             ("<---> %s UNSUPPORTED PREEMPTION FUNCTION fence_id=%d\n",
-              __FUNCTION__,
-              pPreemptCommand->PreemptionFenceId));
+             ("<---> %s PreemptionFenceId=%d node=%u engine=%u -> notify DMA_PREEMPTED\n",
+              __FUNCTION__, pPreemptCommand->PreemptionFenceId,
+              pPreemptCommand->NodeOrdinal, pPreemptCommand->EngineOrdinal));
+
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
+    interrupt.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
+    interrupt.DmaPreempted.PreemptionFenceId = pPreemptCommand->PreemptionFenceId;
+    interrupt.DmaPreempted.LastCompletedFenceId =
+        (UINT)InterlockedOr(&pAdapter->m_LastCompletedFenceId, 0);
+    interrupt.DmaPreempted.NodeOrdinal = pPreemptCommand->NodeOrdinal;
+    interrupt.DmaPreempted.EngineOrdinal = pPreemptCommand->EngineOrdinal;
+    pAdapter->NotifyInterrupt(&interrupt, true);
 
     return STATUS_SUCCESS;
 };
