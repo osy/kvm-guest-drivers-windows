@@ -470,18 +470,36 @@ void VioGpuAllocation::FlushToScreen(UINT scan_id)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d IsBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));
 
     if (m_IsBlob) {
+        // Snapshot under the same lock EscapeResourceBlobSetInfo writes
+        // under: an unsynchronized read can pair a pre-write rect with
+        // post-write framebuffer fields in one scanout command.
+        VIOGPU_BLOB_INFO info;
+        BOOL infoValid;
+        {
+            auto lock_guard = LockGuard();
+            info = m_Blob.Info;
+            infoValid = m_Blob.InfoValid;
+        }
+
+        DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s scanout blob res_id=%d valid=%d %dx%d\n", __FUNCTION__, m_Id, infoValid, info.width, info.height));
+
+        // A blob whose info has not been published yet has zero
+        // dimensions; the host rejects a degenerate scanout rect, so
+        // hold off the scanout until the info lands (the next flip
+        // retries with the same resource).
+        if (!infoValid || info.width < 16 || info.height < 16) {
+            DbgPrint(TRACE_LEVEL_INFORMATION,
+                     ("---> %s deferring scanout of blob res_id=%d without valid info\n", __FUNCTION__, m_Id));
+            return;
+        }
+
         GPU_RECT rect;
         rect.x = 0;
         rect.y = 0;
-        rect.width = m_Blob.Info.width;
-        rect.height = m_Blob.Info.height;
+        rect.width = info.width;
+        rect.height = info.height;
 
-        DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s scanout blob res_id=%d valid=%d %dx%d\n", __FUNCTION__, m_Id, m_Blob.InfoValid, m_Blob.Info.width, m_Blob.Info.height));
-
-        if (!m_Blob.InfoValid) {
-            DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s Blob resource has no info attached \n", __FUNCTION__));
-        }
-        m_adapter->ctrlQueue.SetScanoutBlob(scan_id, m_Id, rect, m_Blob.Info);
+        m_adapter->ctrlQueue.SetScanoutBlob(scan_id, m_Id, rect, info);
         // TODO: guard with IsGuest()
         m_adapter->ctrlQueue.ResFlush(m_Id, rect);
     } else {
