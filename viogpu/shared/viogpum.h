@@ -262,11 +262,22 @@ typedef struct _VIOGPU_CREATE_RESOURCE_EXCHANGE
 // allocation: ownership stays with the creating allocation.  Blob info
 // (w/h/format/stride) is published separately via VIOGPU_RES_BLOB_SET_INFO.
 // Keep in lockstep with virtio-win-mesa/src/virtio/virtio-gpu/wddm_hw.h.
+// present_cmd carries opaque transport bytes the KMD submits verbatim as a
+// fenced EXECBUF for each flip present of this primary, so the WDDM present
+// fence retires when the host GPU finishes the frame.  The submit targets
+// present_ctx_id (the transport context owning the swapchain, which is not
+// the presenting device's context) on present_ring_idx.
+// present_cmd_size == 0 disables the per-present submit.
+#define VIOGPU_PRESENT_CMD_MAX 40
 #pragma pack(1)
 typedef struct _VIOGPU_RESOURCE_IMPORT_OPTIONS
 {
     ULONG res_id;
     ULONG primary;   // non-zero: place in the CPU-visible aperture (segment 1) as a flippable primary
+    ULONG present_ctx_id;
+    ULONG present_ring_idx;
+    ULONG present_cmd_size;
+    UCHAR present_cmd[VIOGPU_PRESENT_CMD_MAX];
 } VIOGPU_RESOURCE_IMPORT_OPTIONS;
 #pragma pack()
 
@@ -334,8 +345,8 @@ struct _VIOGPU_BLIT_PRESENT
 #define VIOGPU_CMD_TRANSFER_FROM_HOST 0x3 // Transfer resource to host
 #define VIOGPU_CMD_MAP_BLOB           0x4 // Map blob resource
 #define VIOGPU_CMD_UNMAP_BLOB         0x5 // Unmap blob resource
-
-//#define VIOGPU_CMD_SUBMIT_UM          0x6
+#define VIOGPU_CMD_SUBMIT_ON_CTX      0x6 // Submit to an explicit virtio context
+                                          // (payload: VIOGPU_SUBMIT_ON_CTX_HDR + bytes)
 
 // #define VIOGPU_EXECBUF_FENCE_FD_IN  0x01
 // #define VIOGPU_EXECBUF_FENCE_FD_OUT 0x02
@@ -351,6 +362,15 @@ typedef struct _VIOGPU_COMMAND_HDR
     UINT flags;
     UINT ring_idx;
 } VIOGPU_COMMAND_HDR;
+#pragma pack()
+
+// Leading payload of a VIOGPU_CMD_SUBMIT_ON_CTX command; the EXECBUF bytes
+// follow.  hdr.size covers this header plus the bytes.
+#pragma pack(1)
+typedef struct _VIOGPU_SUBMIT_ON_CTX_HDR
+{
+    ULONG ctx_id;
+} VIOGPU_SUBMIT_ON_CTX_HDR;
 #pragma pack()
 
 #pragma pack(1)

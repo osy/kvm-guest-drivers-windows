@@ -1056,7 +1056,6 @@ VOID VioGpuAdapter::DpcRoutine(VOID)
                               resp->ctx_id,
                               pcmd->type));
                 }
-                DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] RESP fence=%llu ctx=%lu cmd_type=%lu resp_type=0x%x has_cb=%d\n", resp->fence_id, resp->ctx_id, pcmd->type, resp->type, (pvbuf->complete_cb != NULL))); // [bringup-tdr]
                 if (pvbuf->complete_cb != NULL)
                 {
                     pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, pvbuf->resp_buf);

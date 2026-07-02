@@ -124,7 +124,6 @@ void VioGpuCommand::Run()
         m_pCommand += cmdHdr->size;
 
         DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s fence_id=%d running command=%d\n", __FUNCTION__, m_FenceId, cmdHdr->type));
-        DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] Run issue fence=%d cmd_type=%d flags=0x%x ctx=%u\n", m_FenceId, cmdHdr->type, cmdHdr->flags, (m_pDevice ? ((cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId()) : 0))); // [bringup-tdr]
 
         switch (cmdHdr->type)
         {
@@ -146,6 +145,55 @@ void VioGpuCommand::Run()
                     m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
                                                         cmdHdr->size,
                                                         (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
+                                                        (cmdHdr->flags & VIOGPU_EXECBUF_RING_IDX) != 0,
+                                                        cmdHdr->ring_idx,
+                                                        VioGpuCommand::QueueRunningCb,
+                                                        this);
+                    return;
+                }
+
+            case VIOGPU_CMD_SUBMIT_ON_CTX:
+                {
+                    // Submit to an explicit virtio context: the payload is a
+                    // VIOGPU_SUBMIT_ON_CTX_HDR naming the target context (the
+                    // transport context that owns a swapchain the presenting
+                    // device flips) followed by the EXECBUF bytes.
+                    if (cmdHdr->size <= sizeof(VIOGPU_SUBMIT_ON_CTX_HDR))
+                    {
+                        DbgPrint(TRACE_LEVEL_ERROR,
+                                 ("%s fence_id=%d SUBMIT_ON_CTX payload too small (size=%u); skipping\n",
+                                  __FUNCTION__, m_FenceId, cmdHdr->size));
+                        goto end;
+                    }
+                    VIOGPU_SUBMIT_ON_CTX_HDR *ctxHdr = (VIOGPU_SUBMIT_ON_CTX_HDR *)cmdBody;
+                    const ULONG payloadSize = cmdHdr->size - sizeof(VIOGPU_SUBMIT_ON_CTX_HDR);
+
+                    PBYTE submitCmd = new (NonPagedPoolNx) BYTE[payloadSize];
+                    if (!submitCmd)
+                    {
+                        DbgPrint(TRACE_LEVEL_ERROR,
+                                 ("%s fence_id=%d OOM allocating submit buffer (size=%u); skipping command\n",
+                                  __FUNCTION__, m_FenceId, payloadSize));
+                        goto end;
+                    }
+                    RtlCopyMemory(submitCmd, (PBYTE)cmdBody + sizeof(VIOGPU_SUBMIT_ON_CTX_HDR),
+                                  payloadSize);
+
+                    // Rate-gated (see the flip-log comment in viogpu_device.cpp:
+                    // unthrottled per-DMA serial logging paces the pipeline).
+                    static LONG s_submitOnCtxLogCount = 0;
+                    const LONG socLogN = InterlockedIncrement(&s_submitOnCtxLogCount);
+                    if (socLogN <= 8 || (socLogN & 63) == 0)
+                    {
+                        DbgPrint(TRACE_LEVEL_INFORMATION,
+                                 ("submit_on_ctx n=%d fence=%d ctx=%u ring=%u\n",
+                                  socLogN, m_FenceId, ctxHdr->ctx_id, cmdHdr->ring_idx));
+                    }
+
+                    AddPending();
+                    m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
+                                                        payloadSize,
+                                                        ctxHdr->ctx_id,
                                                         (cmdHdr->flags & VIOGPU_EXECBUF_RING_IDX) != 0,
                                                         cmdHdr->ring_idx,
                                                         VioGpuCommand::QueueRunningCb,
@@ -260,7 +308,6 @@ void VioGpuCommand::Run()
 
 end:
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s finished fence_id=%d, this=%p, m_pAdapter=%p\n", __FUNCTION__, m_FenceId, this, m_pAdapter));
-    DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] Run DONE fence=%d\n", m_FenceId)); // [bringup-tdr]
 
     if (m_allocations)
     {
@@ -283,6 +330,9 @@ end:
 
     m_pCommander->CommandFinished();
 
+    // The commander runs one command at a time (VIOGPU_MAX_RUNNING == 1) and
+    // dxgkrnl serializes SubmitCommand, so completions arrive in submission
+    // order and the reported fence only ever advances.
     InterlockedExchange(&m_pAdapter->m_LastCompletedFenceId, m_FenceId);
 
     delete this;

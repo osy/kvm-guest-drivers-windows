@@ -87,6 +87,17 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPOR
     m_IsPrimary = !!options->primary;
     m_IsShared = FALSE;
 
+    // Per-flip host present: opaque transport bytes submitted as a fenced
+    // EXECBUF on the owning transport context by DxgkDdiPresent.
+    m_PresentCtxId = options->present_ctx_id;
+    m_PresentRingIdx = options->present_ring_idx;
+    m_PresentCmdSize = 0;
+    if (options->present_cmd_size && options->present_cmd_size <= VIOGPU_PRESENT_CMD_MAX)
+    {
+        m_PresentCmdSize = options->present_cmd_size;
+        RtlCopyMemory(m_PresentCmd, options->present_cmd, options->present_cmd_size);
+    }
+
     // Present as a host-backed HOST3D blob so DxgkCreateAllocation's segment
     // selection and FlushToScreen (SetScanoutBlob) treat it exactly like the
     // dmabuf it aliases.
@@ -868,10 +879,11 @@ NTSTATUS VioGpuAllocation::MapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildP
         AttachBacking(pMdl, pageCount, mdlPageOffset);
         SetDxPhysicalAddress(pBuildPagingBuffer->MapApertureSegment.OffsetInPages * PAGE_SIZE);
         return STATUS_SUCCESS;
+    }
+
     } else {
         DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s host-only blob resources cannot be mapped via aperture\n", __FUNCTION__));
         return STATUS_INVALID_PARAMETER;
-    }
 }
 
 NTSTATUS VioGpuAllocation::UnmapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildPagingBuffer)

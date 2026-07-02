@@ -2028,7 +2028,6 @@ void VioGpuVidPN::Flip()
         address = m_sourceAddress;
         KeReleaseSpinLock(&m_sourceLock, oldIrql);
 
-        DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] Flip handling addr=%llx res_id=%d isBlob=%d\n", address.QuadPart, res ? res->GetId() : 0, res ? res->IsBlob() : 0)); // [bringup-tdr]
         // Blob primaries (the blt-present standing dmabuf set via
         // SetScanoutSource) scan out by res_id through SetScanoutBlob and carry
         // no guest PrimaryAddress, so flush them regardless of address; only 3D
@@ -2126,7 +2125,7 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
         oldRes->ReleaseDeferred();
     }
 
-    DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] SetVidPnSourceAddress res_id=%d isBlob=%d srcId=%d addr=%llx\n", newRes ? newRes->GetId() : 0, newRes ? newRes->IsBlob() : 0, pSetVidPnSourceAddress->VidPnSourceId, pSetVidPnSourceAddress->PrimaryAddress.QuadPart)); // [bringup-tdr]
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("SetVidPnSourceAddress res_id=%d isBlob=%d host3d=%d guest=%d srcId=%d addr=%llx size=%llu\n", newRes ? newRes->GetId() : 0, newRes ? newRes->IsBlob() : 0, newRes ? newRes->IsHost3dBlob() : 0, newRes ? newRes->IsGuestBlob() : 0, pSetVidPnSourceAddress->VidPnSourceId, pSetVidPnSourceAddress->PrimaryAddress.QuadPart, (unsigned long long)(newRes ? newRes->GetSize() : 0)));
 
     InterlockedOr(&m_shouldFlip, 1);
 
@@ -2166,6 +2165,8 @@ void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res)
         // while still excluding sub-screen surfaces.
         if (mw != 0 && mh != 0 && resBytes * 100ull < modeBytes * 95ull)
         {
+            DbgPrint(TRACE_LEVEL_INFORMATION, ("SetScanoutSource REJECT res_id=%d size=%llu < modeBytes=%llu (mode %ux%u)\n",
+                                               res->GetId(), (unsigned long long)resBytes, (unsigned long long)modeBytes, mw, mh));
             return;
         }
     }
@@ -2189,8 +2190,8 @@ void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res)
         oldRes->ReleaseDeferred();
     }
 
-    DbgPrint(TRACE_LEVEL_INFORMATION, ("[bringup-tdr] SetScanoutSource res_id=%d isBlob=%d\n",
-                                       res ? res->GetId() : 0, res ? res->IsBlob() : 0)); // [bringup-tdr]
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("SetScanoutSource ACCEPT res_id=%d isBlob=%d size=%llu\n",
+                                       res ? res->GetId() : 0, res ? res->IsBlob() : 0, (unsigned long long)(res ? res->GetSize() : 0)));
 
     InterlockedOr(&m_shouldFlip, 1);
 }

@@ -156,6 +156,26 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
         return m_IsShared;
     }
 
+    inline ULONG GetPresentCtxId() const
+    {
+        return m_PresentCtxId;
+    }
+
+    inline ULONG GetPresentRingIdx() const
+    {
+        return m_PresentRingIdx;
+    }
+
+    inline ULONG GetPresentCmdSize() const
+    {
+        return m_PresentCmdSize;
+    }
+
+    inline const UCHAR *GetPresentCmd() const
+    {
+        return m_PresentCmd;
+    }
+
     void AttachBacking(MDL *pMdl, size_t pageCount, size_t pageOffset);
     void DetachBacking();
 
@@ -197,6 +217,15 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     UINT m_SharedWidth;
     UINT m_SharedHeight;
     UINT m_SharedFormat; // DXGI_FORMAT
+    // Per-flip host present for an IMPORT primary: opaque transport bytes
+    // DxgkDdiPresent submits verbatim as a fenced EXECBUF on the owning
+    // transport context's present ring, retiring the flip's fence when the
+    // host GPU finishes the frame.  m_PresentCmdSize == 0 on every
+    // non-primary allocation type.
+    ULONG m_PresentCtxId = 0;
+    ULONG m_PresentRingIdx = 0;
+    ULONG m_PresentCmdSize = 0;
+    UCHAR m_PresentCmd[VIOGPU_PRESENT_CMD_MAX] = {};
     union {
         VIOGPU_RESOURCE_3D_OPTIONS m_3dOptions;
         struct {

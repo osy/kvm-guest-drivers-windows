@@ -445,14 +445,77 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
         // Flip-model present: the runtime advances the swapchain by making
         // src the new active primary.  Latch m_sourceRes so the next vsync
         // Flip scans out the back buffer the runtime just made current.
+        VioGpuAllocation *srcAlloc = NULL;
         DXGK_ALLOCATIONLIST *dxgk_src = &pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX];
         if (dxgk_src->hDeviceSpecificAllocation)
         {
             VioGpuDeviceAllocation *srcDev =
                 VioGpuDeviceAllocation::FromHandle(dxgk_src->hDeviceSpecificAllocation);
-            VioGpuAllocation *srcAlloc = srcDev ? srcDev->GetAllocation() : NULL;
+            srcAlloc = srcDev ? srcDev->GetAllocation() : NULL;
             if (srcAlloc && srcAlloc->IsPrimary())
                 m_pAdapter->vidpn.SetScanoutSource(srcAlloc);
+        }
+
+        // Drive the host present for this flip: the primary carries
+        // pre-encoded transport bytes (its swapchain's WSI_PRESENT) that
+        // are submitted as a fenced EXECBUF on the transport context that
+        // owns the swapchain.  The flip's DMA fence then retires when the
+        // host GPU finishes rendering the frame into the scanout dmabuf,
+        // which paces DWM's present queue to real frame completion.
+        const ULONG presentCmdSize = srcAlloc ? srcAlloc->GetPresentCmdSize() : 0;
+        const ULONG flipDmaSize = sizeof(VIOGPU_COMMAND_HDR) +
+                                  sizeof(VIOGPU_SUBMIT_ON_CTX_HDR) + presentCmdSize;
+        // Rate-gated: synchronous serial DbgPrint costs milliseconds per
+        // line, so unthrottled per-flip logging paces the present pipeline.
+        static LONG s_flipLogCount = 0;
+        const LONG flipLogN = InterlockedIncrement(&s_flipLogCount);
+        if (flipLogN <= 16 || (flipLogN & 255) == 0)
+        {
+            DbgPrint(TRACE_LEVEL_INFORMATION,
+                     ("Present flip n=%d src=%p cmdSize=%u ctx=%u ring=%u dma=%p dmaSize=%u\n",
+                      flipLogN, srcAlloc, presentCmdSize, srcAlloc ? srcAlloc->GetPresentCtxId() : 0,
+                      srcAlloc ? srcAlloc->GetPresentRingIdx() : 0,
+                      pPresent->pDmaBuffer, pPresent->DmaSize));
+        }
+        if (presentCmdSize && pPresent->pDmaBuffer && pPresent->DmaSize >= flipDmaSize)
+        {
+            VioGpuCommand *flipCmd = new (NonPagedPoolNx) VioGpuCommand(m_pAdapter);
+            if (!flipCmd)
+            {
+                DbgPrint(TRACE_LEVEL_ERROR,
+                         ("%s VioGpuCommand allocation failed for flip\n", __FUNCTION__));
+                return STATUS_NO_MEMORY;
+            }
+
+            NTSTATUS attachStatus = flipCmd->AttachAllocations(pPresent->pAllocationList,
+                                                               DXGK_PRESENT_MAX_INDEX + 1);
+            if (!NT_SUCCESS(attachStatus))
+            {
+                delete flipCmd;
+                return attachStatus;
+            }
+
+            if (pPresent->pDmaBufferPrivateData)
+            {
+                void **privateData = (void **)pPresent->pDmaBufferPrivateData;
+                *privateData = flipCmd->ToHandle();
+            }
+            flipCmd->SetDmaBuf((char *)pPresent->pDmaBuffer);
+
+            BYTE *dma = (BYTE *)pPresent->pDmaBuffer;
+            VIOGPU_COMMAND_HDR hdr;
+            RtlZeroMemory(&hdr, sizeof(hdr));
+            hdr.type = VIOGPU_CMD_SUBMIT_ON_CTX;
+            hdr.size = sizeof(VIOGPU_SUBMIT_ON_CTX_HDR) + presentCmdSize;
+            hdr.flags = VIOGPU_EXECBUF_RING_IDX;
+            hdr.ring_idx = srcAlloc->GetPresentRingIdx();
+            VIOGPU_SUBMIT_ON_CTX_HDR ctxHdr;
+            ctxHdr.ctx_id = srcAlloc->GetPresentCtxId();
+            RtlCopyMemory(dma, &hdr, sizeof(hdr));
+            RtlCopyMemory(dma + sizeof(hdr), &ctxHdr, sizeof(ctxHdr));
+            RtlCopyMemory(dma + sizeof(hdr) + sizeof(ctxHdr),
+                          srcAlloc->GetPresentCmd(), presentCmdSize);
+            pPresent->pDmaBuffer = dma + flipDmaSize;
         }
         return STATUS_SUCCESS;
     }
