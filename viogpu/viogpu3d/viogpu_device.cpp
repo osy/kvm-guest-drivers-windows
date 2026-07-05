@@ -440,6 +440,19 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s\n", __FUNCTION__));
 
+    // DMA buffers (and their private-data area) are RECYCLED by dxgkrnl.
+    // Every path below that returns without storing a VioGpuCommand*
+    // (windowed flips with no present bytes, error exits) would leave a
+    // STALE pointer from the buffer's previous user; SubmitCommand then
+    // resurrects that command and PrepareSubmit clobbers its fence id —
+    // fences complete wrongly or never (intermittent TDR at first
+    // windowed flip, 2026-07-04). NULL it up front; real writers below
+    // overwrite.
+    if (pPresent->pDmaBufferPrivateData)
+    {
+        *(void **)pPresent->pDmaBufferPrivateData = NULL;
+    }
+
     if (pPresent->Flags.Flip)
     {
         // Flip-model present: the runtime advances the swapchain by making
@@ -654,6 +667,14 @@ NTSTATUS VioGpuDevice::Render(DXGKARG_RENDER *pRender)
 {
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    // See Present: recycled DMA private data must never carry a stale
+    // command pointer into SubmitCommand (multipass/error exits below
+    // return before the real write).
+    if (pRender->pDmaBufferPrivateData)
+    {
+        *(void **)pRender->pDmaBufferPrivateData = NULL;
+    }
 
     char *pDmaBufStart = (char *)pRender->pDmaBuffer;
 

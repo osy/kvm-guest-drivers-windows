@@ -602,7 +602,13 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
 
                     pSegmentInfo->PagingBufferPrivateDataSize = 0;
 
-                    pSegmentInfo->PagingBufferSegmentId = 1;
+                    // 0 = paging buffers from SYSTEM memory.  Segment 1 is the
+                    // CPU-INVISIBLE aperture: pointing the paging pool there
+                    // leaves VIDMM_DMA_POOL::BeginCPUAccess with nothing to
+                    // map, and every TDR's debug-info collection bugchecks
+                    // 0x7E instead of recovering (dxgmms1 null-class AV; two
+                    // minidumps 2026-07-04).  VBoxMPWddm uses 0 as well.
+                    pSegmentInfo->PagingBufferSegmentId = 0;
                     pSegmentInfo->PagingBufferSize = 10 * PAGE_SIZE;
 
                     //
@@ -1007,7 +1013,8 @@ VOID VioGpuAdapter::DpcRoutine(VOID)
                     DbgPrint(TRACE_LEVEL_ERROR,
                              ("<--> %s pvbuf=%p has no resp_buf for cmd_type=0x%x\n",
                               __FUNCTION__, pvbuf, pcmd ? pcmd->type : 0));
-                    if (pvbuf->complete_cb != NULL)
+                    if (pvbuf->complete_cb != NULL &&
+                        InterlockedExchange(&pvbuf->complete_fired, 1) == 0)
                     {
                         pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, NULL);
                     }
@@ -1056,7 +1063,8 @@ VOID VioGpuAdapter::DpcRoutine(VOID)
                               resp->ctx_id,
                               pcmd->type));
                 }
-                if (pvbuf->complete_cb != NULL)
+                if (pvbuf->complete_cb != NULL &&
+                    InterlockedExchange(&pvbuf->complete_fired, 1) == 0)
                 {
                     pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, pvbuf->resp_buf);
                 }

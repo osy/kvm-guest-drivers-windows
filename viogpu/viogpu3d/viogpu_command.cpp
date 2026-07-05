@@ -217,6 +217,43 @@ void VioGpuCommand::Run()
                     return;
                 }
 
+            case VIOGPU_CMD_UNMAP_BLOB_BY_ID:
+                {
+                    // DISCARD_CONTENT paging op: tear down the host mapping
+                    // of every listed res_id.  VidMm frees the segment range
+                    // when a dead process's blob is discarded, and a stale
+                    // host mapping there poisons the next blob mapped into
+                    // the reused range (dead transport rings, 2026-07-04).
+                    const UINT *res_ids = (const UINT *)cmdBody;
+                    const size_t count = cmdHdr->size / sizeof(UINT);
+
+                    AddPending();
+                    for (size_t i = 0; i < count; i++)
+                    {
+                        if (!res_ids[i])
+                        {
+                            continue;
+                        }
+                        AddPending();
+                        static LONG s_discardLogCount = 0;
+                        const LONG dlogN = InterlockedIncrement(&s_discardLogCount);
+                        if (dlogN <= 16 || (dlogN & 63) == 0)
+                        {
+                            DbgPrint(TRACE_LEVEL_WARNING,
+                                     ("<---> %s fence_id=%d DISCARD-unmap blob res_id=%d n=%d\n",
+                                      __FUNCTION__, m_FenceId, res_ids[i], dlogN));
+                        }
+                        m_pAdapter->ctrlQueue.ResourceUnmapBlob(res_ids[i], 0,
+                                                                VioGpuCommand::QueueRunningCb,
+                                                                this);
+                    }
+                    if (DropPending() == 0)
+                    {
+                        break;
+                    }
+                    return;
+                }
+
             case VIOGPU_CMD_MAP_BLOB:
             case VIOGPU_CMD_UNMAP_BLOB:
                 {

@@ -249,10 +249,18 @@ VioGpuAllocation::~VioGpuAllocation(void)
 
     if (m_IsBlob && m_Blob.Mapped)
     {
-        // This happening is probably an app bug
-        DbgPrint(TRACE_LEVEL_WARNING, ("---> %s res_id=%d UNREACHABLE unmapping mapped blob in destructor\n", __FUNCTION__, m_Id));
-        // FIXME: this is likely what causes QEMU to sometimes abort
-        //m_adapter->ctrlQueue.ResourceUnmapBlob(m_Id, 0, NULL, NULL);
+        // Orphaned mapping (process died without the UMD unmap).  Do NOT
+        // send UNMAP_BLOB here: back-to-back unmap+destroy re-triggers the
+        // QEMU async-unmap/destroy race -- as a main-loop wedge now
+        // (cmdq suspended forever on the unmap, observed 17:45 2026-07-04)
+        // rather than the historical abort.  The DISCARD_CONTENT paging op
+        // (BuildPagingBuffer) performs the ordered host unmap when VidMm
+        // actually frees the range; the destroy below is safe because the
+        // host keeps blob memory alive until RES_UNREF.
+        DbgPrint(TRACE_LEVEL_WARNING,
+                 ("---> %s res_id=%d still-mapped blob at destroy (host unmap deferred to DISCARD)\n",
+                  __FUNCTION__, m_Id));
+        m_Blob.Mapped = FALSE;
     }
 
     if (m_IsImport)
@@ -349,6 +357,14 @@ BOOLEAN VioGpuAllocation::UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void 
     // INVALID_RESOURCE_ID. Gating on the local Mapped flag matches the host
     // semantics and makes Close idempotent across cross-context sharers.
     if (!m_Blob.Mapped) return FALSE;
+    if (m_Id == 0)
+    {
+        // Phantom allocations (shared-registry backing) never created a
+        // host blob; an UNMAP_BLOB for res_id 0 is the guest-error spam
+        // in the QEMU log.  Clear local state and skip the wire op.
+        m_Blob.Mapped = FALSE;
+        return FALSE;
+    }
     m_adapter->ctrlQueue.ResourceUnmapBlob(m_Id, ctx_id, complete_cb, complete_ctx);
     m_Blob.Mapped = FALSE;
     return TRUE;

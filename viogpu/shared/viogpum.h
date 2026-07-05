@@ -347,6 +347,12 @@ struct _VIOGPU_BLIT_PRESENT
 #define VIOGPU_CMD_UNMAP_BLOB         0x5 // Unmap blob resource
 #define VIOGPU_CMD_SUBMIT_ON_CTX      0x6 // Submit to an explicit virtio context
                                           // (payload: VIOGPU_SUBMIT_ON_CTX_HDR + bytes)
+#define VIOGPU_CMD_UNMAP_BLOB_BY_ID   0x7 // Unmap blob host mapping by res_id
+                                          // (payload: UINT res_id[]). Emitted by
+                                          // DISCARD_CONTENT paging ops: VidMm is
+                                          // freeing the segment range, and a stale
+                                          // host mapping there poisons whatever
+                                          // blob reuses the range next.
 
 // #define VIOGPU_EXECBUF_FENCE_FD_IN  0x01
 // #define VIOGPU_EXECBUF_FENCE_FD_OUT 0x02

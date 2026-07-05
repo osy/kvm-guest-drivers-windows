@@ -551,6 +551,15 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s operation=%d\n", __FUNCTION__, pBuildPagingBuffer->Operation));
 
+    // Paging DMA buffers are recycled with their private-data area; no
+    // path below stores a VioGpuCommand*, so a stale pointer from the
+    // buffer's previous user would reach SubmitCommand and corrupt an
+    // unrelated in-flight command's fence (see VioGpuDevice::Present).
+    if (pBuildPagingBuffer->pDmaBufferPrivateData)
+    {
+        *(void **)pBuildPagingBuffer->pDmaBufferPrivateData = NULL;
+    }
+
     switch (pBuildPagingBuffer->Operation)
     {
         case DXGK_OPERATION_MAP_APERTURE_SEGMENT:
@@ -624,6 +633,35 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
                                                pBuildPagingBuffer->DiscardContent.SegmentAddress.QuadPart,
                                                allocation->GetId(),
                                                allocation->IsBlob()));
+
+                // VidMm is freeing this allocation's segment range for reuse.
+                // A mappable blob's HOST mapping must die with it: dead
+                // processes never send their UMD-side unmap, and the next
+                // blob mapped into the reused range reads the stale window
+                // (dead transport rings at demo start, 2026-07-04).  Emit the
+                // unmap into the paging DMA so it retires in paging order.
+                if (allocation->IsBlob() && allocation->IsMappable() && allocation->GetId() != 0)
+                {
+                    const SIZE_T needed = sizeof(VIOGPU_COMMAND_HDR) + sizeof(UINT);
+                    if (pBuildPagingBuffer->pDmaBuffer && pBuildPagingBuffer->DmaSize >= needed)
+                    {
+                        BYTE *dma = (BYTE *)pBuildPagingBuffer->pDmaBuffer;
+                        VIOGPU_COMMAND_HDR hdr;
+                        RtlZeroMemory(&hdr, sizeof(hdr));
+                        hdr.type = VIOGPU_CMD_UNMAP_BLOB_BY_ID;
+                        hdr.size = sizeof(UINT);
+                        UINT rid = allocation->GetId();
+                        RtlCopyMemory(dma, &hdr, sizeof(hdr));
+                        RtlCopyMemory(dma + sizeof(hdr), &rid, sizeof(rid));
+                        pBuildPagingBuffer->pDmaBuffer = dma + needed;
+                    }
+                    else
+                    {
+                        DbgPrint(TRACE_LEVEL_ERROR,
+                                 ("<--- %s discard res_id=%d: paging DMA too small (%u)\n",
+                                  __FUNCTION__, allocation->GetId(), pBuildPagingBuffer->DmaSize));
+                    }
+                }
 
                 return STATUS_SUCCESS;
             }

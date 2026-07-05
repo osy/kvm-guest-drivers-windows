@@ -1277,7 +1277,8 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
         DbgPrint(TRACE_LEVEL_ERROR,
                  ("<--> %s AddBuf failed rc=%d; firing complete_cb\n",
                   __FUNCTION__, rc));
-        if (buf->complete_cb)
+        if (buf->complete_cb &&
+            InterlockedExchange(&buf->complete_fired, 1) == 0)
         {
             buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
         }
@@ -1378,7 +1379,8 @@ void VioGpuBuf::Close(void)
         PLIST_ENTRY entry = RemoveHeadList(&drained);
         PGPU_VBUFFER pvbuf = CONTAINING_RECORD(entry, GPU_VBUFFER, list_entry);
 
-        if (pvbuf->complete_cb)
+        if (pvbuf->complete_cb &&
+            InterlockedExchange(&pvbuf->complete_fired, 1) == 0)
         {
             pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, pvbuf->resp_buf);
         }
