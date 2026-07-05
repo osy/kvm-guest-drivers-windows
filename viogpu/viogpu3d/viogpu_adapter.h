@@ -228,6 +228,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     }
 
     volatile LONG m_LastCompletedFenceId;
+    volatile LONG m_LastSubmittedFenceId;
   private:
     BOOLEAN CheckHardware();
     NTSTATUS WriteRegistryString(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _In_ PCSTR pszValue);

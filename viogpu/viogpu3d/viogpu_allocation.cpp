@@ -80,27 +80,15 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPOR
 
     m_adapter = adapter;
     // Adopt the existing host res_id; do NOT mint one. The owning allocation
-    // (the Neptune transport device's swapchain dmabuf claim) created the
-    // resource on its context and owns the id's lifetime.
+    // (another process's shared-texture blob) created the resource on its
+    // context and owns the id's lifetime.
     m_Id = options->res_id;
     m_IsImport = TRUE;
-    m_IsPrimary = !!options->primary;
+    m_IsPrimary = FALSE;
     m_IsShared = FALSE;
 
-    // Per-flip host present: opaque transport bytes submitted as a fenced
-    // EXECBUF on the owning transport context by DxgkDdiPresent.
-    m_PresentCtxId = options->present_ctx_id;
-    m_PresentRingIdx = options->present_ring_idx;
-    m_PresentCmdSize = 0;
-    if (options->present_cmd_size && options->present_cmd_size <= VIOGPU_PRESENT_CMD_MAX)
-    {
-        m_PresentCmdSize = options->present_cmd_size;
-        RtlCopyMemory(m_PresentCmd, options->present_cmd, options->present_cmd_size);
-    }
-
-    // Present as a host-backed HOST3D blob so DxgkCreateAllocation's segment
-    // selection and FlushToScreen (SetScanoutBlob) treat it exactly like the
-    // dmabuf it aliases.
+    // Behave as a host-backed HOST3D blob so DxgkCreateAllocation's segment
+    // selection treats it exactly like the dmabuf it aliases.
     RtlZeroMemory(&m_Blob.Options, sizeof(m_Blob.Options));
     m_Blob.Options.blob_mem = VIOGPU_BLOB_MEM_HOST3D;
     RtlZeroMemory(&m_Blob.Info, sizeof(m_Blob.Info));
@@ -130,25 +118,34 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPOR
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s IMPORT res_id=%d size=%lld\n", __FUNCTION__, m_Id, size));
 }
 
-VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARED_OPTIONS *options, ULONGLONG size)
+VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS *options, ULONGLONG size)
 {
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s SHARED key=0x%llx %dx%d\n", __FUNCTION__,
-                                   options->shared_key, options->width, options->height));
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s SHARED blob_id=0x%llx %dx%d primary=%d\n", __FUNCTION__,
+                                   options->blob_id, options->width, options->height, options->primary));
 
     m_adapter = adapter;
-    // Host-COM-backed: the pixels live in the host D3D11 texture reached via
-    // the Neptune COM transport, not a virtio resource. Mint no res_id and
-    // create no host resource. m_IsImport makes the destructor skip
-    // DestroyResource, and m_IsShared makes Open skip the context attach.
-    m_Id = 0;
-    m_IsImport = TRUE;
-    m_IsPrimary = FALSE;
+    // Blob-backed shared texture: mint the res_id now; the host binding
+    // (RESOURCE_CREATE_BLOB on the UMD's transport context, which staged
+    // the pending dmabuf export under blob_id) happens when the creating
+    // device opens the allocation.
+    m_Id = m_adapter->resourceIdr.GetId();
+    m_IsImport = FALSE;
+    m_IsPrimary = !!options->primary;
     m_IsShared = TRUE;
     m_SharedWidth = options->width;
     m_SharedHeight = options->height;
     m_SharedFormat = options->format;
-    m_IsBlob = FALSE;
-    RtlZeroMemory(&m_3dOptions, sizeof(m_3dOptions));
+    m_CreateCtxId = options->create_ctx_id;
+    m_IsBlob = TRUE;
+    RtlZeroMemory(&m_Blob.Options, sizeof(m_Blob.Options));
+    m_Blob.Options.blob_mem = VIOGPU_BLOB_MEM_HOST3D;
+    m_Blob.Options.blob_flags = VIOGPU_BLOB_FLAG_USE_SHAREABLE;
+    m_Blob.Options.blob_id = options->blob_id;
+    m_Blob.Info = options->ScanoutInfo;
+    m_Blob.InfoValid = options->ScanoutInfo.width != 0;
+    m_Blob.MapOffset = 0;
+    m_Blob.Created = FALSE;
+    m_Blob.Mapped = FALSE;
     m_Size = size;
 
     m_pMDL = NULL;
@@ -165,8 +162,8 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARE
     m_refCount = 1;
     m_deferReleaseItem = IoAllocateWorkItem(m_adapter->GetPhysicalDevice());
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s SHARED key=0x%llx size=%lld\n", __FUNCTION__,
-                                   options->shared_key, size));
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s SHARED res_id=%d blob_id=0x%llx size=%lld\n", __FUNCTION__,
+                                   m_Id, options->blob_id, size));
 }
 
 void VioGpuAllocation::AddRef()
@@ -486,9 +483,9 @@ void VioGpuAllocation::FlushToScreen(UINT scan_id)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d IsBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));
 
     if (m_IsBlob) {
-        // Snapshot under the same lock EscapeResourceBlobSetInfo writes
-        // under: an unsynchronized read can pair a pre-write rect with
-        // post-write framebuffer fields in one scanout command.
+        // Snapshot under the allocation lock so a concurrent info update
+        // cannot pair a pre-write rect with post-write framebuffer fields
+        // in one scanout command.
         VIOGPU_BLOB_INFO info;
         BOOL infoValid;
         {
@@ -673,8 +670,8 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->OptionsImport, resourceExchange->Size);
             break;
         case VIOGPU_RESOURCE_TYPE_SHARED:
-            // Host-COM-backed shareable texture; a phantom WDDM sharing token
-            // with no virtio resource of its own.
+            // Blob-backed shared/presentable texture (dmabuf export staged by
+            // the UMD; res_id minted here, bound at first open).
             allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->OptionsShared, resourceExchange->Size);
             break;
         default:
@@ -755,58 +752,47 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             }
             break;
         case VIOGPU_RESOURCE_TYPE_IMPORT:
-            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s import res_id=%d size=%lld primary=%d\n",
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s import res_id=%d size=%lld\n",
                                            __FUNCTION__,
                                            allocation->GetId(),
-                                           allocationInfo->Size,
-                                           resourceExchange->OptionsImport.primary));
-            if (resourceExchange->OptionsImport.primary)
-            {
-                // Flippable primary: reside in the CPU-visible aperture (segment 1)
-                // so dxgkrnl accepts it as a VidPnSource scanout target; the
-                // vsync Flip scans out the bound dmabuf res_id.
-                allocationInfo->EvictionSegmentSet = 1;
-                allocationInfo->PreferredSegment.SegmentId0 = 1;
-                allocationInfo->PreferredSegment.Direction0 = 0;
-                allocationInfo->Flags.CpuVisible = TRUE;
-                allocationInfo->SupportedReadSegmentSet = 0b1;
-                allocationInfo->SupportedWriteSegmentSet = 0b1;
-                // Promote to the active scanout source as soon as the runtime
-                // mints it: the runtime owns rotation between back buffers,
-                // and the most recently created primary is what the runtime
-                // is currently presenting from.
-                adapter->vidpn.SetScanoutSource(allocation);
-            }
-            else
-            {
-                // Host-backed alias of an existing dmabuf res_id: residency matches
-                // a non-mappable HOST3D blob (host shmem BAR segment, pinned; not
-                // CpuVisible -- the guest never maps the host scanout dmabuf).
-                allocationInfo->PreferredSegment.SegmentId0 = 2;
-                allocationInfo->PreferredSegment.Direction0 = 0;
-                allocationInfo->Flags.CpuVisible = FALSE;
-                allocationInfo->SupportedReadSegmentSet = 0b10;
-                allocationInfo->SupportedWriteSegmentSet = 0b10;
-            }
+                                           allocationInfo->Size));
+            // Host-backed alias of an existing dmabuf res_id: residency matches
+            // a non-mappable HOST3D blob (host shmem BAR segment, pinned; not
+            // CpuVisible -- the guest never maps the host dmabuf).
+            allocationInfo->PreferredSegment.SegmentId0 = 2;
+            allocationInfo->PreferredSegment.Direction0 = 0;
+            allocationInfo->Flags.CpuVisible = FALSE;
+            allocationInfo->SupportedReadSegmentSet = 0b10;
+            allocationInfo->SupportedWriteSegmentSet = 0b10;
             break;
         case VIOGPU_RESOURCE_TYPE_SHARED:
             // Reside in the CPU-visible aperture (segment 1) with DXGK-supplied
-            // backing pages, like a 3D allocation. The pages are never used --
-            // the content is the host D3D11 texture -- but they satisfy the
-            // video memory manager for a shareable allocation whose private
-            // data conveys the Neptune key + descriptor to the opening process.
-            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s shared key=0x%llx size=%d %dx%d\n",
+            // backing pages, like a 3D allocation. The pages are never read --
+            // the content is the host texture's dmabuf -- but segment 1 both
+            // satisfies the video memory manager for a shareable allocation and
+            // lets dxgkrnl accept a primary as a VidPnSource scanout target.
+            DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s shared res_id=%d blob_id=0x%llx size=%d %dx%d primary=%d\n",
                                            __FUNCTION__,
-                                           resourceExchange->OptionsShared.shared_key,
+                                           allocation->GetId(),
+                                           resourceExchange->OptionsShared.blob_id,
                                            allocationInfo->Size,
                                            resourceExchange->OptionsShared.width,
-                                           resourceExchange->OptionsShared.height));
+                                           resourceExchange->OptionsShared.height,
+                                           resourceExchange->OptionsShared.primary));
             allocationInfo->EvictionSegmentSet = 1;
             allocationInfo->PreferredSegment.SegmentId0 = 1;
             allocationInfo->PreferredSegment.Direction0 = 0;
             allocationInfo->Flags.CpuVisible = TRUE;
             allocationInfo->SupportedReadSegmentSet = 0b1;
             allocationInfo->SupportedWriteSegmentSet = 0b1;
+            if (resourceExchange->OptionsShared.primary)
+            {
+                // Promote to the active scanout source as soon as the runtime
+                // mints it: the runtime owns rotation between back buffers,
+                // and the most recently created primary is what the runtime
+                // is presenting from until the first flip latches a source.
+                adapter->vidpn.SetScanoutSource(allocation);
+            }
             break;
     }
 
@@ -972,24 +958,6 @@ NTSTATUS VioGpuAllocation::EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy)
     }
 
     resBusy->IsBusy = m_busy != 0;
-
-    return STATUS_SUCCESS;
-}
-
-NTSTATUS VioGpuAllocation::EscapeResourceBlobSetInfo(VIOGPU_RES_BLOB_SET_INFO_REQ *resBlob)
-{
-    PAGED_CODE();
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d isBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));
-
-    if (!m_IsBlob) {
-        DbgPrint(TRACE_LEVEL_FATAL, ("<---> %s cannot set blob info for 3d resources\n", __FUNCTION__));
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    auto lock_guard = LockGuard();
-
-    m_Blob.Info = resBlob->Info;
-    m_Blob.InfoValid = TRUE;
 
     return STATUS_SUCCESS;
 }

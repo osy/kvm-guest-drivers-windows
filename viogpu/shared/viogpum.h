@@ -82,7 +82,6 @@ typedef struct _VIOGPU_ADAPTERINFO
 
 #define VIOGPU_RES_INFO              0x100
 #define VIOGPU_RES_BUSY              0x101
-#define VIOGPU_RES_BLOB_SET_INFO     0x102
 #define VIOGPU_SET_SCANOUT_SOURCE    0x103
 
 #define VIOGPU_CTX_INIT              0x200
@@ -152,13 +151,6 @@ typedef struct _VIOGPU_RES_BUSY_REQ
 } VIOGPU_RES_BUSY_REQ;
 #pragma pack()
 
-#pragma pack(1)
-typedef struct {
-    D3DKMT_HANDLE ResHandle;
-    VIOGPU_BLOB_INFO Info;
-} VIOGPU_RES_BLOB_SET_INFO_REQ, *PVIOGPU_RES_BLOB_SET_INFO_REQ;
-#pragma pack()
-
 // Override VidPn source-0 scanout to this allocation (a standing dmabuf primary
 // the UMD blits the composited frame into); the KMD's vsync Flip then scans it
 // out via SetScanoutBlob.  For the blt-present path where dxgkrnl issues no
@@ -205,7 +197,6 @@ typedef struct _VIOGPU_ESCAPE
 
         VIOGPU_RES_INFO_REQ ResourceInfo;
         VIOGPU_RES_BUSY_REQ ResourceBusy;
-        VIOGPU_RES_BLOB_SET_INFO_REQ BlobInfoSet;
         VIOGPU_SET_SCANOUT_SOURCE_REQ SetScanoutSource;
 
         VIOGPU_CTX_INIT_REQ CtxInit;
@@ -255,52 +246,62 @@ typedef struct _VIOGPU_CREATE_RESOURCE_EXCHANGE
 } VIOGPU_CREATE_RESOURCE_EXCHANGE;
 #pragma pack()
 
-// Adopt an existing host res_id (a HOST3D blob already created and owned by
-// another device's allocation, e.g. the Neptune transport device's swapchain
-// dmabuf claim) as a runtime-device scanout source.  The KMD does NOT mint a
-// res_id, issue RESOURCE_CREATE_BLOB, or destroy the resource for an import
-// allocation: ownership stays with the creating allocation.  Blob info
-// (w/h/format/stride) is published separately via VIOGPU_RES_BLOB_SET_INFO.
+// Import an existing VM-global virtio resource (a shared texture's blob,
+// created by another process/device) into this device's context.  The KMD
+// does NOT mint a res_id, issue RESOURCE_CREATE_BLOB, or destroy the
+// resource: ownership stays with the creating allocation.  Opening the
+// allocation attaches the resource to the opening device's virtio context
+// (CTX_ATTACH_RESOURCE), which is what forwards the host dmabuf into that
+// context's render worker.  Venus analog: dma-buf import.
 // Keep in lockstep with virtio-win-mesa/src/virtio/virtio-gpu/wddm_hw.h.
-// present_cmd carries opaque transport bytes the KMD submits verbatim as a
-// fenced EXECBUF for each flip present of this primary, so the WDDM present
-// fence retires when the host GPU finishes the frame.  The submit targets
-// present_ctx_id (the transport context owning the swapchain, which is not
-// the presenting device's context) on present_ring_idx.
-// present_cmd_size == 0 disables the per-present submit.
-#define VIOGPU_PRESENT_CMD_MAX 40
 #pragma pack(1)
 typedef struct _VIOGPU_RESOURCE_IMPORT_OPTIONS
 {
     ULONG res_id;
-    ULONG primary;   // non-zero: place in the CPU-visible aperture (segment 1) as a flippable primary
-    ULONG present_ctx_id;
-    ULONG present_ring_idx;
-    ULONG present_cmd_size;
-    UCHAR present_cmd[VIOGPU_PRESENT_CMD_MAX];
 } VIOGPU_RESOURCE_IMPORT_OPTIONS;
 #pragma pack()
 
-// Emulated D3D11 shared resource.  DXVK on Linux cannot honor Win32 shared
-// handles, so cross-process sharing is emulated: the producer's texture is a
-// normal host resource registered under shared_key, and a consumer's
-// OpenResource binds a host-side mirror of it.  The descriptor lets the
-// consumer UMD rebuild its resource state without a kernel round-trip.
+// Shared / presentable D3D11 texture backed by a virtio-gpu blob resource
+// (Venus model).  The UMD created the host texture with exportable storage
+// and staged its dmabuf as a pending blob under blob_id on create_ctx_id
+// (the UMD's transport context) via SHARED_EXPORT_BLOB.  The KMD mints a
+// res_id and issues RESOURCE_CREATE_BLOB(HOST3D, blob_id) on create_ctx_id
+// when the creating device opens the allocation, binding the res_id to the
+// dmabuf VM-globally.  primary != 0 marks a flippable scanout primary:
+// segment-1 residency, scanout promotion, and FlushToScreen uses
+// ScanoutInfo for SET_SCANOUT_BLOB.  The trailing D3D11/dmabuf description
+// is opaque to the KMD; it round-trips through the WDDM allocation private
+// data so an opening process's UMD can rebuild the texture (paired with
+// the res_id from VIOGPU_RES_INFO) via SHARED_OPEN_RES.
 // Keep in lockstep with virtio-win-mesa/src/virtio/virtio-gpu/wddm_hw.h.
 #pragma pack(1)
-typedef struct _VIOGPU_RESOURCE_SHARED_OPTIONS
+typedef struct _VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS
 {
-    ULONGLONG shared_key;   // Neptune 64-bit identity, minted by the producer UMD
+    // --- blob binding (consumed by the KMD) ---
+    ULONGLONG blob_id;
+    ULONG create_ctx_id;    // 0 = the opening device's own context
+    ULONG primary;
+    VIOGPU_BLOB_INFO ScanoutInfo;
+    // --- D3D11 + dmabuf rebuild info for opening UMDs (opaque to KMD) ---
     ULONG width;
     ULONG height;
-    ULONG format;           // DXGI_FORMAT
     ULONG mip_levels;
     ULONG array_size;
+    ULONG format;           // DXGI_FORMAT
     ULONG sample_count;
-    ULONG bind_flags;       // D3D11 bind flags chosen for the host texture
-    ULONG misc_flags;       // original DDI misc flags (incl. keyed-mutex) for the consumer
-    ULONG is_producer;      // 1 when created by the producer, 0 when opened by a consumer
-} VIOGPU_RESOURCE_SHARED_OPTIONS;
+    ULONG usage;            // D3D11_USAGE
+    ULONG bind_flags;
+    ULONG cpu_access_flags;
+    ULONG misc_flags;
+    ULONG texture_layout;   // D3D11_TEXTURE_LAYOUT
+    ULONG plane_count;
+    ULONGLONG modifier;     // DRM format modifier of the export
+    ULONGLONG allocation_size;
+    struct {
+        ULONGLONG offset;
+        ULONGLONG pitch;
+    } planes[4];
+} VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS;
 #pragma pack()
 
 #define VIOGPU_RESOURCE_TYPE_3D     0
@@ -315,7 +316,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE
         VIOGPU_RESOURCE_3D_OPTIONS Options3D;
         VIOGPU_RESOURCE_BLOB_OPTIONS OptionsBlob;
         VIOGPU_RESOURCE_IMPORT_OPTIONS OptionsImport;
-        VIOGPU_RESOURCE_SHARED_OPTIONS OptionsShared;
+        VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS OptionsShared;
     };
     ULONGLONG Size;
 } VIOGPU_CREATE_ALLOCATION_EXCHANGE;
@@ -345,8 +346,6 @@ struct _VIOGPU_BLIT_PRESENT
 #define VIOGPU_CMD_TRANSFER_FROM_HOST 0x3 // Transfer resource to host
 #define VIOGPU_CMD_MAP_BLOB           0x4 // Map blob resource
 #define VIOGPU_CMD_UNMAP_BLOB         0x5 // Unmap blob resource
-#define VIOGPU_CMD_SUBMIT_ON_CTX      0x6 // Submit to an explicit virtio context
-                                          // (payload: VIOGPU_SUBMIT_ON_CTX_HDR + bytes)
 #define VIOGPU_CMD_UNMAP_BLOB_BY_ID   0x7 // Unmap blob host mapping by res_id
                                           // (payload: UINT res_id[]). Emitted by
                                           // DISCARD_CONTENT paging ops: VidMm is
@@ -368,15 +367,6 @@ typedef struct _VIOGPU_COMMAND_HDR
     UINT flags;
     UINT ring_idx;
 } VIOGPU_COMMAND_HDR;
-#pragma pack()
-
-// Leading payload of a VIOGPU_CMD_SUBMIT_ON_CTX command; the EXECBUF bytes
-// follow.  hdr.size covers this header plus the bytes.
-#pragma pack(1)
-typedef struct _VIOGPU_SUBMIT_ON_CTX_HDR
-{
-    ULONG ctx_id;
-} VIOGPU_SUBMIT_ON_CTX_HDR;
 #pragma pack()
 
 #pragma pack(1)

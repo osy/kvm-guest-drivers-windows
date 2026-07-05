@@ -108,7 +108,17 @@ class VioGpuVidPN
     // dxgkrnl's flip. The vsync Flip thread then scans it out continuously.
     // Used by the blt-present path where dxgkrnl issues no SetVidPnSourceAddress
     // for the windowed present source.
-    void SetScanoutSource(VioGpuAllocation *res);
+    // Latch \p res as the scanout source.  \p addr is the allocation's
+    // segment address when the caller knows it (DdiPresent's allocation
+    // list); the vsync interrupt echoes it so dxgkrnl sees the display
+    // progressing across flips.  Callers without an address (creation-
+    // time promotion) pass {0}, which leaves the reported address alone.
+    void SetScanoutSource(VioGpuAllocation *res, PHYSICAL_ADDRESS addr);
+    inline void SetScanoutSource(VioGpuAllocation *res)
+    {
+        PHYSICAL_ADDRESS zero = {};
+        SetScanoutSource(res, zero);
+    }
 
     // Currently-committed refresh rate, or {0,0} if no source mode is
     // pinned. Caller is responsible for choosing a default.

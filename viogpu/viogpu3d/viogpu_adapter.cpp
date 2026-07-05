@@ -830,28 +830,6 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
 
                 break;
             }
-        case VIOGPU_RES_BLOB_SET_INFO:
-            {
-                size = sizeof(VIOGPU_RES_BLOB_SET_INFO_REQ);
-                if (pVioGpuEscape->DataLength < size)
-                {
-                    DbgPrint(TRACE_LEVEL_ERROR,
-                             ("%s buffer too small %d, should be at least %d\n",
-                              __FUNCTION__,
-                              pVioGpuEscape->DataLength,
-                              size));
-                    return STATUS_INVALID_BUFFER_SIZE;
-                }
-                VioGpuAllocation *allocation = AllocationFromHandle(pVioGpuEscape->BlobInfoSet.ResHandle);
-                if (allocation == NULL)
-                {
-                    DbgPrint(TRACE_LEVEL_ERROR, ("%s invalid handle\n", __FUNCTION__));
-                    return STATUS_INVALID_PARAMETER;
-                }
-                status = allocation->EscapeResourceBlobSetInfo(&pVioGpuEscape->BlobInfoSet);
-
-                break;
-            }
         case VIOGPU_CTX_INIT:
             {
                 size = sizeof(VIOGPU_CTX_INIT_REQ);

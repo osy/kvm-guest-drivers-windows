@@ -2095,7 +2095,21 @@ void VioGpuVidPN::Flip()
     interrupt.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
 
     interrupt.CrtcVsync.VidPnTargetId = 0;
-    interrupt.CrtcVsync.PhysicalAddress = m_sourceAddress;
+    // Report the address of what is actually displayed: dxgkrnl completes
+    // queued flips (and waits to reuse or destroy displaced primaries)
+    // based on the address the vsync reports, so it must track the flip
+    // latch.  Flip-model primaries get their segment address at Patch;
+    // fall back to the last SetVidPnSourceAddress value (MMIO flips,
+    // boot primary) when the latch has no patched address yet.
+    {
+        KIRQL vsyncIrql;
+        KeAcquireSpinLock(&m_sourceLock, &vsyncIrql);
+        interrupt.CrtcVsync.PhysicalAddress =
+            (m_sourceRes && m_sourceRes->m_SegmentAddress.QuadPart != 0)
+                ? m_sourceRes->m_SegmentAddress
+                : m_sourceAddress;
+        KeReleaseSpinLock(&m_sourceLock, vsyncIrql);
+    }
 
     m_pAdapter->NotifyInterrupt(&interrupt, true);
 }
@@ -2185,18 +2199,16 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
     return STATUS_SUCCESS;
 };
 
-void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res)
+void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res, PHYSICAL_ADDRESS addr)
 {
     // Only the full-screen desktop primary may become the scanout source.
-    // DWM presents its cursor (e.g. 32x32) and individual windows (sub-screen)
-    // as their OWN "primary" BIND_PRESENT IMPORT allocations as well; without
-    // this gate the most-recently-created/flipped one clobbers the desktop and
+    // DWM can present its cursor (e.g. 32x32) and individual windows
+    // (sub-screen) as their OWN "primary" allocations as well; without this
+    // gate the most-recently-created/flipped one clobbers the desktop and
     // the screen scans out a cursor/window surface (black/garbage desktop).
     //
-    // IMPORT primaries carry no blob dimensions (m_Blob.Info is zeroed and no
-    // RES_BLOB_SET_INFO is issued on the import adopter), so the framebuffer
-    // BYTE SIZE -- which IS populated on every allocation, imports included --
-    // is the discriminator: the desktop primary backs the whole screen
+    // The framebuffer BYTE SIZE -- populated on every allocation -- is the
+    // discriminator: the desktop primary backs the whole screen
     // (>= mode_w * mode_h * 4), the cursor / per-window primaries are far
     // smaller.  A 0 mode (before CommitVidPn) bypasses the gate so the boot
     // primary still promotes.
@@ -2216,8 +2228,16 @@ void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res)
         }
     }
 
-    // Mirror SetVidPnSourceAddress's refcount/swap discipline. Blob scanout is
-    // keyed by res_id, so there is no guest PrimaryAddress; zero it.
+    // Mirror SetVidPnSourceAddress's refcount/swap discipline.  Blob
+    // scanout is keyed by res_id, so the flip latch does not need a
+    // PrimaryAddress -- but m_sourceAddress must be left ALONE: it is
+    // what the vsync interrupt reports back to dxgkrnl, and dxgkrnl
+    // completes a queued SetVidPnSourceAddress flip only when a vsync
+    // reports that flip's address.  Zeroing it here let a blob latch
+    // race a concurrent MMIO flip (e.g. dxgkrnl reverting to the
+    // standard shared primary when a device died) and park it forever:
+    // display-path TDR with an idle engine (submitted==completed,
+    // 2026-07-05).
     if (res)
     {
         res->AddRef();
@@ -2226,8 +2246,11 @@ void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res)
     KIRQL oldIrql;
     KeAcquireSpinLock(&m_sourceLock, &oldIrql);
     VioGpuAllocation *oldRes = m_sourceRes;
-    m_sourceAddress.QuadPart = 0;
     m_sourceRes = res;
+    if (addr.QuadPart != 0)
+    {
+        m_sourceAddress = addr;
+    }
     KeReleaseSpinLock(&m_sourceLock, oldIrql);
 
     if (oldRes)
@@ -2235,8 +2258,10 @@ void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res)
         oldRes->ReleaseDeferred();
     }
 
-    DbgPrint(TRACE_LEVEL_INFORMATION, ("SetScanoutSource ACCEPT res_id=%d isBlob=%d size=%llu\n",
-                                       res ? res->GetId() : 0, res ? res->IsBlob() : 0, (unsigned long long)(res ? res->GetSize() : 0)));
+    DbgPrint(TRACE_LEVEL_INFORMATION, ("SetScanoutSource ACCEPT res_id=%d isBlob=%d size=%llu addr=%llx\n",
+                                       res ? res->GetId() : 0, res ? res->IsBlob() : 0,
+                                       (unsigned long long)(res ? res->GetSize() : 0),
+                                       (unsigned long long)addr.QuadPart));
 
     InterlockedOr(&m_shouldFlip, 1);
 }

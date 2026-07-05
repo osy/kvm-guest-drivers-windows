@@ -466,69 +466,24 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
                 VioGpuDeviceAllocation::FromHandle(dxgk_src->hDeviceSpecificAllocation);
             srcAlloc = srcDev ? srcDev->GetAllocation() : NULL;
             if (srcAlloc && srcAlloc->IsPrimary())
-                m_pAdapter->vidpn.SetScanoutSource(srcAlloc);
+                m_pAdapter->vidpn.SetScanoutSource(srcAlloc, dxgk_src->PhysicalAddress);
         }
 
-        // Drive the host present for this flip: the primary carries
-        // pre-encoded transport bytes (its swapchain's WSI_PRESENT) that
-        // are submitted as a fenced EXECBUF on the transport context that
-        // owns the swapchain.  The flip's DMA fence then retires when the
-        // host GPU finishes rendering the frame into the scanout dmabuf,
-        // which paces DWM's present queue to real frame completion.
-        const ULONG presentCmdSize = srcAlloc ? srcAlloc->GetPresentCmdSize() : 0;
-        const ULONG flipDmaSize = sizeof(VIOGPU_COMMAND_HDR) +
-                                  sizeof(VIOGPU_SUBMIT_ON_CTX_HDR) + presentCmdSize;
-        // Rate-gated: synchronous serial DbgPrint costs milliseconds per
-        // line, so unthrottled per-flip logging paces the present pipeline.
+        // No host command is needed for a flip: the primary IS the blob
+        // the KMD scans out, and FlushToScreen re-emits SET_SCANOUT_BLOB
+        // at vsync.  The flip's (empty) DMA packet completes on submission
+        // order like any other packet.
+        //
+        // Rate-gated liveness log (com1 serial is 11 KB/s and synchronous;
+        // per-flip logging would stall the pipeline).
         static LONG s_flipLogCount = 0;
         const LONG flipLogN = InterlockedIncrement(&s_flipLogCount);
-        if (flipLogN <= 16 || (flipLogN & 255) == 0)
+        if (flipLogN <= 16 || (flipLogN & 63) == 0)
         {
             DbgPrint(TRACE_LEVEL_INFORMATION,
-                     ("Present flip n=%d src=%p cmdSize=%u ctx=%u ring=%u dma=%p dmaSize=%u\n",
-                      flipLogN, srcAlloc, presentCmdSize, srcAlloc ? srcAlloc->GetPresentCtxId() : 0,
-                      srcAlloc ? srcAlloc->GetPresentRingIdx() : 0,
-                      pPresent->pDmaBuffer, pPresent->DmaSize));
-        }
-        if (presentCmdSize && pPresent->pDmaBuffer && pPresent->DmaSize >= flipDmaSize)
-        {
-            VioGpuCommand *flipCmd = new (NonPagedPoolNx) VioGpuCommand(m_pAdapter);
-            if (!flipCmd)
-            {
-                DbgPrint(TRACE_LEVEL_ERROR,
-                         ("%s VioGpuCommand allocation failed for flip\n", __FUNCTION__));
-                return STATUS_NO_MEMORY;
-            }
-
-            NTSTATUS attachStatus = flipCmd->AttachAllocations(pPresent->pAllocationList,
-                                                               DXGK_PRESENT_MAX_INDEX + 1);
-            if (!NT_SUCCESS(attachStatus))
-            {
-                delete flipCmd;
-                return attachStatus;
-            }
-
-            if (pPresent->pDmaBufferPrivateData)
-            {
-                void **privateData = (void **)pPresent->pDmaBufferPrivateData;
-                *privateData = flipCmd->ToHandle();
-            }
-            flipCmd->SetDmaBuf((char *)pPresent->pDmaBuffer);
-
-            BYTE *dma = (BYTE *)pPresent->pDmaBuffer;
-            VIOGPU_COMMAND_HDR hdr;
-            RtlZeroMemory(&hdr, sizeof(hdr));
-            hdr.type = VIOGPU_CMD_SUBMIT_ON_CTX;
-            hdr.size = sizeof(VIOGPU_SUBMIT_ON_CTX_HDR) + presentCmdSize;
-            hdr.flags = VIOGPU_EXECBUF_RING_IDX;
-            hdr.ring_idx = srcAlloc->GetPresentRingIdx();
-            VIOGPU_SUBMIT_ON_CTX_HDR ctxHdr;
-            ctxHdr.ctx_id = srcAlloc->GetPresentCtxId();
-            RtlCopyMemory(dma, &hdr, sizeof(hdr));
-            RtlCopyMemory(dma + sizeof(hdr), &ctxHdr, sizeof(ctxHdr));
-            RtlCopyMemory(dma + sizeof(hdr) + sizeof(ctxHdr),
-                          srcAlloc->GetPresentCmd(), presentCmdSize);
-            pPresent->pDmaBuffer = dma + flipDmaSize;
+                     ("Present flip n=%d src=%p res_id=%d primary=%d\n",
+                      flipLogN, srcAlloc, srcAlloc ? srcAlloc->GetId() : 0,
+                      srcAlloc ? srcAlloc->IsPrimary() : 0));
         }
         return STATUS_SUCCESS;
     }
@@ -631,7 +586,8 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
         {
             VioGpuAllocation *srcAlloc = src->GetAllocation();
             if (srcAlloc && srcAlloc->IsPrimary())
-                m_pAdapter->vidpn.SetScanoutSource(srcAlloc);
+                m_pAdapter->vidpn.SetScanoutSource(srcAlloc,
+                                                   dxgk_src->PhysicalAddress);
         }
         if (pPresent->pDmaBuffer && dst && src)
         {
@@ -800,21 +756,29 @@ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAlloc
 
     if (m_pAllocation->IsBlob() && !m_pAllocation->IsCreated())
     {
+        // Shared-texture blobs bind on the UMD transport context that
+        // staged the pending dmabuf export (m_CreateCtxId); transport
+        // shmem blobs (0) bind on the opening device's own context.
+        UINT create_ctx = m_pAllocation->m_CreateCtxId
+                              ? m_pAllocation->m_CreateCtxId
+                              : m_pDevice->m_Context.GetId();
         DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d ctx_id=%d capset=%d blob_id=%llu creating blob resource\n",
                                        __FUNCTION__,
                                        allocation->GetId(),
-                                       device->m_Context.GetId(),
+                                       create_ctx,
                                        device->m_Context.GetCapset(),
                                        allocation->m_Blob.Options.blob_id));
-        //m_pAllocation->CreateBlob(m_pDevice->m_Context.GetId());
-        bool ok = m_pDevice->GetCtrlQueue()->CreateResourceBlob(m_pAllocation->GetId(), m_pDevice->m_Context.GetId(), &m_pAllocation->m_Blob.Options, m_pAllocation->m_Size);
+        bool ok = m_pDevice->GetCtrlQueue()->CreateResourceBlob(m_pAllocation->GetId(), create_ctx, &m_pAllocation->m_Blob.Options, m_pAllocation->m_Size);
         m_pAllocation->m_Blob.Created = ok;
     }
 
-    // A shared allocation is host-COM-backed and carries no virtio res_id, so
-    // there is nothing to attach to the context; leave m_attached false so the
-    // destructor issues no detach either.
-    if (!m_pAllocation->IsShared())
+    // Attach the resource to the opening device's virtio context.  For a
+    // cross-process open of a shared blob this is what forwards the host
+    // dmabuf into the opener's render worker (proxy attach-forwarding).
+    // A device that never issued VIOGPU_CTX_INIT has no host context to
+    // attach to (the UMD's transport-context import rig covers the open
+    // in that case); skip rather than name a nonexistent ctx.
+    if (!m_pDevice->m_Context.IsEmpty())
     {
         m_pDevice->GetCtrlQueue()->CtxResource(true, m_pDevice->m_Context.GetId(), m_pAllocation->GetId());
         m_attached = true;

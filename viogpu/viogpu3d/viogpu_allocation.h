@@ -42,19 +42,20 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_3D_OPTIONS *options, ULONGLONG size);
 
     // Import: adopt an already-created host res_id owned by another
-    // allocation. Behaves like a HOST3D blob for residency/scanout, but
-    // mints no id, issues no RESOURCE_CREATE_BLOB, and (m_IsImport) skips
+    // allocation. Behaves like a HOST3D blob for residency, but mints no
+    // id, issues no RESOURCE_CREATE_BLOB, and (m_IsImport) skips
     // DestroyResource at teardown so the owning allocation's res_id is not
-    // unref'd or freed twice.
+    // unref'd or freed twice.  Opening it attaches the resource to the
+    // opening device's virtio context (Venus-style dma-buf import).
     VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPORT_OPTIONS *options, ULONGLONG size);
 
-    // Shared: a host-COM-backed texture made cross-process shareable. Carries
-    // no virtio res_id (m_Id == 0) and creates no host virtio resource -- the
-    // pixels live in the host D3D11 texture reached via the Neptune COM
-    // transport. The allocation is only a WDDM sharing token + private-data
-    // carrier; the destructor skips DestroyResource and Open skips the context
-    // attach.
-    VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARED_OPTIONS *options, ULONGLONG size);
+    // Shared / presentable texture: a host D3D11 texture with exportable
+    // (dmabuf) storage, bound to a virtio-gpu blob resource.  The UMD
+    // staged the export as a pending blob under blob_id on create_ctx_id;
+    // this allocation mints the res_id and issues RESOURCE_CREATE_BLOB
+    // there when first opened.  primary marks a flippable scanout target
+    // (segment-1 residency + scanout promotion + SET_SCANOUT_BLOB info).
+    VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS *options, ULONGLONG size);
 
     ~VioGpuAllocation(void);
 
@@ -140,6 +141,11 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
         return m_IsPrimary;
     }
 
+    // Segment address of the allocation as of its last Patch (zero until
+    // first patched).  The vsync interrupt reports the latched primary's
+    // address so dxgkrnl sees flips progress on the display.
+    PHYSICAL_ADDRESS m_SegmentAddress = {};
+
     // Backing byte size of the allocation (framebuffer bytes for a primary).
     // Always populated, including for IMPORT primaries, so it is the reliable
     // discriminator between the full-screen desktop primary and DWM's
@@ -149,31 +155,10 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
         return m_Size;
     }
 
-    // Host-COM-backed shared allocation: no virtio res_id, no context attach,
-    // no DestroyResource. Exists only as a WDDM sharing token.
+    // Shared/presentable blob-backed texture (see the shared-texture ctor).
     inline BOOL IsShared() const
     {
         return m_IsShared;
-    }
-
-    inline ULONG GetPresentCtxId() const
-    {
-        return m_PresentCtxId;
-    }
-
-    inline ULONG GetPresentRingIdx() const
-    {
-        return m_PresentRingIdx;
-    }
-
-    inline ULONG GetPresentCmdSize() const
-    {
-        return m_PresentCmdSize;
-    }
-
-    inline const UCHAR *GetPresentCmd() const
-    {
-        return m_PresentCmd;
     }
 
     void AttachBacking(MDL *pMdl, size_t pageCount, size_t pageOffset);
@@ -190,7 +175,6 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
 
     NTSTATUS EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo);
     NTSTATUS EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy);
-    NTSTATUS EscapeResourceBlobSetInfo(VIOGPU_RES_BLOB_SET_INFO_REQ *resBlob);
 
     VOID CreateBlob(UINT ctx_id);
     // Return TRUE if a host map/unmap command was actually issued (so
@@ -210,22 +194,16 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // VioGpuDevice::Present updates VioGpuVidPN's m_sourceRes when it sees
     // this allocation as the blt-present source.
     BOOL m_IsPrimary;
-    // Host-COM-backed cross-process shared allocation (no virtio res_id, no
-    // context attach, no DestroyResource). Dimensions/format are retained for
-    // DxgkDdiDescribeAllocation when another process opens the share.
+    // Shared/presentable blob-backed texture. Dimensions/format are retained
+    // for DxgkDdiDescribeAllocation when another process opens the share.
     BOOL m_IsShared;
     UINT m_SharedWidth;
     UINT m_SharedHeight;
     UINT m_SharedFormat; // DXGI_FORMAT
-    // Per-flip host present for an IMPORT primary: opaque transport bytes
-    // DxgkDdiPresent submits verbatim as a fenced EXECBUF on the owning
-    // transport context's present ring, retiring the flip's fence when the
-    // host GPU finishes the frame.  m_PresentCmdSize == 0 on every
-    // non-primary allocation type.
-    ULONG m_PresentCtxId = 0;
-    ULONG m_PresentRingIdx = 0;
-    ULONG m_PresentCmdSize = 0;
-    UCHAR m_PresentCmd[VIOGPU_PRESENT_CMD_MAX] = {};
+    // Context the deferred RESOURCE_CREATE_BLOB targets (the UMD transport
+    // context that staged the pending blob).  0 = the opening device's own
+    // context (transport shmem blobs).
+    UINT m_CreateCtxId = 0;
     union {
         VIOGPU_RESOURCE_3D_OPTIONS m_3dOptions;
         struct {
