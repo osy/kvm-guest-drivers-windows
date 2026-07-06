@@ -56,10 +56,14 @@ void InitializeDebugPrints(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Re
     nDebugLevel = TRACE_LEVEL_NONE;
     bBreakAlways = 0;
 
-    bDebugPrint = 1;
-    virtioDebugLevel = 0x5;
-    bBreakAlways = 1;
-    nDebugLevel = TRACE_LEVEL_INFORMATION;
+    /* PERF (xperf, verified 2026-07-06): the KMD debug logging is the dominant
+     * cost in the System process coupled to the render's present cycle -- it
+     * emits WRITE_PORT_BUFFER_UCHAR (serial-port I/O, ~1.1M samples) + serial.sys
+     * SerialISR TX interrupts (~0.64M). Keep it OFF so DbgPrint()/serial is skipped. */
+    bDebugPrint = 0;
+    virtioDebugLevel = 0;
+    bBreakAlways = 0;
+    nDebugLevel = TRACE_LEVEL_NONE;
 #if defined(COM_DEBUG)
     VirtioDebugPrintProc = DebugPrintFuncSerial;
 #elif defined(PRINT_DEBUG)
