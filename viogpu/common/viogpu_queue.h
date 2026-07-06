@@ -212,6 +212,9 @@ class VioGpuQueue
     {
         if (m_pVirtQueue)
         {
+            /* Must be kick_ALWAYS: this virtio-gpu/host does not reliably drive
+             * notify suppression, so a suppression-aware virtqueue_kick() misses
+             * the notify and hangs the display-driver load (verified 2026-07-06). */
             virtqueue_kick_always(m_pVirtQueue);
         }
     }
