@@ -65,6 +65,12 @@ VioGpuVidPN::~VioGpuVidPN()
         m_sourceRes = NULL;
     }
 
+    if (m_desktopPrimary)
+    {
+        m_desktopPrimary->Release();
+        m_desktopPrimary = NULL;
+    }
+
     delete[] m_ModeInfo;
     delete[] m_ModeNumbers;
 
@@ -1696,10 +1702,54 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceVisibility(_In_ CONST DXGKARG_SETVIDPNSOURCE
             // idempotent: in the normal case DWM's presents drive the same
             // scanout a beat later; it neither changes m_sourceRes/m_sourceAddress
             // nor the flip-completion contract.
-            InterlockedOr(&m_shouldFlip, 1);
+            // Re-arming alone only re-emits the STALE m_sourceRes, stuck on the
+            // exiting app's torn-down fullscreen primary; QEMU caches the EGL
+            // import of a re-emitted same res_id so it stays black, and betting
+            // on DWM's next present races the teardown (esp. when calc opens and
+            // destroys the old alloc first) -> permanent black. Deterministically
+            // re-latch instead to the desktop primary captured on fullscreen
+            // entry (a DIFFERENT, live res_id): SetScanoutSource swaps m_sourceRes,
+            // releases the stale ref, and re-arms the flip.
+            if (m_desktopPrimary != NULL)
+            {
+                VioGpuAllocation *desktop = m_desktopPrimary;
+                m_desktopPrimary = NULL;
+                SetScanoutSource(desktop, m_desktopAddress);
+                desktop->ReleaseDeferred();  // drop capture ref; SetScanoutSource took its own
+            }
+            else
+            {
+                InterlockedOr(&m_shouldFlip, 1);
+            }
         }
         else
         {
+            // Entering fullscreen / hiding the source: snapshot the current
+            // desktop primary so Visible=TRUE above can re-latch to a live
+            // desktop res_id instead of the exiting app's dead one. AddRef under
+            // m_sourceLock so a concurrent SetScanoutSource can't free it.
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&m_sourceLock, &oldIrql);
+            VioGpuAllocation *cur = m_sourceRes;
+            PHYSICAL_ADDRESS curAddr = m_sourceAddress;
+            if (cur != NULL)
+                cur->AddRef();
+            KeReleaseSpinLock(&m_sourceLock, oldIrql);
+            if (cur != NULL)
+            {
+                if (cur != m_desktopPrimary)
+                {
+                    VioGpuAllocation *oldDesktop = m_desktopPrimary;
+                    m_desktopPrimary = cur;
+                    m_desktopAddress = curAddr;
+                    if (oldDesktop != NULL)
+                        oldDesktop->ReleaseDeferred();
+                }
+                else
+                {
+                    cur->ReleaseDeferred();  // already captured; drop the extra ref
+                }
+            }
             BlackOutScreen(&m_CurrentModes[SourceId]);
         }
 

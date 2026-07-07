@@ -161,6 +161,17 @@ class VioGpuVidPN
     KSPIN_LOCK m_sourceLock;
     volatile LONG m_shouldFlip = 0;
 
+    // Last-known-good full-screen DESKTOP primary, captured when a source
+    // goes not-visible (a fullscreen-exclusive app takes over).  On the
+    // fullscreen->desktop transition m_sourceRes is stuck on the app's now
+    // torn-down primary; re-emitting that stale res_id is a no-op (QEMU
+    // caches the EGL import) and betting on DWM's next present races the
+    // teardown -> permanent black.  Re-latching to this live desktop
+    // primary (a DIFFERENT res_id) restores the scanout deterministically.
+    // Own AddRef held from capture until re-latch/replace/destructor.
+    VioGpuAllocation *m_desktopPrimary = NULL;
+    PHYSICAL_ADDRESS m_desktopAddress = {0};
+
     PETHREAD m_pFlipThread;
     BOOL m_shouldFlipStop = false;
 };
