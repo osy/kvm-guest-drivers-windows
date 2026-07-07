@@ -19,6 +19,7 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
     m_EngineOrdinal = 0;
     m_NullRendering = FALSE;
     m_pendingCallbacks = 0;
+    m_notified = 0;
     m_pDmaBuffer = NULL;
     m_pCommand = NULL;
     m_pEnd = NULL;
@@ -309,19 +310,14 @@ end:
         delete m_allocations;
     }
 
-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
-    interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
-    interrupt.DmaCompleted.SubmissionFenceId = m_FenceId;
-    interrupt.DmaCompleted.NodeOrdinal = m_NodeOrdinal;
-    interrupt.DmaCompleted.EngineOrdinal = m_EngineOrdinal;
-    m_pAdapter->NotifyInterrupt(&interrupt, true);
+    // Retire the DXGK fence. For a command with outstanding async submissions
+    // (the render hot path) this already fired from the response DPC via
+    // QueueRunningCb -> NotifyCompletion() -- the reliable delivery path -- and
+    // is a guarded no-op here. Commands that finish synchronously in Run()
+    // (NullRendering, empty bodies) have no DPC callback and retire here.
+    NotifyCompletion();
 
     m_pCommander->CommandFinished();
-
-    // The commander runs one command at a time (VIOGPU_MAX_RUNNING == 1) and
-    // dxgkrnl serializes SubmitCommand, so completions arrive in submission
-    // order and the reported fence only ever advances.
-    InterlockedExchange(&m_pAdapter->m_LastCompletedFenceId, m_FenceId);
 
     delete this;
 }
@@ -364,6 +360,27 @@ void VioGpuCommand::QueueRunning()
     m_pCommander->QueueRunning(this);
 }
 
+void VioGpuCommand::NotifyCompletion()
+{
+    // Fire the DMA_COMPLETED interrupt at most once (both the DPC completion
+    // path and the worker Run() epilogue can reach here).
+    if (InterlockedExchange(&m_notified, 1) != 0)
+    {
+        return;
+    }
+
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
+    interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
+    interrupt.DmaCompleted.SubmissionFenceId = m_FenceId;
+    interrupt.DmaCompleted.NodeOrdinal = m_NodeOrdinal;
+    interrupt.DmaCompleted.EngineOrdinal = m_EngineOrdinal;
+    m_pAdapter->NotifyInterrupt(&interrupt, true);
+
+    // Completions arrive in submission order (VIOGPU_MAX_RUNNING == 1, dxgkrnl
+    // serializes SubmitCommand), so the reported fence only ever advances.
+    InterlockedExchange(&m_pAdapter->m_LastCompletedFenceId, m_FenceId);
+}
+
 void VioGpuCommand::QueueRunningCb(void *cmd, void *, void *)
 {
     VioGpuCommand *self = (VioGpuCommand *)cmd;
@@ -376,7 +393,26 @@ void VioGpuCommand::QueueRunningCb(void *cmd, void *, void *)
     // completion just decrements. Drop before queue so the dtor's
     // zero-pending assertion can't observe a transient count.
     if (self->DropPending() == 0)
+    {
+        // This callback runs inside VioGpuAdapter::DpcRoutine's response drain.
+        // If the whole DMA buffer is now drained (Run advanced m_pCommand past
+        // the last command before the matching submit returned), the DXGK
+        // command is complete: retire its fence HERE, in the DPC, so the
+        // DMA_COMPLETED interrupt is committed by the SAME DpcRoutine pass's
+        // DxgkCbNotifyDpc. Firing it from the commander worker thread instead
+        // (the old Run() epilogue) deferred it into an async NotifyInterrupt
+        // whose queued notification could be dropped by dxgkrnl's interrupt
+        // buffer under sustained render load -- the last fence of a workload
+        // was lost and the scheduler TDR'd an idle engine (submitted==completed,
+        // root-caused 2026-07-06). The worker still re-enters Run() to do the
+        // paged cleanup (UnmarkBusy / delete); its NotifyCompletion() is a
+        // guarded no-op.
+        if (self->m_pCommand >= self->m_pEnd)
+        {
+            self->NotifyCompletion();
+        }
         self->QueueRunning();
+    }
 }
 
 #pragma code_seg(pop)

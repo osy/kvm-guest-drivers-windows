@@ -35,6 +35,15 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     void QueueRunning();
     static void QueueRunningCb(void *cmd, void *, void *);
 
+    // Fire the DXGK DMA_COMPLETED interrupt for this command's fence and
+    // advance m_LastCompletedFenceId. Once-guarded (m_notified) so it runs
+    // exactly once whether reached from the response DPC (the reliable path:
+    // fired inside DpcRoutine, committed by the same pass's DxgkCbNotifyDpc)
+    // or the worker-thread Run() epilogue (fallback for commands that finish
+    // synchronously with no outstanding async submission). Non-paged /
+    // DISPATCH-safe so the DPC path is legal.
+    void NotifyCompletion();
+
     void SetDmaBuf(char *pDmaBuffer)
     {
         m_pDmaBuffer = pDmaBuffer;
@@ -68,6 +77,11 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     // Outstanding async submissions where `this` is the complete_ctx.
     // Tracked so the dtor can assert no callback is still pending.
     volatile LONG m_pendingCallbacks;
+
+    // Once-guard for NotifyCompletion(): the DMA_COMPLETED interrupt must fire
+    // exactly once per command even though both the DPC completion path and the
+    // Run() epilogue can reach it.
+    volatile LONG m_notified;
 
     void AddPending();
     // Returns the post-decrement count so callers can re-queue the command

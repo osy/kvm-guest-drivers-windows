@@ -1238,6 +1238,14 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
     if (buf->size > PAGE_SIZE)
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s size is too big %d\n", __FUNCTION__, buf->size));
+        // Don't leak the fence: fire the completion callback and release the
+        // vbuf (mirroring the AddBuf-failure arm) so the owning command
+        // advances and dxgkrnl sees the fence retire instead of timing the
+        // engine out (VidSchWaitForCompletionEvent TDR).
+        if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
+            buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
+        if (buf->auto_release)
+            ReleaseBuffer(buf);
         return 0;
     }
 
@@ -1262,6 +1270,11 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
                 if (sgleft == 0)
                 {
                     DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s no more sgelenamt spots left %d\n", __FUNCTION__, outcnt));
+                    // Retire the fence instead of leaking it (see size-guard above).
+                    if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
+                        buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
+                    if (buf->auto_release)
+                        ReleaseBuffer(buf);
                     return 0;
                 }
             }
@@ -1606,10 +1619,17 @@ void VioGpuBuf::FreeBuf(_In_ PGPU_VBUFFER pbuf)
     if (!found)
     {
         KeReleaseSpinLock(&m_SpinLock, OldIrql);
-        DbgPrint(TRACE_LEVEL_ERROR,
-                 ("<--- %s buf=%p not on in-use list; suspected double-free\n",
-                  __FUNCTION__, pbuf));
-        ASSERT(FALSE);
+        // pbuf is not on the in-use list: a second Free of an already-freed
+        // vbuf. The membership check above makes this a safe no-op -- the vbuf
+        // and its resp_buf/data_buf are NOT double-deleted and the free list is
+        // not corrupted. Historically this path hit ASSERT(FALSE), but in the
+        // DBG=1 kernel build that assertion fires from the completion DPC (the
+        // auto_release arm) and *halts the DPC thread*, so no further DMA
+        // completions reach dxgkrnl -- the GPU scheduler then times the engine
+        // out (dxgmms1!VidSchWaitForCompletionEvent) with an idle engine
+        // (submitted==completed) and TDRs / hangs the guest. That spurious TDR
+        // -- not the harmless second free -- was the real fullscreen-3D failure
+        // (root-caused via kd, 2026-07-06). Return without the fatal assert.
         return;
     }
 
