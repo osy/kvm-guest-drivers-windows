@@ -1681,6 +1681,22 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceVisibility(_In_ CONST DXGKARG_SETVIDPNSOURCE
         if (pSetVidPnSourceVisibility->Visible)
         {
             m_CurrentModes[SourceId].Flags.FullscreenPresent = TRUE;
+
+            // Black-screen-after-fullscreen fix (2026-07-06): when a source
+            // becomes visible again (e.g. a fullscreen-exclusive app -- 3DMark
+            // Fire Strike -- releases the display and the desktop returns), the
+            // host scanout is still parked on the last frame of the app that
+            // just went away. Nothing re-emits the scanout until DWM's next
+            // present latches a new primary via SetScanoutSource -- but when the
+            // flip pipeline wedged on a timed-out flip during the transition,
+            // that present may never arrive, leaving the desktop permanently
+            // black (recoverable only by a resolution modeset). Re-arm the flip
+            // latch here so the vsync FlipThread re-emits SET_SCANOUT_BLOB for
+            // the current source primary and the desktop reappears. This is
+            // idempotent: in the normal case DWM's presents drive the same
+            // scanout a beat later; it neither changes m_sourceRes/m_sourceAddress
+            // nor the flip-completion contract.
+            InterlockedOr(&m_shouldFlip, 1);
         }
         else
         {
