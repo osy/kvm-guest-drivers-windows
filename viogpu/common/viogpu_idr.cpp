@@ -60,18 +60,16 @@ BOOLEAN VioGpuIdr::Init(_In_ ULONG start)
 
 ULONG VioGpuIdr::GetId(VOID)
 {
-    ULONG id = 0;
-
-    FreeId *freeId = reinterpret_cast<FreeId *>(ExInterlockedRemoveHeadList(&m_freeList, &m_lock));
-    if (freeId != NULL)
-    {
-        id = freeId->id;
-        delete freeId;
-    }
-    else
-    {
-        id = m_nextId++;
-    }
+    // Allocate res/ctx ids MONOTONICALLY -- never reuse a freed id within a
+    // boot.  QEMU's virtio-gpu-gl caches scanout/EGL dmabuf imports keyed by
+    // res_id; reusing a just-freed id (before that cache and the host resource
+    // are fully torn down) makes the reborn resource alias the old one's stale
+    // pages.  For a command ring that means the host's ALIVE heartbeat lands on
+    // the wrong page and never reaches the guest -> guest ring watchdog fires
+    // "ring wedged head=0 tail=0 status=0x0" and the screen goes black.  A boot
+    // mints at most a few thousand ids, far below the 32-bit space, so retiring
+    // ids permanently is safe.  InterlockedIncrement keeps this IRQL-agnostic.
+    ULONG id = (ULONG)InterlockedIncrement((volatile LONG *)&m_nextId) - 1;
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("[%s] id = %d\n", __FUNCTION__, id));
 
@@ -80,38 +78,11 @@ ULONG VioGpuIdr::GetId(VOID)
 
 VOID VioGpuIdr::PutId(_In_ ULONG id)
 {
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("[%s] id = %d\n", __FUNCTION__, id));
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&m_lock, &oldIrql);
-
-    // Walk the free list before inserting: a double-PutId would
-    // otherwise queue the same id twice, and the next two GetIds
-    // would hand the same value to two callers -- which means two
-    // virtio-gpu objects share one host id.
-    for (PLIST_ENTRY entry = m_freeList.Flink; entry != &m_freeList; entry = entry->Flink)
-    {
-        FreeId *existing = CONTAINING_RECORD(entry, FreeId, list_entry);
-        if (existing->id == id)
-        {
-            KeReleaseSpinLock(&m_lock, oldIrql);
-            DbgPrint(TRACE_LEVEL_ERROR, ("[%s] duplicate put id=%d\n", __FUNCTION__, id));
-            ASSERT(FALSE);
-            return;
-        }
-    }
-
-    FreeId *freeId = new (NonPagedPoolNx) FreeId;
-    if (!freeId)
-    {
-        KeReleaseSpinLock(&m_lock, oldIrql);
-        DbgPrint(TRACE_LEVEL_ERROR, ("[%s] alloc failed for id=%d; id will leak\n", __FUNCTION__, id));
-        return;
-    }
-    freeId->id = id;
-    InsertTailList(&m_freeList, &freeId->list_entry);
-
-    KeReleaseSpinLock(&m_lock, oldIrql);
+    // Ids are retired permanently (GetId is monotonic) to keep a res_id from
+    // being reused while QEMU still caches a stale import for it.  Nothing to
+    // free-list: the id is simply never handed out again this boot.
+    UNREFERENCED_PARAMETER(id);
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("[%s] id = %d (retired)\n", __FUNCTION__, id));
 }
 
 VOID VioGpuIdr::Close(VOID)
