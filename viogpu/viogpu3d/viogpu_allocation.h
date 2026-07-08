@@ -99,6 +99,10 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
 #define VIOGPU_BLOB_FLAG_USE_MAPPABLE     0x0001
 #define VIOGPU_BLOB_FLAG_USE_SHAREABLE    0x0002
 #define VIOGPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
+/* Control-ring blobs the guest CPU-maps and polls forever: pin at MAXIMUM
+ * priority so VidMm won't DISCARD their backing under VRAM pressure (a discard
+ * zeroes the guest mapping -> ring wedge). */
+#define VIOGPU_BLOB_FLAG_PINNED           0x0008
 
     inline BOOL IsCoherent() const
     {
@@ -129,6 +133,11 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     inline BOOL IsMappable() const
     {
         return m_IsBlob && m_Blob.Created && (m_Blob.Options.blob_flags & VIOGPU_BLOB_FLAG_USE_MAPPABLE) != 0;
+    }
+
+    inline BOOL IsPinned() const
+    {
+        return m_IsBlob && (m_Blob.Options.blob_flags & VIOGPU_BLOB_FLAG_PINNED) != 0;
     }
 
     inline BOOL IsMapped() const

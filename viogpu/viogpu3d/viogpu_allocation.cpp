@@ -691,7 +691,13 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
     allocationInfo->Size = (SIZE_T)resourceExchange->Size;
     allocationInfo->PitchAlignedSize = 0;
     allocationInfo->HintedBank.Value = 0;
-    allocationInfo->AllocationPriority = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
+    // Control-ring blobs are CPU-mapped and polled for the device's lifetime;
+    // if VidMm DISCARDs their segment-2 backing under VRAM pressure the guest
+    // mapping zeroes and the ring wedges (status=0x0).  MAXIMUM priority makes
+    // VidMm evict everything else first.
+    allocationInfo->AllocationPriority = allocation->IsPinned()
+                                             ? D3DDDI_ALLOCATIONPRIORITY_MAXIMUM
+                                             : D3DDDI_ALLOCATIONPRIORITY_NORMAL;
     allocationInfo->Flags.Value = 0;
     allocationInfo->MaximumRenamingListLength = 0;
     allocationInfo->pAllocationUsageHint = NULL;
