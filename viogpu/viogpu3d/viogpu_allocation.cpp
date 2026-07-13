@@ -168,6 +168,73 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARE
                                    m_Id, options->blob_id, size));
 }
 
+static BOOLEAN IsLinear32BppVirtioFormat(ULONG format)
+{
+    switch (format)
+    {
+        case VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM:
+        case VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM:
+        case VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM:
+        case VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM:
+        case VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM:
+        case VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM:
+        case VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM:
+        case VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+BOOLEAN VioGpuAllocation::GetTransferLayout(LONG x, LONG y, ULONG *pStride, ULONGLONG *pOffset) const
+{
+    ULONG format;
+    ULONG width;
+    ULONG height;
+    ULONG stride;
+    ULONGLONG planeOffset;
+
+    if (!pStride || !pOffset || x < 0 || y < 0)
+        return FALSE;
+
+    if (m_IsBlob)
+    {
+        if (!m_Blob.InfoValid)
+            return FALSE;
+
+        format = m_Blob.Info.format;
+        width = m_Blob.Info.width;
+        height = m_Blob.Info.height;
+        stride = m_Blob.Info.strides[0];
+        planeOffset = m_Blob.Info.offsets[0];
+    }
+    else
+    {
+        format = m_3dOptions.format;
+        width = m_3dOptions.width;
+        height = m_3dOptions.height;
+        planeOffset = 0;
+
+        ULONGLONG rowBytes = (ULONGLONG)width * 4;
+        if (rowBytes > MAXULONG)
+            return FALSE;
+        stride = (ULONG)rowBytes;
+    }
+
+    if (!IsLinear32BppVirtioFormat(format) || !width || !height ||
+        (ULONG)x > width || (ULONG)y > height ||
+        stride < (ULONGLONG)width * 4)
+        return FALSE;
+
+    ULONGLONG offset = planeOffset + (ULONGLONG)(ULONG)y * stride + (ULONGLONG)(ULONG)x * 4;
+    if (offset < planeOffset || (m_Size && offset > m_Size))
+        return FALSE;
+
+    *pStride = stride;
+    *pOffset = offset;
+    return TRUE;
+}
+
 void VioGpuAllocation::AddRef()
 {
     InterlockedIncrement(&m_refCount);

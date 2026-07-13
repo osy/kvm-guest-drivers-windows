@@ -164,6 +164,12 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
         return m_Size;
     }
 
+    // Translate a 2D resource coordinate to the attached guest backing
+    // layout used by VIRTIO_GPU_CMD_TRANSFER_{TO,FROM}_HOST_3D.  The box
+    // selects pixels in the host resource; offset independently selects the
+    // first byte in the guest backing, so partial transfers must include x/y.
+    BOOLEAN GetTransferLayout(LONG x, LONG y, ULONG *pStride, ULONGLONG *pOffset) const;
+
     // Shared/presentable blob-backed texture (see the shared-texture ctor).
     inline BOOL IsShared() const
     {

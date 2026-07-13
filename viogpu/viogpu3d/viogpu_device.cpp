@@ -107,6 +107,18 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuDevic
     // If source requires coherency (staging or shadow surface) then emit transfer
     if (src->IsCoherent())
     {
+        ULONG transferStride;
+        ULONGLONG transferOffset;
+        LONG transferX = coverRect.left + dx;
+        LONG transferY = coverRect.top + dy;
+        if (!src->GetTransferLayout(transferX, transferY, &transferStride, &transferOffset))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("<--> %s invalid source transfer layout res_id=%d x=%ld y=%ld\n",
+                      __FUNCTION__, src->GetId(), transferX, transferY));
+            return STATUS_INVALID_PARAMETER;
+        }
+
         VIOGPU_COMMAND_HDR *cmd_hdr = (VIOGPU_COMMAND_HDR *)dmaBuf;
         cmd_hdr->type = VIOGPU_CMD_TRANSFER_TO_HOST;
         cmd_hdr->size = sizeof(VIOGPU_TRANSFER_CMD);
@@ -127,9 +139,9 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuDevic
         cmdBody->box.depth = 1;
 
         cmdBody->layer_stride = 0;
-        cmdBody->stride = 0;
+        cmdBody->stride = transferStride;
         cmdBody->level = 0;
-        cmdBody->offset = 0;
+        cmdBody->offset = transferOffset;
     }
 
     if (!srcDev->m_AttachedToVirgl)
@@ -251,6 +263,16 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuDevic
 
     if (dst->IsCoherent())
     {
+        ULONG transferStride;
+        ULONGLONG transferOffset;
+        if (!dst->GetTransferLayout(coverRect.left, coverRect.top, &transferStride, &transferOffset))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("<--> %s invalid destination transfer layout res_id=%d x=%ld y=%ld\n",
+                      __FUNCTION__, dst->GetId(), coverRect.left, coverRect.top));
+            return STATUS_INVALID_PARAMETER;
+        }
+
         VIOGPU_COMMAND_HDR *cmd_hdr = (VIOGPU_COMMAND_HDR *)dmaBuf;
         cmd_hdr->type = VIOGPU_CMD_TRANSFER_FROM_HOST;
         cmd_hdr->size = sizeof(VIOGPU_TRANSFER_CMD);
@@ -275,9 +297,9 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuDevic
         cmdBody->box.depth = 1;
 
         cmdBody->layer_stride = 0;
-        cmdBody->stride = 0;
+        cmdBody->stride = transferStride;
         cmdBody->level = 0;
-        cmdBody->offset = 0;
+        cmdBody->offset = transferOffset;
     }
 
     pPresent->pDmaBuffer = dmaBuf;
@@ -393,6 +415,16 @@ NTSTATUS VioGpuDevice::GenerateBltPresentUM(DXGKARG_PRESENT *pPresent, VioGpuAll
 
     if (dst->IsCoherent())
     {
+        ULONG transferStride;
+        ULONGLONG transferOffset;
+        if (!dst->GetTransferLayout(coverRect.left, coverRect.top, &transferStride, &transferOffset))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("<--> %s invalid destination transfer layout res_id=%d x=%ld y=%ld\n",
+                      __FUNCTION__, dst->GetId(), coverRect.left, coverRect.top));
+            return STATUS_INVALID_PARAMETER;
+        }
+
         UCHAR *dmaBuf = (UCHAR *)pPresent->pDmaBuffer;
 
         VIOGPU_COMMAND_HDR *cmd_hdr = (VIOGPU_COMMAND_HDR *)dmaBuf;
@@ -415,9 +447,9 @@ NTSTATUS VioGpuDevice::GenerateBltPresentUM(DXGKARG_PRESENT *pPresent, VioGpuAll
         cmdBody->box.depth = 1;
 
         cmdBody->layer_stride = 0;
-        cmdBody->stride = 0;
+        cmdBody->stride = transferStride;
         cmdBody->level = 0;
-        cmdBody->offset = 0;
+        cmdBody->offset = transferOffset;
 
         pPresent->pDmaBuffer = dmaBuf;
     }
