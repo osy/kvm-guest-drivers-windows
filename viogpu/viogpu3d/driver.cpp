@@ -795,6 +795,13 @@ VioGpu3DPatch(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PATCH *pPatch)
     return pAdapter->commander.Patch(pPatch);
 };
 
+/* DxgkDdiSubmitCommand is invoked at DISPATCH_LEVEL.  Keep the entry point
+ * nonpageable together with VioGpuCommander::SubmitCommand and its queueing
+ * helpers; otherwise an instruction-page fault here bugchecks before the
+ * function can execute. */
+#pragma code_seg(push)
+#pragma code_seg()
+_IRQL_requires_(DISPATCH_LEVEL)
 NTSTATUS
 APIENTRY
 VioGpu3DSubmitCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SUBMITCOMMAND *pSubmitCommand)
@@ -813,6 +820,7 @@ VioGpu3DSubmitCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SUBMITCOMMA
     }
     return pAdapter->commander.SubmitCommand(pSubmitCommand);
 };
+#pragma code_seg(pop)
 
 NTSTATUS
 APIENTRY
