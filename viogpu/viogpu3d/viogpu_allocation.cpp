@@ -120,8 +120,9 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPOR
 
 VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS *options, ULONGLONG size)
 {
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s SHARED blob_id=0x%llx %dx%d primary=%d\n", __FUNCTION__,
-                                   options->blob_id, options->width, options->height, options->primary));
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s SHARED blob_id=0x%llx %dx%d primary=%d modifier=0x%llx\n", __FUNCTION__,
+                                   options->blob_id, options->width, options->height,
+                                   options->primary, options->modifier));
 
     m_adapter = adapter;
     // Blob-backed shared texture: mint the res_id now; the host binding
@@ -135,6 +136,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARE
     m_SharedWidth = options->width;
     m_SharedHeight = options->height;
     m_SharedFormat = options->format;
+    m_BlobModifier = options->modifier;
     m_CreateCtxId = options->create_ctx_id;
     m_IsBlob = TRUE;
     RtlZeroMemory(&m_Blob.Options, sizeof(m_Blob.Options));

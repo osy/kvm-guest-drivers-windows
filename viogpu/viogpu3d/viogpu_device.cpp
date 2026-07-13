@@ -163,8 +163,8 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuDevic
             cmdBody[4] = src->m_Blob.Info.width;
             cmdBody[5] = src->m_Blob.Info.height;
             cmdBody[6] = 0; // usage seems to be ignored
-            cmdBody[7] = 0xFFFFFFFF;
-            cmdBody[8] = 0xFFFFFF;
+            cmdBody[7] = (UINT)(src->m_BlobModifier & 0xFFFFFFFFull);
+            cmdBody[8] = (UINT)(src->m_BlobModifier >> 32);
             cmdBody[9] = src->m_Blob.Info.strides[0];
             cmdBody[10] = src->m_Blob.Info.offsets[0];
         }
@@ -200,8 +200,8 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuDevic
             cmdBody[4] = dst->m_Blob.Info.width;
             cmdBody[5] = dst->m_Blob.Info.height;
             cmdBody[6] = 0; // usage seems to be ignored
-            cmdBody[7] = 0xFFFFFFFF;
-            cmdBody[8] = 0xFFFFFF;
+            cmdBody[7] = (UINT)(dst->m_BlobModifier & 0xFFFFFFFFull);
+            cmdBody[8] = (UINT)(dst->m_BlobModifier >> 32);
             cmdBody[9] = dst->m_Blob.Info.strides[0];
             cmdBody[10] = dst->m_Blob.Info.offsets[0];
         }

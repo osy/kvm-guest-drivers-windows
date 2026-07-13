@@ -209,6 +209,11 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     UINT m_SharedWidth;
     UINT m_SharedHeight;
     UINT m_SharedFormat; // DXGI_FORMAT
+    // DRM modifier of the host dmabuf backing a shared blob.  Blt Present
+    // must pass this through PIPE_RESOURCE_SET_TYPE so virglrenderer imports
+    // tiled allocations with their real layout.  Other blob types retain
+    // INVALID, matching the old implicit-modifier behavior.
+    ULONGLONG m_BlobModifier = 0x00FFFFFFFFFFFFFFull;
     // Context the deferred RESOURCE_CREATE_BLOB targets (the UMD transport
     // context that staged the pending blob).  0 = the opening device's own
     // context (transport shmem blobs).
