@@ -113,6 +113,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     m_ResolutionEventHandle = NULL;
     m_u32NumCapsets = 0;
     m_u32NumScanouts = 0;
+    KeInitializeSpinLock(&m_ThreadTokenLock);
+    KeInitializeSpinLock(&m_PresentTokenLock);
 }
 
 VioGpuAdapter::~VioGpuAdapter(void)
@@ -953,9 +955,13 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     DbgPrint(TRACE_LEVEL_ERROR, ("%s no hDevice(context) supplied\n", __FUNCTION__));
                     return STATUS_INVALID_PARAMETER;
                 }
-                // Reference the UMD event; PresentFenceCb releases it after signalling.
+                // EventUM is optional.  The npt transport passes an event so
+                // its guest-side waiter can observe GPU completion (windowed
+                // presents block on it; the fence-feedback path also uses it);
+                // a caller that only needs the flip-gate token may pass 0.
                 PKEVENT pEvent = NULL;
-                if (!NT_SUCCESS(ObReferenceObjectByHandle(VioGpuUmHandleValue(pVioGpuEscape->PresentFence.EventUM),
+                if (pVioGpuEscape->PresentFence.EventUM != 0 &&
+                    !NT_SUCCESS(ObReferenceObjectByHandle(VioGpuUmHandleValue(pVioGpuEscape->PresentFence.EventUM),
                                                           SYNCHRONIZE | EVENT_MODIFY_STATE,
                                                           *ExEventObjectType,
                                                           UserMode,
@@ -967,13 +973,29 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                               __FUNCTION__, pVioGpuEscape->PresentFence.EventUM));
                     return STATUS_INVALID_HANDLE;
                 }
+
+                ULONGLONG token = PresentTokenSubmit();
+                PRESENT_FENCE_CTX *pCtx =
+                    &m_PresentFenceCtx[token % VIOGPU_PRESENT_FENCE_CTX_COUNT];
+                pCtx->pAdapter = this;
+                pCtx->Token = token;
+                pCtx->pEvent = pEvent;
+
+                // Pair the arm with the flip that follows it on this same
+                // thread (the UMD arms and then presents without switching
+                // threads; DxgkDdiPresent runs synchronously in the caller's
+                // thread).  See the token block in viogpu_adapter.h for why
+                // the pairing can be neither per-device nor the peeked
+                // newest token.
+                StampThreadToken(PsGetCurrentThreadId(), pCtx->Token);
+
                 // Empty fenced SUBMIT_3D on the event ring.  The host defers the
                 // used-ring response until the fence's D3DMetal proxy signals (real
-                // GPU completion), so PresentFenceCb -> KeSetEvent fires exactly when
-                // the frame finished rendering -- the async present-completion wake.
+                // GPU completion), so PresentFenceCb fires exactly when the frame
+                // finished rendering on the host GPU.
                 ctrlQueue.SubmitCommand(NULL, 0, pDevice->m_Context.GetId(), TRUE,
                                         pVioGpuEscape->PresentFence.RingIdx,
-                                        PresentFenceCb, pEvent);
+                                        PresentFenceCb, pCtx);
                 break;
             }
         default:
@@ -1027,9 +1049,25 @@ PAGED_CODE_SEG_END
 // so ObDereferenceObject here never triggers deletion at raised IRQL.
 static void PresentFenceCb(void *ctx, void *, void *)
 {
-    PKEVENT pEvent = (PKEVENT)ctx;
-    KeSetEvent(pEvent, IO_NO_INCREMENT, FALSE);
-    ObDereferenceObject(pEvent);
+    VioGpuAdapter::PRESENT_FENCE_CTX *pCtx = (VioGpuAdapter::PRESENT_FENCE_CTX *)ctx;
+    VioGpuAdapter *pAdapter = pCtx->pAdapter;
+
+    // Publish the retirement BEFORE waking anyone, so a waiter that runs the
+    // instant it is signalled already sees the token as done.
+    pAdapter->PresentTokenRetire(pCtx->Token);
+
+    if (pCtx->pEvent != NULL)
+    {
+        KeSetEvent(pCtx->pEvent, IO_NO_INCREMENT, FALSE);
+        ObDereferenceObject(pCtx->pEvent);
+        pCtx->pEvent = NULL;
+    }
+
+    // A flip may have been waiting on exactly this token; scan it out now
+    // rather than at the next vsync tick (which would cost up to a full
+    // refresh period of latency).  Only wakes the flip thread -- the scanout
+    // itself stays at PASSIVE_LEVEL where FlushToScreen expects to run.
+    pAdapter->vidpn.OnPresentTokenRetired();
 }
 
 VOID VioGpuAdapter::DpcRoutine(VOID)

@@ -540,9 +540,17 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
             // latch overwrite m_sourceAddress raced the queued flip's
             // address match and dxgkrnl TDR'd an idle engine
             // (0x117 LiveKernelEvent, submitted==completed).
+            //
+            // The render dependency is THIS frame's own present-fence token,
+            // stamped by the escape that armed it on this same thread (see
+            // viogpu_adapter.h).  0 when the frame's fence had already
+            // completed at present time -- the UMD then never armed, and the
+            // flip correctly runs un-gated.  Consumed unconditionally so a
+            // stamp never outlives its present.
+            ULONGLONG flipToken = m_pAdapter->TakeThreadToken(PsGetCurrentThreadId());
             PHYSICAL_ADDRESS zeroAddr = {};
             if (srcAlloc && srcAlloc->IsPrimary())
-                m_pAdapter->vidpn.SetScanoutSource(srcAlloc, zeroAddr);
+                m_pAdapter->vidpn.SetScanoutSource(srcAlloc, zeroAddr, flipToken);
         }
 
         // No host command is needed for a flip: the primary IS the blob
@@ -651,9 +659,15 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
             VioGpuAllocation *srcAlloc = src->GetAllocation();
             // See the Flip branch: never let a present-path latch
             // overwrite the MMIO-flip address the vsync must report.
+            //
+            // No token dependency: blt presents (GDI / redirection model)
+            // carry their pixels in the DMA buffer's transfer commands, not
+            // in a GPU render the present fence tracks, and the UMD does not
+            // arm a present fence for them.  Peeking here would chain the
+            // desktop's GDI updates behind an unrelated 3D client's frame.
             PHYSICAL_ADDRESS zeroBltAddr = {};
             if (srcAlloc && srcAlloc->IsPrimary())
-                m_pAdapter->vidpn.SetScanoutSource(srcAlloc, zeroBltAddr);
+                m_pAdapter->vidpn.SetScanoutSource(srcAlloc, zeroBltAddr, 0);
         }
         // Re-flush the scanout when the blt writes into the resource being
         // scanned out (GDI shared-primary model; see RearmFlipIfScanout).

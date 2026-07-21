@@ -48,6 +48,10 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
 
     m_SystemDisplaySourceId = D3DDDI_ID_UNINITIALIZED;
     KeInitializeSpinLock(&m_sourceLock);
+    // Auto-reset: each retiring present fence is one promotion opportunity,
+    // and TryPromoteFlip re-checks the latch anyway, so a coalesced signal
+    // can never strand an armed flip.
+    KeInitializeEvent(&m_flipReadyEvent, SynchronizationEvent, FALSE);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
@@ -76,9 +80,14 @@ VioGpuVidPN::~VioGpuVidPN()
     m_ModeNumbers = NULL;
 
     m_shouldFlipStop = true;
+    KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
 
     KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, NULL);
     ObDereferenceObject(m_pFlipThread);
+
+    KIRQL oldIrql = AcquireSourceLock();
+    FlipQueueClearLocked();
+    ReleaseSourceLock(oldIrql);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
@@ -196,6 +205,7 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
     timeout.QuadPart = Int32x32To64(1000, -10000);
 
     m_shouldFlipStop = TRUE;
+    KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
 
     if (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
     {
@@ -2059,42 +2069,166 @@ void VioGpuVidPN::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
     SetVideoModeInfo(m_CustomModeIndex, &tmpModeInfo);
 }
 
-void VioGpuVidPN::Flip()
+// Scan out an armed flip once the render it depends on has retired on the host
+// GPU.  Returns TRUE if a scanout was emitted (or explicitly cleared).
+//
+// Until the dependency retires the latch stays armed and NOTHING is published:
+// in particular m_displayedAddress is left alone, so the vsync interrupt keeps
+// reporting the frame that is really on screen and dxgkrnl neither retires the
+// queued flip nor frees the primary it would displace.  That is what makes it
+// safe for the UMD's present to return immediately.
+BOOLEAN VioGpuVidPN::TryPromoteFlip()
 {
     PAGED_CODE();
 
-    if (InterlockedExchange(&m_shouldFlip, 0))
+    // Consume the arm FIRST, then read the latch.  Any producer that latches
+    // after this exchange re-arms the flag, so its flip is picked up by a
+    // later promote against its own latch state.  Consuming only after the
+    // token check would swallow the arm of a producer that latched in the
+    // window: that flip would never scan out, its address would never be
+    // reported, and dxgkrnl would wait on it forever.
+    if (!InterlockedExchange(&m_shouldFlip, 0))
     {
-        VioGpuAllocation *res = NULL;
-        PHYSICAL_ADDRESS address;
+        return FALSE;
+    }
 
-        KIRQL oldIrql = AcquireSourceLock();
+    VioGpuAllocation *res = NULL;
+    PHYSICAL_ADDRESS address;
+    ULONGLONG required = 0;
+    BOOLEAN timedOut = FALSE;
+
+    const ULONGLONG done = m_pAdapter->PresentTokenDone();
+    const ULONGLONG now = KeQueryInterruptTime();
+
+    KIRQL oldIrql = AcquireSourceLock();
+    address = m_sourceAddress;
+    if (m_flipQCount != 0)
+    {
+        // Scan out the NEWEST queued flip whose render has retired; every
+        // older entry is superseded and dropped (sync-interval-0 frame
+        // dropping).  If nothing has retired, the oldest entry's own age
+        // bounds the wait: past the deadline a completion was lost, so the
+        // newest frame is shown anyway rather than freezing the display
+        // (and a genuinely wedged GPU still surfaces as a TDR elsewhere).
+        LONG pick = -1;
+        for (LONG i = (LONG)m_flipQCount - 1; i >= 0; i--)
+        {
+            const ULONGLONG tok = m_flipQueue[(m_flipQHead + i) % VIOGPU_FLIP_QUEUE_DEPTH].Token;
+            // Per-token, not a max-of-retired watermark: tokens come from one
+            // adapter-wide counter but retire on per-device, per-event-ring
+            // streams, so an unrelated device's later token can retire first
+            // and would mark this frame's render done while the GPU is still
+            // writing the buffer.
+            if (m_pAdapter->PresentTokenRetired(tok))
+            {
+                pick = i;
+                break;
+            }
+        }
+        if (pick < 0)
+        {
+            if (now - m_flipQueue[m_flipQHead].ArmedAt < VIOGPU_FLIP_TOKEN_DEADLINE_100NS)
+            {
+                // Not ready: put the arm back.  A producer may have re-armed
+                // already; OR keeps it set either way, and whichever promote
+                // eventually consumes it re-evaluates the queue, so nothing
+                // is lost.
+                ReleaseSourceLock(oldIrql);
+                InterlockedOr(&m_shouldFlip, 1);
+                return FALSE;
+            }
+            timedOut = TRUE;
+            pick = (LONG)m_flipQCount - 1;
+        }
+        // Steal the picked entry's reference; drop everything older.
+        for (LONG i = 0; i <= pick; i++)
+        {
+            PENDING_FLIP *p = &m_flipQueue[(m_flipQHead + i) % VIOGPU_FLIP_QUEUE_DEPTH];
+            if (i == pick)
+            {
+                res = p->Res;
+                required = p->Token;
+            }
+            else
+            {
+                if (p->Res)
+                {
+                    p->Res->ReleaseDeferred();
+                }
+            }
+            p->Res = NULL;
+        }
+        m_flipQHead = (m_flipQHead + (ULONG)pick + 1) % VIOGPU_FLIP_QUEUE_DEPTH;
+        m_flipQCount -= (ULONG)pick + 1;
+        if (m_flipQCount != 0)
+        {
+            // Newer flips remain pending; keep the promote loop running.
+            InterlockedOr(&m_shouldFlip, 1);
+        }
+    }
+    else
+    {
+        // No fenced flips pending: legacy direct latch (boot / GDI / blt
+        // primaries and SetVidPnSourceAddress-only transitions).
         res = m_sourceRes;
         if (res)
         {
             res->AddRef();
         }
-        address = m_sourceAddress;
-        ReleaseSourceLock(oldIrql);
+    }
+    ReleaseSourceLock(oldIrql);
 
-        // Blob primaries (the blt-present standing dmabuf set via
-        // SetScanoutSource) scan out by res_id through SetScanoutBlob and carry
-        // no guest PrimaryAddress, so flush them regardless of address; only 3D
-        // primaries are gated on a non-zero MMIO-flip address.
-        if (res != NULL && (address.QuadPart != 0 || res->IsBlob()))
+    if (timedOut)
+    {
+        LONG n = InterlockedIncrement(&m_flipTokenTimeouts);
+        // Rate-limited: an unconditional print on the flip path is a known
+        // TDR heisenbug.
+        if (n <= 16 || (n & 63) == 0)
         {
-            res->FlushToScreen(0);
-        }
-        else
-        {
-            m_pAdapter->ctrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
-        }
-
-        if (res)
-        {
-            res->Release();
+            DbgPrintEx(DPFLTR_DEFAULT_ID,
+                       DPFLTR_ERROR_LEVEL,
+                       "%s: flip token %llu not retired (done=%llu) after deadline #%ld; "
+                       "scanning out anyway\n",
+                       __FUNCTION__,
+                       required,
+                       done,
+                       n);
         }
     }
+
+    // Blob primaries (the blt-present standing dmabuf set via
+    // SetScanoutSource) scan out by res_id through SetScanoutBlob and carry
+    // no guest PrimaryAddress, so flush them regardless of address; only 3D
+    // primaries are gated on a non-zero MMIO-flip address.
+    if (res != NULL && (address.QuadPart != 0 || res->IsBlob()))
+    {
+        res->FlushToScreen(0);
+    }
+    else
+    {
+        m_pAdapter->ctrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
+    }
+
+    if (res)
+    {
+        res->Release();
+    }
+
+    // Published only after the scanout was emitted: from here the vsync may
+    // tell dxgkrnl this flip retired.
+    oldIrql = AcquireSourceLock();
+    m_displayedAddress = address;
+    ReleaseSourceLock(oldIrql);
+
+    return TRUE;
+}
+
+void VioGpuVidPN::Flip()
+{
+    PAGED_CODE();
+
+    TryPromoteFlip();
+
     DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
     interrupt.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;
 
@@ -2107,17 +2241,24 @@ void VioGpuVidPN::Flip()
     // boot primary) when the latch has no patched address yet.
     {
         KIRQL vsyncIrql = AcquireSourceLock();
-        // Report the latched flip address FIRST: for MMIO flips
-        // (FlipOnVSyncMmIo) m_sourceAddress is the PrimaryAddress of
-        // the pending flip and MUST be echoed verbatim for dxgkrnl to
-        // confirm it; the allocation's patched SegmentAddress is only
-        // a boot-primary fallback.
+        // Report the address of the frame that has actually been scanned
+        // out.  For MMIO flips (FlipOnVSyncMmIo) this is the PrimaryAddress
+        // of the flip and MUST be echoed verbatim for dxgkrnl to confirm it;
+        // the allocation's patched SegmentAddress is only a boot-primary
+        // fallback.
+        //
+        // m_displayedAddress rather than the latched m_sourceAddress: a flip
+        // whose render has not retired has been latched but NOT scanned out,
+        // and reporting it would tell dxgkrnl the flip completed -- freeing
+        // the displaced primary for reuse while it is still the one on
+        // screen, and letting the app overwrite the buffer we are about to
+        // display.  Once TryPromoteFlip emits the scanout the two agree.
         interrupt.CrtcVsync.PhysicalAddress =
-            (m_sourceAddress.QuadPart != 0)
-                ? m_sourceAddress
+            (m_displayedAddress.QuadPart != 0)
+                ? m_displayedAddress
                 : ((m_sourceRes && m_sourceRes->m_SegmentAddress.QuadPart != 0)
                        ? m_sourceRes->m_SegmentAddress
-                       : m_sourceAddress);
+                       : m_displayedAddress);
         ReleaseSourceLock(vsyncIrql);
     }
 
@@ -2147,17 +2288,36 @@ void VioGpuVidPN::FlipThread(void *ctx)
 
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
     LARGE_INTEGER interval;
+
     while (true)
     {
         // Recompute the period each tick so a mode change picks up
         // the new cadence without restarting the thread.
+        //
+        // KNOWN DEFECT: a relative timeout restarts the full period on
+        // every m_flipReadyEvent wake, and present-fence completions arrive
+        // per ID3D11Fence::SetEventOnCompletion from every process -- under
+        // load the vsync tick starves and MMIO flips stop completing.  The
+        // follow-up commit moves the tick to a periodic KTIMER.
         interval.QuadPart = -VsyncPeriodFromRefresh(vidpn->GetActiveRefreshRate());
-        KeDelayExecutionThread(KernelMode, false, &interval);
+
+        NTSTATUS wait = KeWaitForSingleObject(&vidpn->m_flipReadyEvent,
+                                              Executive,
+                                              KernelMode,
+                                              FALSE,
+                                              &interval);
         if (vidpn->m_shouldFlipStop)
         {
             return;
         }
-        vidpn->Flip();
+        if (wait == STATUS_TIMEOUT)
+        {
+            vidpn->Flip();
+        }
+        else
+        {
+            vidpn->TryPromoteFlip();
+        }
     }
 }
 
@@ -2168,6 +2328,36 @@ PAGED_CODE_SEG_END
 //
 #pragma code_seg(push)
 #pragma code_seg()
+
+void VioGpuVidPN::OnPresentTokenRetired()
+{
+    // Runs at DISPATCH_LEVEL from the present-fence completion DPC
+    // (PresentFenceCb -> here).  It only wakes the flip thread -- FlushToScreen
+    // is PAGED and stays on that thread -- but the FUNCTION ITSELF must live in
+    // a NON-PAGED code segment: MmTrimAllSystemPagableMemory can trim its code
+    // page out, and executing a paged-out page at DISPATCH bugchecks 0xD1
+    // (DRIVER_IRQL_NOT_LESS_OR_EQUAL, Arg1==Arg4 = an execute-from-paged fault).
+    KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+}
+
+// NON-PAGED: runs under m_sourceLock at DISPATCH_LEVEL (SetScanoutSource can
+// hold the lock with callers at raised IRQL) -- executing paged code there is
+// the 0xD1 class OnPresentTokenRetired documents above.  ReleaseDeferred is
+// the DIRQL-safe release.
+void VioGpuVidPN::FlipQueueClearLocked()
+{
+    while (m_flipQCount != 0)
+    {
+        PENDING_FLIP *p = &m_flipQueue[m_flipQHead];
+        if (p->Res)
+        {
+            p->Res->ReleaseDeferred();
+        }
+        p->Res = NULL;
+        m_flipQHead = (m_flipQHead + 1) % VIOGPU_FLIP_QUEUE_DEPTH;
+        m_flipQCount--;
+    }
+}
 
 NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
 {
@@ -2222,7 +2412,7 @@ void VioGpuVidPN::RearmFlipIfScanout(VioGpuAllocation *res)
         InterlockedOr(&m_shouldFlip, 1);
     }
 }
-void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res, PHYSICAL_ADDRESS addr)
+void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res, PHYSICAL_ADDRESS addr, ULONGLONG requiredToken)
 {
     // Only the full-screen desktop primary may become the scanout source.
     // DWM can present its cursor (e.g. 32x32) and individual windows
@@ -2269,6 +2459,41 @@ void VioGpuVidPN::SetScanoutSource(VioGpuAllocation *res, PHYSICAL_ADDRESS addr)
     if (addr.QuadPart != 0)
     {
         m_sourceAddress = addr;
+    }
+    // A flip WITH a render dependency queues; see the PENDING_FLIP block in
+    // viogpu_vidpn.h for why this must be a queue and not a coalescing
+    // latch.  A latch WITHOUT a dependency (boot/GDI primaries pass 0)
+    // supersedes everything queued: its content is current by definition,
+    // and chaining it behind a stale token would stall the display on the
+    // wrong image.
+    if (requiredToken != 0)
+    {
+        if (m_flipQCount == VIOGPU_FLIP_QUEUE_DEPTH)
+        {
+            // Full: the oldest frame is dropped, exactly as a sync-interval-0
+            // flip queue drops superseded frames.
+            PENDING_FLIP *pOld = &m_flipQueue[m_flipQHead];
+            if (pOld->Res)
+            {
+                pOld->Res->ReleaseDeferred();
+            }
+            pOld->Res = NULL;
+            m_flipQHead = (m_flipQHead + 1) % VIOGPU_FLIP_QUEUE_DEPTH;
+            m_flipQCount--;
+        }
+        PENDING_FLIP *pNew = &m_flipQueue[(m_flipQHead + m_flipQCount) % VIOGPU_FLIP_QUEUE_DEPTH];
+        pNew->Res = res;
+        if (res)
+        {
+            res->AddRef();
+        }
+        pNew->Token = requiredToken;
+        pNew->ArmedAt = KeQueryInterruptTime();
+        m_flipQCount++;
+    }
+    else
+    {
+        FlipQueueClearLocked();
     }
     ReleaseSourceLock(oldIrql);
 

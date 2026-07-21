@@ -101,6 +101,22 @@ class VioGpuVidPN
     void Flip();
     static void FlipThread(void *ctx);
 
+    // How long an armed flip may wait for its render dependency before it is
+    // scanned out regardless (100ns units, 1 second).  Far beyond any
+    // legitimate frame, so it only ever fires on a LOST completion -- and far
+    // below the TDR budget, so a genuinely wedged GPU still surfaces as a TDR
+    // instead of being hidden behind a stuttering display.
+#define VIOGPU_FLIP_TOKEN_DEADLINE_100NS (10ull * 1000ull * 1000ull)
+
+    // Scan out an armed flip if its render dependency has retired.  Called
+    // from the vsync tick and, so a ready flip does not wait a whole refresh
+    // period, from the present-fence wake.  Returns TRUE if it scanned out.
+    BOOLEAN TryPromoteFlip();
+
+    // Present-fence completion (DPC): a token retired, so re-evaluate an
+    // armed flip.  Only wakes the flip thread; does no work at DISPATCH.
+    void OnPresentTokenRetired();
+
     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
 
     // Override the source-0 scanout to an arbitrary allocation (a standing
@@ -113,12 +129,15 @@ class VioGpuVidPN
     // list); the vsync interrupt echoes it so dxgkrnl sees the display
     // progressing across flips.  Callers without an address (creation-
     // time promotion) pass {0}, which leaves the reported address alone.
-    void SetScanoutSource(VioGpuAllocation *res, PHYSICAL_ADDRESS addr);
+    // \p requiredToken is the present-fence token whose retirement means the
+    // contents of \p res are complete on the host GPU; 0 means "no dependency"
+    // (boot / GDI primaries, which no present fence covers).
+    void SetScanoutSource(VioGpuAllocation *res, PHYSICAL_ADDRESS addr, ULONGLONG requiredToken = 0);
     void RearmFlipIfScanout(VioGpuAllocation *res);
     inline void SetScanoutSource(VioGpuAllocation *res)
     {
         PHYSICAL_ADDRESS zero = {};
-        SetScanoutSource(res, zero);
+        SetScanoutSource(res, zero, 0);
     }
 
     // Currently-committed refresh rate, or {0,0} if no source mode is
@@ -192,6 +211,60 @@ class VioGpuVidPN
     VioGpuAllocation *m_sourceRes = NULL;
     KSPIN_LOCK m_sourceLock;
     volatile LONG m_shouldFlip = 0;
+
+    // Render->flip ordering.  The UMD renders through its OWN kernel context
+    // (D3DKMTCreateContext in the neptune transport) while the flip arrives on
+    // the runtime's context, so dxgkrnl cannot order the flip behind the
+    // render -- it never saw the render.  The UMD therefore submits a
+    // GPU-completion fence (VIOGPU_SUBMIT_PRESENT_FENCE) per present, the
+    // adapter stamps it with a monotonic token paired to the flip by arming
+    // thread (viogpu_adapter.h), and the flip may not scan out until its
+    // token retires.
+    //
+    // Pending flips form a small QUEUE, not a single coalescing latch.  A
+    // pipelined app (DXGI MaximumFrameLatency is 3) presents flip N+1 --
+    // whose render is still in flight -- BEFORE flip N's token retires, so a
+    // single latch always holds a not-yet-retired dependency and the scanout
+    // livelocks parked while the app renders at full speed.  With a queue the
+    // promote scans out the NEWEST entry whose token HAS retired and drops
+    // the older ones: standard sync-interval-0 frame-dropping, display shows
+    // the latest completed frame while newer ones render.  Each entry keeps
+    // the arm time of ITS OWN flip, so the lost-completion deadline
+    // genuinely accrues instead of being reset by every new present.
+    //
+    // All under m_sourceLock.  Entries hold a reference to Res.
+    struct PENDING_FLIP
+    {
+        VioGpuAllocation *Res;
+        ULONGLONG Token;
+        ULONGLONG ArmedAt;
+    };
+#define VIOGPU_FLIP_QUEUE_DEPTH 8
+    PENDING_FLIP m_flipQueue[VIOGPU_FLIP_QUEUE_DEPTH] = {};
+    ULONG m_flipQHead = 0;  // index of the oldest entry
+    ULONG m_flipQCount = 0;
+
+    // Drop every queued entry (deferred release -- callers may hold the lock
+    // at DIRQL).  Used when a no-dependency latch (boot/GDI primary)
+    // supersedes the queued flips and at teardown.
+    void FlipQueueClearLocked();
+
+    // What is ACTUALLY on screen, as opposed to what has been latched.
+    // dxgkrnl retires a queued flip -- and frees the primary it displaced --
+    // when a vsync reports that flip's address, so reporting a latched but
+    // not-yet-scanned-out address would hand a buffer back while it is still
+    // the one being displayed.  Only Flip() promotes latched -> displayed,
+    // and only after the scanout has been emitted.
+    PHYSICAL_ADDRESS m_displayedAddress = {0};
+
+    // Signalled from the present-fence completion DPC so a flip whose token
+    // just retired scans out immediately instead of waiting for the next
+    // vsync tick (which would add up to a full refresh period of latency).
+    KEVENT m_flipReadyEvent;
+
+    // Diagnostics for the bounded fallback: a flip promoted without its token
+    // means a completion was lost.  Must stay zero in healthy operation.
+    volatile LONG m_flipTokenTimeouts = 0;
 
     PETHREAD m_pFlipThread;
     BOOL m_shouldFlipStop = false;
