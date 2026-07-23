@@ -2289,6 +2289,14 @@ void VioGpuVidPN::FlipThread(void *ctx)
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
     LARGE_INTEGER interval;
 
+    // This thread IS the display: it emits every scanout and reports every
+    // vsync.  At default priority it starves whenever a benchmark saturates
+    // the vCPUs.  Real display drivers run this work at DIRQL/DPC; the
+    // closest a system thread gets is the realtime band, where it preempts
+    // any time-sharing workload thread but still yields to DPCs and other
+    // realtime work.
+    KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
+
     while (true)
     {
         // Recompute the period each tick so a mode change picks up
