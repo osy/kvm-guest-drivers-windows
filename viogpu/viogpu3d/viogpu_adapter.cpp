@@ -115,6 +115,16 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     m_u32NumScanouts = 0;
     KeInitializeSpinLock(&m_ThreadTokenLock);
     KeInitializeSpinLock(&m_PresentTokenLock);
+    // Present-fence completion contexts: fixed-size, allocated at Escape
+    // (PASSIVE) and freed from the response DPC (DISPATCH), which is exactly
+    // the lookaside contract.
+    ExInitializeNPagedLookasideList(&m_PresentFenceLookaside,
+                                    NULL,
+                                    NULL,
+                                    POOL_NX_ALLOCATION,
+                                    sizeof(PRESENT_FENCE_CTX),
+                                    'fPgV',
+                                    0);
 }
 
 VioGpuAdapter::~VioGpuAdapter(void)
@@ -125,6 +135,7 @@ VioGpuAdapter::~VioGpuAdapter(void)
     CloseResolutionEvent();
     VioGpuAdapterClose();
     HWClose();
+    ExDeleteNPagedLookasideList(&m_PresentFenceLookaside);
     m_Id = 0;
 }
 
@@ -974,11 +985,18 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_INVALID_HANDLE;
                 }
 
-                ULONGLONG token = PresentTokenSubmit();
-                PRESENT_FENCE_CTX *pCtx =
-                    &m_PresentFenceCtx[token % VIOGPU_PRESENT_FENCE_CTX_COUNT];
+                PRESENT_FENCE_CTX *pCtx = (PRESENT_FENCE_CTX *)
+                    ExAllocateFromNPagedLookasideList(&m_PresentFenceLookaside);
+                if (pCtx == NULL)
+                {
+                    if (pEvent != NULL)
+                    {
+                        ObDereferenceObject(pEvent);
+                    }
+                    return STATUS_INSUFFICIENT_RESOURCES;
+                }
                 pCtx->pAdapter = this;
-                pCtx->Token = token;
+                pCtx->Token = PresentTokenSubmit();
                 pCtx->pEvent = pEvent;
 
                 // Pair the arm with the flip that follows it on this same
@@ -1060,8 +1078,9 @@ static void PresentFenceCb(void *ctx, void *, void *)
     {
         KeSetEvent(pCtx->pEvent, IO_NO_INCREMENT, FALSE);
         ObDereferenceObject(pCtx->pEvent);
-        pCtx->pEvent = NULL;
     }
+
+    ExFreeToNPagedLookasideList(&pAdapter->m_PresentFenceLookaside, pCtx);
 
     // A flip may have been waiting on exactly this token; scan it out now
     // rather than at the next vsync tick (which would cost up to a full

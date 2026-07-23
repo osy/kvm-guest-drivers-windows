@@ -407,21 +407,20 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
         KeReleaseSpinLock(&m_PresentTokenLock, oldIrql);
     }
 
-    // Per-present completion context.  Preallocated and indexed by token so
-    // the present path never allocates from pool.  NOTE: this ring wraps
-    // onto a live entry once more than VIOGPU_PRESENT_FENCE_CTX_COUNT arms
-    // are in flight (fence-event arms are per
+    // Per-escape completion context, carried through SubmitCommand to
+    // PresentFenceCb.  Allocated from a nonpaged lookaside list: fixed-size,
+    // DISPATCH-safe free from the response DPC, per-processor cached -- and
+    // unlike a fixed ring it cannot wrap onto a live entry no matter how
+    // many arms are in flight (fence-event arms are per
     // ID3D11Fence::SetEventOnCompletion, adapter-wide, so the in-flight
-    // count is unbounded); the follow-up commit replaces it with a
-    // lookaside list.
+    // count is unbounded by design).
     struct PRESENT_FENCE_CTX
     {
         VioGpuAdapter *pAdapter;
         ULONGLONG Token;
         PKEVENT pEvent; // optional user-mode wake; NULL for kernel-gated flips
     };
-#define VIOGPU_PRESENT_FENCE_CTX_COUNT 256
-    PRESENT_FENCE_CTX m_PresentFenceCtx[VIOGPU_PRESENT_FENCE_CTX_COUNT] = {};
+    NPAGED_LOOKASIDE_LIST m_PresentFenceLookaside;
 
   private:
     static ULONG VioGpuThreadTokenHash(HANDLE tid)

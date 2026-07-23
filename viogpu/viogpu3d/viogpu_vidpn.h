@@ -262,9 +262,33 @@ class VioGpuVidPN
     // vsync tick (which would add up to a full refresh period of latency).
     KEVENT m_flipReadyEvent;
 
+    // Periodic vsync timer.  The vsync cadence MUST be independent of the
+    // fence-completion wakes above: a single KeWaitForSingleObject with the
+    // period as a relative timeout restarts the period on EVERY wake, and
+    // present-fence completions arrive per ID3D11Fence::SetEventOnCompletion
+    // from every process -- under load their inter-arrival stays below the
+    // refresh period and the vsync interrupt stops entirely.  Per MSDN, an
+    // MMIO flip completes ONLY when the CRTC_VSYNC interrupt reports its
+    // address, so starving the tick freezes every queued flip.  A periodic
+    // KTIMER keeps ticking no matter how often the event fires.
+    KTIMER m_vsyncTimer;
+
+    // Period the timer is currently programmed with (100ns units), so the
+    // flip thread re-arms it only when a mode change alters the refresh
+    // rate.
+    LONGLONG m_vsyncTimerPeriod100ns = 0;
+
     // Diagnostics for the bounded fallback: a flip promoted without its token
     // means a completion was lost.  Must stay zero in healthy operation.
     volatile LONG m_flipTokenTimeouts = 0;
+
+    // Flip-gate health counters (inspectable from the debugger).  A 3D
+    // client presenting while `gated` stays zero means the token
+    // association is broken.
+    volatile LONG m_flipPromotes = 0;
+    volatile LONG m_flipGatedPromotes = 0;
+    volatile LONG m_flipUngatedPromotes = 0;
+    volatile LONG m_flipParked = 0;
 
     PETHREAD m_pFlipThread;
     BOOL m_shouldFlipStop = false;

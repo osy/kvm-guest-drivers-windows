@@ -52,6 +52,9 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
     // and TryPromoteFlip re-checks the latch anyway, so a coalesced signal
     // can never strand an armed flip.
     KeInitializeEvent(&m_flipReadyEvent, SynchronizationEvent, FALSE);
+    // Auto-reset periodic tick; armed by the flip thread (see FlipThread for
+    // why the vsync cadence must not come from a wait timeout).
+    KeInitializeTimerEx(&m_vsyncTimer, SynchronizationTimer);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
@@ -2135,6 +2138,7 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
                 // is lost.
                 ReleaseSourceLock(oldIrql);
                 InterlockedOr(&m_shouldFlip, 1);
+                InterlockedIncrement(&m_flipParked);
                 return FALSE;
             }
             timedOut = TRUE;
@@ -2220,6 +2224,16 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
     m_displayedAddress = address;
     ReleaseSourceLock(oldIrql);
 
+    if (required != 0)
+    {
+        InterlockedIncrement(&m_flipGatedPromotes);
+    }
+    else
+    {
+        InterlockedIncrement(&m_flipUngatedPromotes);
+    }
+    InterlockedIncrement(&m_flipPromotes);
+
     return TRUE;
 }
 
@@ -2287,7 +2301,7 @@ void VioGpuVidPN::FlipThread(void *ctx)
     PAGED_CODE();
 
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
-    LARGE_INTEGER interval;
+    PVOID waitObjects[2] = {&vidpn->m_vsyncTimer, &vidpn->m_flipReadyEvent};
 
     // This thread IS the display: it emits every scanout and reports every
     // vsync.  At default priority it starves whenever a benchmark saturates
@@ -2297,28 +2311,61 @@ void VioGpuVidPN::FlipThread(void *ctx)
     // realtime work.
     KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
 
-    while (true)
-    {
-        // Recompute the period each tick so a mode change picks up
-        // the new cadence without restarting the thread.
-        //
-        // KNOWN DEFECT: a relative timeout restarts the full period on
-        // every m_flipReadyEvent wake, and present-fence completions arrive
-        // per ID3D11Fence::SetEventOnCompletion from every process -- under
-        // load the vsync tick starves and MMIO flips stop completing.  The
-        // follow-up commit moves the tick to a periodic KTIMER.
-        interval.QuadPart = -VsyncPeriodFromRefresh(vidpn->GetActiveRefreshRate());
+    // Force the first loop iteration to program the timer (the thread can be
+    // restarted after ReleasePostDisplayOwnership, and the previous run
+    // cancelled it on exit).
+    vidpn->m_vsyncTimerPeriod100ns = 0;
 
-        NTSTATUS wait = KeWaitForSingleObject(&vidpn->m_flipReadyEvent,
-                                              Executive,
-                                              KernelMode,
-                                              FALSE,
-                                              &interval);
+    for (;;)
+    {
+        // The vsync tick comes from a PERIODIC timer, not from a wait
+        // timeout.  A relative timeout restarts the full period on every
+        // wake, and m_flipReadyEvent fires on every present-fence completion
+        // adapter-wide (one per ID3D11Fence::SetEventOnCompletion, from
+        // every process) -- under load their inter-arrival stays below the
+        // refresh period, a timeout-based tick then never fires, and per the
+        // MMIO-flip contract (DxgkDdiSetVidPnSourceAddress: completion is
+        // reported only by the CRTC_VSYNC interrupt's effective scan
+        // address) every queued flip stops completing: the screen freezes on
+        // one frame while rendering continues.  The periodic timer keeps
+        // ticking no matter how often the event fires.
+        //
+        // Re-program only when a mode change alters the refresh rate.  The
+        // ms rounding of KeSetTimerEx's Period is fine: this is a synthetic
+        // cadence for dxgkrnl, not a hardware vblank.
+        LONGLONG period100ns = VsyncPeriodFromRefresh(vidpn->GetActiveRefreshRate());
+        if (period100ns != vidpn->m_vsyncTimerPeriod100ns)
+        {
+            vidpn->m_vsyncTimerPeriod100ns = period100ns;
+            LARGE_INTEGER due;
+            due.QuadPart = -period100ns;
+            LONG periodMs = (LONG)((period100ns + 5000) / 10000);
+            if (periodMs < 1)
+            {
+                periodMs = 1;
+            }
+            KeSetTimerEx(&vidpn->m_vsyncTimer, due, periodMs, NULL);
+        }
+
+        // Timer tick -> Flip() (vsync interrupt + promote).  Fence-retire
+        // wake -> TryPromoteFlip() only: a flip whose render just finished
+        // scans out immediately instead of sitting out the rest of the
+        // period, but no extra vsync is reported -- dxgkrnl needs a steady
+        // refresh cadence, and emitting vsyncs at the fence-completion rate
+        // would corrupt its flip accounting.
+        NTSTATUS wait = KeWaitForMultipleObjects(2,
+                                                 waitObjects,
+                                                 WaitAny,
+                                                 Executive,
+                                                 KernelMode,
+                                                 FALSE,
+                                                 NULL,
+                                                 NULL);
         if (vidpn->m_shouldFlipStop)
         {
-            return;
+            break;
         }
-        if (wait == STATUS_TIMEOUT)
+        if (wait == STATUS_WAIT_0)
         {
             vidpn->Flip();
         }
@@ -2327,6 +2374,8 @@ void VioGpuVidPN::FlipThread(void *ctx)
             vidpn->TryPromoteFlip();
         }
     }
+
+    KeCancelTimer(&vidpn->m_vsyncTimer);
 }
 
 PAGED_CODE_SEG_END
