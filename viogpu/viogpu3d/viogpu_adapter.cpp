@@ -342,8 +342,6 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
 {
     PAGED_CODE();
 
-    UNREFERENCED_PARAMETER(ActionType);
-
     DbgPrint(TRACE_LEVEL_FATAL,
              ("---> %s HardwareUid = 0x%x ActionType = %s DevicePowerState = %s AdapterPowerState = %s\n",
               __FUNCTION__,
@@ -400,8 +398,22 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
                 break;
             case PowerDeviceD3:
                 {
-                    vidpn.Powerdown();
-                    VioGpuAdapterClose();
+                    if (ActionType == PowerActionSleep)
+                    {
+                        // S3 preserves the emulated virtio-gpu device and
+                        // its host resources.  Quiesce presentation while
+                        // Windows is asleep, but do not reset the device:
+                        // VidMm retains its allocation objects across S3,
+                        // so resetting here would leave every retained
+                        // allocation referring to a host resource that no
+                        // longer exists after resume.
+                        vidpn.StopFlipThread();
+                    }
+                    else
+                    {
+                        vidpn.Powerdown();
+                        VioGpuAdapterClose();
+                    }
                 }
                 break;
         }

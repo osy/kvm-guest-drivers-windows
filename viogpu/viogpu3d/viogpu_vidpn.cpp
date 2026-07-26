@@ -205,6 +205,13 @@ NTSTATUS VioGpuVidPN::StartFlipThread()
         m_shouldFlipStop = true;
         KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
     }
+    else
+    {
+        // A sleep transition preserves the current host resource.  Publish
+        // that retained scanout again as soon as presentation resumes even
+        // if dxgkrnl has no new source-address DDI to issue.
+        InterlockedOr(&m_shouldFlip, 1);
+    }
     return status;
 }
 
