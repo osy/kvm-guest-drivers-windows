@@ -40,6 +40,8 @@ class VioGpuVidPN
     ~VioGpuVidPN();
 
     NTSTATUS Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren);
+    NTSTATUS StartFlipThread();
+    void StopFlipThread();
     NTSTATUS AcquirePostDisplayOwnership();
     void ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId, DXGK_DISPLAY_INFORMATION *pDisplayInfo);
     void Powerdown();
@@ -290,6 +292,6 @@ class VioGpuVidPN
     volatile LONG m_flipUngatedPromotes = 0;
     volatile LONG m_flipParked = 0;
 
-    PETHREAD m_pFlipThread;
+    PETHREAD m_pFlipThread = NULL;
     BOOL m_shouldFlipStop = false;
 };

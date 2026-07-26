@@ -82,11 +82,7 @@ VioGpuVidPN::~VioGpuVidPN()
     m_ModeInfo = NULL;
     m_ModeNumbers = NULL;
 
-    m_shouldFlipStop = true;
-    KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
-
-    KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, NULL);
-    ObDereferenceObject(m_pFlipThread);
+    StopFlipThread();
 
     KIRQL oldIrql = AcquireSourceLock();
     FlipQueueClearLocked();
@@ -166,17 +162,66 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
     DbgPrint(TRACE_LEVEL_INFORMATION,
              ("<--- %s ColorFormat = %d\n", __FUNCTION__, m_CurrentModes[0].DispInfo.ColorFormat));
 
-    HANDLE threadHandle = 0;
-    m_shouldFlipStop = false;
-    Status = PsCreateSystemThread(&threadHandle, (ACCESS_MASK)0, NULL, (HANDLE)0, NULL, VioGpuVidPN::FlipThread, this);
-
-    ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)(&m_pFlipThread), NULL);
-
-    ZwClose(threadHandle);
+    Status = StartFlipThread();
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     return Status;
+}
+
+NTSTATUS VioGpuVidPN::StartFlipThread()
+{
+    PAGED_CODE();
+
+    if (m_pFlipThread != NULL)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    HANDLE threadHandle = NULL;
+    m_shouldFlipStop = false;
+    NTSTATUS status = PsCreateSystemThread(&threadHandle,
+                                           (ACCESS_MASK)0,
+                                           NULL,
+                                           (HANDLE)0,
+                                           NULL,
+                                           VioGpuVidPN::FlipThread,
+                                           this);
+    if (!NT_SUCCESS(status))
+    {
+        m_shouldFlipStop = true;
+        return status;
+    }
+
+    status = ObReferenceObjectByHandle(threadHandle,
+                                       THREAD_ALL_ACCESS,
+                                       NULL,
+                                       KernelMode,
+                                       (PVOID *)(&m_pFlipThread),
+                                       NULL);
+    ZwClose(threadHandle);
+    if (!NT_SUCCESS(status))
+    {
+        m_shouldFlipStop = true;
+        KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+    }
+    return status;
+}
+
+void VioGpuVidPN::StopFlipThread()
+{
+    PAGED_CODE();
+
+    m_shouldFlipStop = true;
+    KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+    KeCancelTimer(&m_vsyncTimer);
+
+    if (m_pFlipThread != NULL)
+    {
+        KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(m_pFlipThread);
+        m_pFlipThread = NULL;
+    }
 }
 
 NTSTATUS VioGpuVidPN::AcquirePostDisplayOwnership()
@@ -204,19 +249,7 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
     D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId = FindSourceForTarget(TargetId, TRUE);
     m_sourceAddress.QuadPart = 0;
 
-    LARGE_INTEGER timeout = {0};
-    timeout.QuadPart = Int32x32To64(1000, -10000);
-
-    m_shouldFlipStop = TRUE;
-    KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
-
-    if (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
-    {
-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to exit the flip thread\n"));
-        VioGpuDbgBreak();
-    }
-
-    ObDereferenceObject(m_pFlipThread);
+    StopFlipThread();
 
     BlackOutScreen(&m_CurrentModes[SourceId]);
     DestroyFrameBufferObj(TRUE);
@@ -236,10 +269,10 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
 
 void VioGpuVidPN::Powerdown()
 {
+    StopFlipThread();
     DestroyFrameBufferObj(TRUE);
     m_CurrentModes[0].Flags.FrameBufferIsActive = FALSE;
     m_CurrentModes[0].FrameBuffer.Ptr = NULL;
-    m_shouldFlipStop = true;
 }
 
 NTSTATUS VioGpuVidPN::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVidPn)

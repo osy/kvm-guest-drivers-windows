@@ -380,6 +380,11 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
                     {
                         VioGpuAdapterInit();
                     }
+                    NTSTATUS status = vidpn.StartFlipThread();
+                    if (!NT_SUCCESS(status))
+                    {
+                        return status;
+                    }
                 }
                 break;
             case PowerDeviceD1:
