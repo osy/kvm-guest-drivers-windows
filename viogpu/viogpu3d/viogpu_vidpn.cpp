@@ -1086,14 +1086,36 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
     PAGED_CODE();
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
-    UNREFERENCED_PARAMETER(pVidPnPinnedSourceModeInfo);
+    UNREFERENCED_PARAMETER(SourceId);
 
     D3DKMDT_VIDPN_TARGET_MODE *pVidPnTargetModeInfo = NULL;
     NTSTATUS Status = STATUS_SUCCESS;
 
-    for (UINT ModeIndex = 0; ModeIndex < GetModeCount(); ++ModeIndex)
+    // Cofunctionality: when dxgkrnl has already PINNED a source mode, this set
+    // must contain only target modes that can actually drive it.  This adapter
+    // exposes no scaler (QueryVidPnHWCapability: DriverScaling = 0) and its
+    // paths carry identity/centered scaling, so exactly ONE target mode is
+    // cofunctional -- the one whose raster equals the pinned source's visible
+    // region.  Build it from the pinned mode rather than from m_ModeInfo, so a
+    // source mode that is not in the table (the custom/agent-driven slot is
+    // rewritten under us) still gets a matching target.
+    VIDEO_MODE_INFORMATION PinnedMode;
+    const BOOLEAN HavePinnedSource = (pVidPnPinnedSourceModeInfo != NULL);
+    UINT ModeCount = (UINT)GetModeCount();
+
+    if (HavePinnedSource)
     {
-        PVIDEO_MODE_INFORMATION pModeInfo = &m_ModeInfo[SourceId];
+        RtlZeroMemory(&PinnedMode, sizeof(PinnedMode));
+        PinnedMode.Length = sizeof(PinnedMode);
+        PinnedMode.VisScreenWidth = pVidPnPinnedSourceModeInfo->Format.Graphics.VisibleRegionSize.cx;
+        PinnedMode.VisScreenHeight = pVidPnPinnedSourceModeInfo->Format.Graphics.VisibleRegionSize.cy;
+        PinnedMode.ScreenStride = (PinnedMode.VisScreenWidth * 4 + 3) & ~0x3;
+        ModeCount = 1;
+    }
+
+    for (UINT ModeIndex = 0; ModeIndex < ModeCount; ++ModeIndex)
+    {
+        PVIDEO_MODE_INFORMATION pModeInfo = HavePinnedSource ? &PinnedMode : &m_ModeInfo[ModeIndex];
         pVidPnTargetModeInfo = NULL;
         Status = pVidPnTargetModeSetInterface->pfnCreateNewModeInfo(hVidPnTargetModeSet, &pVidPnTargetModeInfo);
         if (!NT_SUCCESS(Status))
@@ -1104,8 +1126,10 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
                       LONG_PTR(hVidPnTargetModeSet)));
             return Status;
         }
-        pVidPnTargetModeInfo->VideoSignalInfo.ActiveSize = pVidPnTargetModeInfo->VideoSignalInfo.TotalSize;
+        // A freshly created mode carries D3DKMDT_DIMENSION_NOTSPECIFIED, so the
+        // raster has to be built before ActiveSize can be taken from TotalSize.
         BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo);
+        pVidPnTargetModeInfo->VideoSignalInfo.ActiveSize = pVidPnTargetModeInfo->VideoSignalInfo.TotalSize;
 
         pVidPnTargetModeInfo->Preference = D3DKMDT_MP_NOTPREFERRED; // TODO: another logic for prefferred mode. Maybe
                                                                     // the pinned source mode
