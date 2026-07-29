@@ -37,6 +37,11 @@
 // per-DriverObject, not per-device.
 static PDRIVER_DISPATCH gOriginalPnpIrp;
 
+// The PDO the fixup applies to. The patched dispatch belongs to the enumerator
+// and is shared by every device it enumerates, so the device object has to be
+// matched: only our own PDO's boot configuration wants a framebuffer resource.
+static PDEVICE_OBJECT gFixupDeviceObject;
+
 //
 // SystemBootGraphicsInformation lets us recover the boot framebuffer range
 // that win32k expects to find in the PDO's resource list. These definitions
@@ -120,6 +125,11 @@ static NTSTATUS InjectFramebufferResource(_Inout_ PCM_RESOURCE_LIST *ppResourceL
     ULONGLONG framebufferStart, framebufferEnd;
     BOOLEAN foundFramebuffer;
 
+    if (*ppResourceList == NULL)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     status = GetFramebufferAddress(&framebufferStart, &framebufferEnd);
     if (!NT_SUCCESS(status))
     {
@@ -199,16 +209,87 @@ static NTSTATUS InjectFramebufferResource(_Inout_ PCM_RESOURCE_LIST *ppResourceL
     return STATUS_SUCCESS;
 }
 
+static IO_COMPLETION_ROUTINE VioGpuQueryResourcesComplete;
+
+static NTSTATUS VioGpuQueryResourcesComplete(_In_ PDEVICE_OBJECT pDevObj, _In_ PIRP pIrp, _In_ PVOID pContext)
+{
+    UNREFERENCED_PARAMETER(pDevObj);
+    UNREFERENCED_PARAMETER(pIrp);
+
+    KeSetEvent((PKEVENT)pContext, IO_NO_INCREMENT, FALSE);
+
+    // Keeps the IRP alive so the caller can read IoStatus out of it and free it.
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+//
+// Ask the enumerator for the device's boot configuration. On success the caller
+// owns the returned resource list and is responsible for handing it on (or
+// freeing it).
+//
+// The IRP is owned here rather than built with IoBuildSynchronousFsdRequest:
+// that helper reports its result by writing the caller's IO_STATUS_BLOCK from
+// the I/O manager's special kernel APC, and this dispatch runs inside PnP
+// enumeration, where that APC can be deferred past our own return.
+//
+static NTSTATUS VioGpuQueryBootResources(_In_ PDEVICE_OBJECT pDevObj, _Outptr_result_maybenull_ PCM_RESOURCE_LIST *ppResourceList)
+{
+    KEVENT event;
+    PIRP newIrp;
+    PIO_STACK_LOCATION pStack;
+    NTSTATUS status;
+
+    *ppResourceList = NULL;
+
+    newIrp = IoAllocateIrp(pDevObj->StackSize, FALSE);
+    if (newIrp == NULL)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    KeInitializeEvent(&event, NotificationEvent, FALSE);
+
+    // PnP convention: a bus driver with no boot configuration for the device
+    // completes the IRP without touching the status we seed here.
+    newIrp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+    newIrp->IoStatus.Information = 0;
+
+    pStack = IoGetNextIrpStackLocation(newIrp);
+    pStack->MajorFunction = IRP_MJ_PNP;
+    pStack->MinorFunction = IRP_MN_QUERY_RESOURCES | IRP_MN_CUSTOM_INJECTED;
+
+    IoSetCompletionRoutine(newIrp, VioGpuQueryResourcesComplete, &event, TRUE, TRUE, TRUE);
+
+    // The completion routine runs on every outcome, so the event is always
+    // signalled and the IRP is always still ours, whether the lower driver
+    // completed inline or pended.
+    (void)IoCallDriver(pDevObj, newIrp);
+    KeWaitForSingleObject(&event,
+                          Executive,  // WaitReason
+                          KernelMode, // must be Kernelmode to prevent the stack getting paged out
+                          FALSE,
+                          NULL // indefinite wait
+    );
+
+    status = newIrp->IoStatus.Status;
+    if (NT_SUCCESS(status))
+    {
+        *ppResourceList = (PCM_RESOURCE_LIST)newIrp->IoStatus.Information;
+    }
+    IoFreeIrp(newIrp);
+
+    return status;
+}
+
 static NTSTATUS VioGpuDisplayFixupPnpIrp(IN PDEVICE_OBJECT pDevObj, IN PIRP pIrp)
 {
     PIO_STACK_LOCATION pStack;
-    KEVENT event;
     NTSTATUS status;
-    IO_STATUS_BLOCK ioStatus;
-    PIRP newIrp;
+    PCM_RESOURCE_LIST pResourceList;
 
     pStack = IoGetCurrentIrpStackLocation(pIrp);
-    if (pStack->MajorFunction != IRP_MJ_PNP || pStack->MinorFunction != IRP_MN_QUERY_RESOURCES)
+    if (pStack->MajorFunction != IRP_MJ_PNP || pStack->MinorFunction != IRP_MN_QUERY_RESOURCES ||
+        pDevObj != gFixupDeviceObject)
     {
         if (pStack->MajorFunction == IRP_MJ_PNP)
         {
@@ -220,40 +301,37 @@ static NTSTATUS VioGpuDisplayFixupPnpIrp(IN PDEVICE_OBJECT pDevObj, IN PIRP pIrp
     }
 
     // Only modify IRP_MN_QUERY_RESOURCES
-    KeInitializeEvent(&event, SynchronizationEvent, FALSE);
-
-    newIrp = IoBuildSynchronousFsdRequest(IRP_MJ_PNP, pDevObj, NULL, 0, 0, &event, &ioStatus);
-    if (!newIrp)
+    status = VioGpuQueryBootResources(pDevObj, &pResourceList);
+    if (!NT_SUCCESS(status) || pResourceList == NULL)
     {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    newIrp->IoStatus.Status = STATUS_NOT_SUPPORTED;
-    IoGetNextIrpStackLocation(newIrp)->MinorFunction = IRP_MN_QUERY_RESOURCES | IRP_MN_CUSTOM_INJECTED;
-
-    status = IoCallDriver(pDevObj, newIrp);
-
-    if (status == STATUS_PENDING)
-    {
-        KeWaitForSingleObject(&event,
-                              Executive,  // WaitReason
-                              KernelMode, // must be Kernelmode to prevent the stack getting paged out
-                              FALSE,
-                              NULL // indefinite wait
-        );
-        status = ioStatus.Status;
+        // The enumerator has no boot configuration for this device, so there is
+        // no list to add the framebuffer to. Forwarding the original IRP leaves
+        // the stack behaving as if the dispatch were never patched.
+        DbgPrint(TRACE_LEVEL_WARNING, ("IRP_MN_QUERY_RESOURCES yielded no resource list (0x%x), skipping fixup\n", status));
+        return gOriginalPnpIrp(pDevObj, pIrp);
     }
 
-    status = InjectFramebufferResource((PCM_RESOURCE_LIST *)&ioStatus.Information);
+    // pResourceList is owned here and passed up on the original IRP. A failure
+    // to inject is not worth failing the query over.
+    status = InjectFramebufferResource(&pResourceList);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("Failed to inject framebuffer resource (0x%x)\n", status));
+    }
 
-    pIrp->IoStatus.Information = ioStatus.Information;
-    pIrp->IoStatus.Status = status;
+    pIrp->IoStatus.Information = (ULONG_PTR)pResourceList;
+    pIrp->IoStatus.Status = STATUS_SUCCESS;
     IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return status;
+    return STATUS_SUCCESS;
 }
 
 void VioGpuInstallDisplayFixup(_In_ PDEVICE_OBJECT pPhysicalDeviceObject)
 {
     PDRIVER_OBJECT pDriverObject = pPhysicalDeviceObject->DriverObject;
+
+    // Recorded unconditionally: a reinstall runs AddDevice again against the
+    // same enumerator, whose dispatch may already be patched at that point.
+    gFixupDeviceObject = pPhysicalDeviceObject;
 
     if (gOriginalPnpIrp == NULL)
     {
@@ -265,10 +343,23 @@ void VioGpuInstallDisplayFixup(_In_ PDEVICE_OBJECT pPhysicalDeviceObject)
 
 void VioGpuRemoveDisplayFixup(_In_ PDEVICE_OBJECT pPhysicalDeviceObject)
 {
-    if (gOriginalPnpIrp)
+    PDRIVER_OBJECT pDriverObject = pPhysicalDeviceObject->DriverObject;
+
+    if (gOriginalPnpIrp == NULL)
     {
-        DbgPrint(TRACE_LEVEL_VERBOSE, ("Removing IRP_MJ_PNP patch\n"));
-        pPhysicalDeviceObject->DriverObject->MajorFunction[IRP_MJ_PNP] = gOriginalPnpIrp;
-        gOriginalPnpIrp = NULL;
+        return;
     }
+
+    // A driver that patched the dispatch on top of us cannot be unlinked, and
+    // restoring the saved pointer would drop it out of the chain.
+    if (pDriverObject->MajorFunction[IRP_MJ_PNP] != VioGpuDisplayFixupPnpIrp)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("IRP_MJ_PNP was re-patched by another driver, leaving it alone\n"));
+        return;
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("Removing IRP_MJ_PNP patch\n"));
+    pDriverObject->MajorFunction[IRP_MJ_PNP] = gOriginalPnpIrp;
+    gOriginalPnpIrp = NULL;
+    gFixupDeviceObject = NULL;
 }
