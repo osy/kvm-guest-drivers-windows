@@ -249,6 +249,10 @@ class VioGpuVidPN
     // supersedes the queued flips and at teardown.
     void FlipQueueClearLocked();
 
+    // Non-paged acquire/clear/release wrapper for PAGE-code callers (the
+    // destructor): code holding m_sourceLock must not fault.
+    void FlipQueueClear();
+
     // What is ACTUALLY on screen, as opposed to what has been latched.
     // dxgkrnl retires a queued flip -- and frees the primary it displaced --
     // when a vsync reports that flip's address, so reporting a latched but
@@ -290,6 +294,9 @@ class VioGpuVidPN
     volatile LONG m_flipUngatedPromotes = 0;
     volatile LONG m_flipParked = 0;
 
-    PETHREAD m_pFlipThread;
+    // NULL whenever no thread reference is held, so that the stop paths can
+    // tell whether the reference is still theirs to drop.  Checked builds
+    // fill fresh objects with 0xCD rather than zeroes.
+    PETHREAD m_pFlipThread = NULL;
     BOOL m_shouldFlipStop = false;
 };

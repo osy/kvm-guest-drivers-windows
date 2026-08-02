@@ -82,15 +82,22 @@ VioGpuVidPN::~VioGpuVidPN()
     m_ModeInfo = NULL;
     m_ModeNumbers = NULL;
 
-    m_shouldFlipStop = true;
-    KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+    // The PnP-stop path has already stopped the thread and dropped the
+    // reference; dereferencing it a second time underflows the thread
+    // object's refcount.
+    if (m_pFlipThread)
+    {
+        m_shouldFlipStop = true;
+        KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
 
-    KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, NULL);
-    ObDereferenceObject(m_pFlipThread);
+        KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(m_pFlipThread);
+        m_pFlipThread = NULL;
+    }
 
-    KIRQL oldIrql = AcquireSourceLock();
-    FlipQueueClearLocked();
-    ReleaseSourceLock(oldIrql);
+    // Non-paged: instructions executed while m_sourceLock is held must not
+    // fault, and this destructor is PAGE code.
+    FlipQueueClear();
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
@@ -210,13 +217,19 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
     m_shouldFlipStop = TRUE;
     KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
 
-    if (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
+    // The caller destroys the VidPN once this returns, and the flip thread
+    // publishes into it (m_displayedAddress) until it exits, so returning
+    // before it does leaves those writes landing in freed pool.  The thread
+    // observes m_shouldFlipStop within one vsync period; this DDI is called
+    // at PASSIVE_LEVEL, where waiting for it indefinitely is legal.
+    while (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to exit the flip thread\n"));
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> flip thread has not exited after 1s; still waiting\n"));
         VioGpuDbgBreak();
     }
 
     ObDereferenceObject(m_pFlipThread);
+    m_pFlipThread = NULL;
 
     BlackOutScreen(&m_CurrentModes[SourceId]);
     DestroyFrameBufferObj(TRUE);
@@ -2096,6 +2109,21 @@ void VioGpuVidPN::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
     SetVideoModeInfo(m_CustomModeIndex, &tmpModeInfo);
 }
 
+PAGED_CODE_SEG_END
+
+//
+// Non-Paged Code
+//
+// The flip path from here down runs with m_sourceLock held, and a routine
+// that acquires a spin lock must not fault until it has released it.
+// AcquireSourceLock is __forceinline, so the locked span is part of these
+// functions and the whole flip-thread call graph has to stay resident: the
+// PAGE section can be trimmed at any time, and executing a trimmed page at
+// DISPATCH_LEVEL bugchecks 0xD1 (see OnPresentTokenRetired for the same rule
+// on the DPC side).
+#pragma code_seg(push)
+#pragma code_seg()
+
 // Scan out an armed flip once the render it depends on has retired on the host
 // GPU.  Returns TRUE if a scanout was emitted (or explicitly cleared).
 //
@@ -2106,7 +2134,9 @@ void VioGpuVidPN::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
 // safe for the UMD's present to return immediately.
 BOOLEAN VioGpuVidPN::TryPromoteFlip()
 {
-    PAGED_CODE();
+    // Entered only from the flip thread at PASSIVE_LEVEL: the scanout emitted
+    // below (FlushToScreen) is PAGE code.
+    VIOGPU_ASSERT_CHK(KeGetCurrentIrql() < DISPATCH_LEVEL);
 
     // Consume the arm FIRST, then read the latch.  Any producer that latches
     // after this exchange re-arms the flag, so its flip is picked up by a
@@ -2263,8 +2293,6 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
 
 void VioGpuVidPN::Flip()
 {
-    PAGED_CODE();
-
     TryPromoteFlip();
 
     DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
@@ -2305,8 +2333,6 @@ void VioGpuVidPN::Flip()
 
 D3DDDI_RATIONAL VioGpuVidPN::GetActiveRefreshRate() const
 {
-    PAGED_CODE();
-
     D3DDDI_RATIONAL rate = {0, 0};
     // m_ModeInfo/m_CurrentModeIndex point at the active mode. Our
     // builds emit a fixed 60 Hz signal (see BuildVideoSignalInfo);
@@ -2322,7 +2348,7 @@ D3DDDI_RATIONAL VioGpuVidPN::GetActiveRefreshRate() const
 
 void VioGpuVidPN::FlipThread(void *ctx)
 {
-    PAGED_CODE();
+    VIOGPU_ASSERT_CHK(KeGetCurrentIrql() < DISPATCH_LEVEL);
 
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
     PVOID waitObjects[2] = {&vidpn->m_vsyncTimer, &vidpn->m_flipReadyEvent};
@@ -2402,14 +2428,6 @@ void VioGpuVidPN::FlipThread(void *ctx)
     KeCancelTimer(&vidpn->m_vsyncTimer);
 }
 
-PAGED_CODE_SEG_END
-
-//
-// Non-Paged Code
-//
-#pragma code_seg(push)
-#pragma code_seg()
-
 void VioGpuVidPN::OnPresentTokenRetired()
 {
     // Runs at DISPATCH_LEVEL from the present-fence completion DPC
@@ -2438,6 +2456,15 @@ void VioGpuVidPN::FlipQueueClearLocked()
         m_flipQHead = (m_flipQHead + 1) % VIOGPU_FLIP_QUEUE_DEPTH;
         m_flipQCount--;
     }
+}
+
+// Lock-taking wrapper for PAGE-code callers: the acquire/clear/release
+// triple has to execute out of non-paged code.
+void VioGpuVidPN::FlipQueueClear()
+{
+    KIRQL oldIrql = AcquireSourceLock();
+    FlipQueueClearLocked();
+    ReleaseSourceLock(oldIrql);
 }
 
 NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
