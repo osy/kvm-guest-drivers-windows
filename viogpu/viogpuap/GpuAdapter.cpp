@@ -236,7 +236,21 @@ bool GpuAdapter::SetResolution(PVIOGPU_DISP_MODE mode)
 {
     PrintMessage(L"%ws\n", __FUNCTIONW__);
 
-    int ix = m_pDisplayPathInfo[m_Index].sourceInfo.modeInfoIdx;
+    if (m_pDisplayPathInfo == NULL || m_pDisplayModeInfo == NULL || m_Index >= GetNumbersOfPathArrayElements())
+    {
+        PrintMessage(L"%ws no display config for m_Index %d\n", __FUNCTIONW__, m_Index);
+        return false;
+    }
+
+    // An inactive path carries DISPLAYCONFIG_PATH_MODE_IDX_INVALID, which would
+    // index the mode info array out of bounds.
+    UINT ix = m_pDisplayPathInfo[m_Index].sourceInfo.modeInfoIdx;
+    if (ix >= GetNumbersOfModeInfoArrayElements())
+    {
+        PrintMessage(L"%ws m_Index %d has no mode info (idx %d)\n", __FUNCTIONW__, m_Index, ix);
+        return false;
+    }
+
     PrintMessage(L"%ws m_Index %d %d (%dx%d)\n", __FUNCTIONW__, m_Index, ix, mode->XResolution, mode->YResolution);
     m_pDisplayModeInfo[ix].sourceMode.width = mode->XResolution;
     m_pDisplayModeInfo[ix].sourceMode.height = mode->YResolution;
@@ -266,8 +280,22 @@ void GpuAdapter::Run()
             if (GetCustomResolution(&custom))
             {
                 VIOGPU_DISP_MODE current = {0};
-                GetCurrentResolution(&current);
-                SetResolution(&custom);
+                // The resolution event fires for every host display event, not only
+                // for actual mode changes.  SetDisplayConfig with SDC_APPLY forces a
+                // modeset (screen blank + DWM swapchain rebuild) even when the
+                // supplied mode equals the current one, so skip no-op applies.
+                if (GetCurrentResolution(&current) && current.XResolution == custom.XResolution &&
+                    current.YResolution == custom.YResolution)
+                {
+                    PrintMessage(L"%ws resolution unchanged (%dx%d), skipping apply\n",
+                                 __FUNCTIONW__,
+                                 custom.XResolution,
+                                 custom.YResolution);
+                }
+                else
+                {
+                    SetResolution(&custom);
+                }
             }
         }
     }
