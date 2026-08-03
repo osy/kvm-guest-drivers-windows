@@ -1842,12 +1842,9 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList)
 
     DbgPrint(TRACE_LEVEL_INFORMATION, ("%s framebuffer %p +0x%x\n", __FUNCTION__, fb_pa.QuadPart, fb_size));
 
-    // FIXME
-#if NTDDI_VERSION > NTDDI_WINBLUE
-    UINT req_size = 0x1000000;
-#else
-    UINT req_size = 0x800000;
-#endif
+    // A 4K framebuffer is 3840*2160*4 = 31.6MB, so the fallback minimum must be
+    // large enough to hold it (was 16MB / 8MB).
+    UINT req_size = 0x4000000;
 
     if (!IsUsePhysicalMemory() || fb_pa.QuadPart == 0 || fb_size < req_size)
     {
