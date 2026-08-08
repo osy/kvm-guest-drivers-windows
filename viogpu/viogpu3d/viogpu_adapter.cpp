@@ -1773,8 +1773,8 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList)
                      ("CAPSET INFO %d    id: %d; version: %d; size: %d\n",
                       i,
                       capset_id,
-                      resp->capset_max_size,
-                      resp->capset_max_version));
+                      resp->capset_max_version,
+                      resp->capset_max_size));
         }
 
     } while (0);

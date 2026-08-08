@@ -125,7 +125,9 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
         {
             return STATUS_UNSUCCESSFUL;
         }
-    } else {
+    }
+    else
+    {
         DbgPrint(TRACE_LEVEL_FATAL, ("%s NOT a VGA device\n", __FUNCTION__));
     }
 
@@ -177,7 +179,34 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
     m_shouldFlipStop = false;
     Status = PsCreateSystemThread(&threadHandle, (ACCESS_MASK)0, NULL, (HANDLE)0, NULL, VioGpuVidPN::FlipThread, this);
 
-    ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)(&m_pFlipThread), NULL);
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s PsCreateSystemThread failed status=0x%x\n", __FUNCTION__, Status));
+        m_pFlipThread = NULL;
+        return Status;
+    }
+
+    // Must succeed, or the stop paths have no object to wait on and the
+    // thread outlives this VidPN, publishing into freed pool.  Leaving
+    // m_pFlipThread NULL on failure keeps the destructor's guard honest.
+    Status = ObReferenceObjectByHandle(threadHandle,
+                                       THREAD_ALL_ACCESS,
+                                       NULL,
+                                       KernelMode,
+                                       (PVOID *)(&m_pFlipThread),
+                                       NULL);
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s ObReferenceObjectByHandle failed status=0x%x; signalling flip thread to exit\n",
+                  __FUNCTION__,
+                  Status));
+        m_pFlipThread = NULL;
+        m_shouldFlipStop = true;
+        KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+        ZwClose(threadHandle);
+        return Status;
+    }
 
     ZwClose(threadHandle);
 
@@ -1031,7 +1060,8 @@ NTSTATUS VioGpuVidPN::AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INT
         {
             DbgPrint(TRACE_LEVEL_ERROR,
                      ("pfnCreateNewModeInfo (ABGR) failed with Status = 0x%X, hVidPnSourceModeSet = %llu",
-                      Status, LONG_PTR(hVidPnSourceModeSet)));
+                      Status,
+                      LONG_PTR(hVidPnSourceModeSet)));
             return Status;
         }
         pVidPnSourceModeInfo->Type = D3DKMDT_RMT_GRAPHICS;
@@ -1054,12 +1084,14 @@ NTSTATUS VioGpuVidPN::AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INT
             if (Status != STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET)
             {
                 DbgPrint(TRACE_LEVEL_ERROR,
-                         ("pfnAddMode (ABGR) failed with Status = 0x%X, hVidPnSourceModeSet = %llu, pVidPnSourceModeInfo = %p",
-                          Status, LONG_PTR(hVidPnSourceModeSet), pVidPnSourceModeInfo));
+                         ("pfnAddMode (ABGR) failed with Status = 0x%X, hVidPnSourceModeSet = %llu, "
+                          "pVidPnSourceModeInfo = %p",
+                          Status,
+                          LONG_PTR(hVidPnSourceModeSet),
+                          pVidPnSourceModeInfo));
                 return Status;
             }
         }
-
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -1768,7 +1800,8 @@ VOID VioGpuVidPN::BlackOutScreen(CURRENT_MODE *pCurrentMod)
 
         resid = m_pFrameBuf->GetId();
 
-        // m_pAdapter->ctrlQueue.TransferToHost2D(resid, 0UL, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height, 0, 0);
+        // m_pAdapter->ctrlQueue.TransferToHost2D(resid, 0UL, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height,
+        // 0, 0);
         m_pAdapter->ctrlQueue.ResFlush(resid, pCurrentMod->DispInfo.Width, pCurrentMod->DispInfo.Height, 0, 0);
     }
 
@@ -2313,12 +2346,9 @@ void VioGpuVidPN::Flip()
         // the displaced primary for reuse while it is still the one on
         // screen, and letting the app overwrite the buffer we are about to
         // display.  Once TryPromoteFlip emits the scanout the two agree.
-        interrupt.CrtcVsync.PhysicalAddress =
-            (m_displayedAddress.QuadPart != 0)
-                ? m_displayedAddress
-                : ((m_sourceRes && m_sourceRes->m_SegmentAddress.QuadPart != 0)
-                       ? m_sourceRes->m_SegmentAddress
-                       : m_displayedAddress);
+        interrupt.CrtcVsync.PhysicalAddress = (m_displayedAddress.QuadPart != 0) ? m_displayedAddress
+                                                                                 : ((m_sourceRes && m_sourceRes->m_SegmentAddress.QuadPart != 0) ? m_sourceRes->m_SegmentAddress
+                                                                                                                                                 : m_displayedAddress);
         ReleaseSourceLock(vsyncIrql);
     }
 
@@ -2397,14 +2427,7 @@ void VioGpuVidPN::FlipThread(void *ctx)
         // period, but no extra vsync is reported -- dxgkrnl needs a steady
         // refresh cadence, and emitting vsyncs at the fence-completion rate
         // would corrupt its flip accounting.
-        NTSTATUS wait = KeWaitForMultipleObjects(2,
-                                                 waitObjects,
-                                                 WaitAny,
-                                                 Executive,
-                                                 KernelMode,
-                                                 FALSE,
-                                                 NULL,
-                                                 NULL);
+        NTSTATUS wait = KeWaitForMultipleObjects(2, waitObjects, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
         if (vidpn->m_shouldFlipStop)
         {
             break;
@@ -2487,12 +2510,13 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS 
 
     InterlockedOr(&m_shouldFlip, 1);
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d isBlob=%d, vidPnSrcId=%d, duration=%lld\n",
-                                   __FUNCTION__,
-                                   newRes ? newRes->GetId() : 0,
-                                   newRes ? newRes->IsBlob() : FALSE,
-                                   pSetVidPnSourceAddress->VidPnSourceId,
-                                   pSetVidPnSourceAddress->Duration));
+    DbgPrint(TRACE_LEVEL_VERBOSE,
+             ("<---> %s res_id=%d isBlob=%d, vidPnSrcId=%d, duration=%lld\n",
+              __FUNCTION__,
+              newRes ? newRes->GetId() : 0,
+              newRes ? newRes->IsBlob() : FALSE,
+              pSetVidPnSourceAddress->VidPnSourceId,
+              pSetVidPnSourceAddress->Duration));
 
     return STATUS_SUCCESS;
 };
