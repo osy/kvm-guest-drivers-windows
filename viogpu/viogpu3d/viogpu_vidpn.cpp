@@ -251,14 +251,22 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
     // before it does leaves those writes landing in freed pool.  The thread
     // observes m_shouldFlipStop within one vsync period; this DDI is called
     // at PASSIVE_LEVEL, where waiting for it indefinitely is legal.
-    while (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
-    {
-        DbgPrint(TRACE_LEVEL_FATAL, ("---> flip thread has not exited after 1s; still waiting\n"));
-        VioGpuDbgBreak();
-    }
+    // 
+    // NOTE: dxgkrnl may invoke this DDI when Start() never got as far as
+    // referencing the thread, and it may invoke it again before RemoveDevice ence the m_pFlipThread guard in the
+    // destructor.
 
-    ObDereferenceObject(m_pFlipThread);
-    m_pFlipThread = NULL;
+    if (m_pFlipThread)
+    {
+        while (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
+        {
+            DbgPrint(TRACE_LEVEL_FATAL, ("---> flip thread has not exited after 1s; still waiting\n"));
+            VioGpuDbgBreak();
+        }
+
+        ObDereferenceObject(m_pFlipThread);
+        m_pFlipThread = NULL;
+    }
 
     BlackOutScreen(&m_CurrentModes[SourceId]);
     DestroyFrameBufferObj(TRUE);
