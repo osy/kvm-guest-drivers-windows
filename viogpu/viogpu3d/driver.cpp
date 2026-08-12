@@ -49,6 +49,9 @@ int bBreakAlways;
 // deregister the trace provider it registered against this driver object.
 static DRIVER_OBJECT *g_pDriverObject = NULL;
 
+// Pool tag ('VgPr' in the pool tracker; tags display reversed).
+#define VIOGPU3D_PROCESS_TAG ((ULONG)'rPgV')
+
 tDebugPrintFunc VirtioDebugPrintProc;
 
 #ifdef DBG
@@ -80,6 +83,7 @@ void InitializeDebugPrints(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Re
 
 #pragma code_seg(push)
 #pragma code_seg("PAGE")
+
 extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_STRING *pRegistryPath)
 {
     PAGED_CODE();
@@ -88,7 +92,17 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
     DbgPrint(TRACE_LEVEL_FATAL, ("---> VIOGPU FULL build on on %s %s\n", __DATE__, __TIME__));
     DRIVER_INITIALIZATION_DATA InitialData = {0};
 
-    InitialData.Version = DXGKDDI_INTERFACE_VERSION_WDDM1_3;
+    // 2.2 is the highest version that costs nothing above the 2.0 (GpuMmu)
+    // feature set this driver implements: every DDI new in 2.1/2.2 is cap- or
+    // callback-conditional, and no dxgkrnl validation above 2.0 is keyed on
+    // the version alone.
+    // Do NOT raise this to 2.3: from the 2.3 kernel interface dxgkrnl routes
+    // every flip through DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3
+    // (unimplemented here) and bugchecks 0xD1 on the NULL entry the moment
+    // the desktop flips.  The D3D11 runtime's 2.3 UMD DDI (needed for BGRA8
+    // typed UAV) is offered independently by the UMD's version ladder and
+    // does not require the KMD side to move.
+    InitialData.Version = DXGKDDI_INTERFACE_VERSION_WDDM2_2;
 
     InitialData.DxgkDdiAddDevice = VioGpu3DAddDevice;
     InitialData.DxgkDdiStartDevice = VioGpu3DStartDevice;
@@ -159,6 +173,20 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
     InitialData.DxgkDdiGetNodeMetadata = VioGpu3DDdiGetNodeMetadata;
     InitialData.DxgkDdiControlInterrupt = VioGpu3DDdiControlInterrupt;
     InitialData.DxgkDdiGetScanLine = VioGpu3DDdiGetScanLine;
+
+    // WDDM2 (GpuMmu) DDIs.
+    InitialData.DxgkDdiCreateProcess = VioGpu3DCreateProcess;
+    InitialData.DxgkDdiDestroyProcess = VioGpu3DDestroyProcess;
+    InitialData.DxgkDdiSubmitCommandVirtual = VioGpu3DSubmitCommandVirtual;
+    InitialData.DxgkDdiSetRootPageTable = VioGpu3DSetRootPageTable;
+    InitialData.DxgkDdiGetRootPageTableSize = VioGpu3DGetRootPageTableSize;
+    // dxgkrnl 26100 refuses AddAdapter for a WDDM2+ driver without
+    // these two (ETW 494: "Driver is compiled against
+    // DXGKDDI_INTERFACE_VERSION_WDDM2_0_M2_2_1 or greater, but does
+    // not fill in the pfnCalibrateGpuClock or pfnSetStablePowerState
+    // DDI", then 549 StartAdapter_AddAdapterFailed, 0xC000000D).
+    InitialData.DxgkDdiCalibrateGpuClock = VioGpu3DDdiCalibrateGpuClock;
+    InitialData.DxgkDdiSetStablePowerState = VioGpu3DDdiSetStablePowerState;
 
     NTSTATUS Status = DxgkInitialize(pDriverObject, pRegistryPath, &InitialData);
 
@@ -369,15 +397,24 @@ VioGpu3DDdiGetNodeMetadata(_In_ CONST HANDLE hAdapter,
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
 
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(NodeOrdinal);
 
+    // WDDMv2 packs the physical adapter index into the high word.
+    NodeOrdinal = DXGKNODEMETADATA_GETNODEORDINAL(NodeOrdinal);
     if (NodeOrdinal >= 1)
     {
         return STATUS_INVALID_PARAMETER;
     }
 
+    // Zero the WHOLE out-struct: dxgkrnl appends FriendlyName to the node
+    // name (RtlAppendUnicodeStringToString) and an uninitialized array
+    // here is a kernel AV (bugcheck 0x7E during adapter init).
+    RtlZeroMemory(pGetNodeMetadata, sizeof(*pGetNodeMetadata));
     pGetNodeMetadata->EngineType = DXGK_ENGINE_TYPE_3D;
     pGetNodeMetadata->Flags.Value = 0;
+    // A GpuMmu adapter whose only node claims no GpuMmu leaves VidMm
+    // with an inconsistent node description.
+    pGetNodeMetadata->GpuMmuSupported = TRUE;
+    pGetNodeMetadata->IoMmuSupported = FALSE;
 
     return STATUS_SUCCESS;
 };
@@ -568,11 +605,15 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s operation=%d\n", __FUNCTION__, pBuildPagingBuffer->Operation));
 
-    // Paging DMA buffers are recycled with their private-data area; no
-    // path below stores a VioGpuCommand*, so a stale pointer from the
-    // buffer's previous user would reach SubmitCommand and corrupt an
-    // unrelated in-flight command's fence (see VioGpuDevice::Present).
-    if (pBuildPagingBuffer->pDmaBufferPrivateData)
+    // Paging DMA buffers are recycled with their private-data area, so a
+    // stale VioGpuCommand* from the buffer's previous user would reach
+    // SubmitCommand and corrupt an unrelated in-flight command's fence (see
+    // VioGpuDevice::Present).  Skip the clear for the one slot that already
+    // carries a stamp this driver placed: VidMm batches several operations
+    // into a single paging buffer, and the private data is handed back
+    // unadvanced, so every operation in the batch addresses the same slot.
+    if (pBuildPagingBuffer->pDmaBufferPrivateData && pBuildPagingBuffer->DmaBufferPrivateDataSize >= sizeof(void *) &&
+        pBuildPagingBuffer->pDmaBufferPrivateData != pAdapter->m_PagingStampPriv)
     {
         *(void **)pBuildPagingBuffer->pDmaBufferPrivateData = NULL;
     }
@@ -583,7 +624,9 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
             {
                 if (pBuildPagingBuffer->MapApertureSegment.hAllocation == NULL)
                 {
-                    DbgPrint(TRACE_LEVEL_ERROR,
+                    // Routine under WDDM2: VidMm pages its own DMA pool
+                    // buffers, which have no driver allocation behind them.
+                    DbgPrint(TRACE_LEVEL_VERBOSE,
                              ("<--- %s (map aperture segment) no allocation specified\n", __FUNCTION__));
                     return STATUS_SUCCESS;
                 }
@@ -598,8 +641,8 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
             {
                 if (pBuildPagingBuffer->UnmapApertureSegment.hAllocation == NULL)
                 {
-                    DbgPrint(TRACE_LEVEL_ERROR,
-                             ("<--- %s (map aperture segment) no allocation specified\n", __FUNCTION__));
+                    DbgPrint(TRACE_LEVEL_VERBOSE,
+                             ("<--- %s (unmap aperture segment) no allocation specified\n", __FUNCTION__));
                     return STATUS_SUCCESS;
                 }
 
@@ -613,7 +656,7 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
             {
                 if (pBuildPagingBuffer->Fill.hAllocation == NULL)
                 {
-                    DbgPrint(TRACE_LEVEL_ERROR,
+                    DbgPrint(TRACE_LEVEL_VERBOSE,
                              ("<--- %s (fill) no allocation specified\n", __FUNCTION__));
                     return STATUS_SUCCESS;
                 }
@@ -636,7 +679,7 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
             {
                 if (pBuildPagingBuffer->DiscardContent.hAllocation == NULL)
                 {
-                    DbgPrint(TRACE_LEVEL_ERROR,
+                    DbgPrint(TRACE_LEVEL_VERBOSE,
                              ("<--- %s (discard) no allocation specified\n", __FUNCTION__));
                     return STATUS_SUCCESS;
                 }
@@ -668,7 +711,7 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
             {
                 if (pBuildPagingBuffer->NotifyResidency.hAllocation == NULL)
                 {
-                    DbgPrint(TRACE_LEVEL_ERROR,
+                    DbgPrint(TRACE_LEVEL_VERBOSE,
                              ("<--- %s (residency) no allocation specified\n", __FUNCTION__));
                     return STATUS_SUCCESS;
                 }
@@ -715,13 +758,182 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
             }
         case DXGK_OPERATION_SIGNAL_MONITORED_FENCE:
             {
-                // The fence-signal operations are paged through the
-                // DMA buffer in some scheduler paths; we don't track
-                // them but the scheduler does. SUCCESS keeps the
-                // pipeline moving; the fence itself is still managed
-                // by the normal submit path.
+                // dxgkrnl expects the GPU to WRITE MonitoredFenceValue to
+                // MonitoredFenceGpuVa; it re-evaluates CPU waiters when the
+                // paging packet completes, so the write is what satisfies
+                // SetEventOnCompletion for any signal routed through the GPU
+                // path (which dxgkrnl takes when the context has work in
+                // flight).  Performing it here in the build phase is too
+                // early -- dxgkrnl prepares packets ahead of execution, and
+                // pollers of GetCompletedValue would observe the value before
+                // the GPU work completed.  Resolve the GPU VA and pin a
+                // kernel mapping of the value cell now (both need PASSIVE),
+                // and stamp a command object into the packet's private data;
+                // Run() registers the write on the defer list, and the value
+                // is published when the completion watermark reaches the
+                // packet's own fence id (VioGpuAdapter::MFenceDeferOrWrite).
+                const ULONGLONG fenceVa =
+                    (ULONGLONG)pBuildPagingBuffer->SignalMonitoredFence.MonitoredFenceGpuVa;
+                const UINT64 fenceVal =
+                    pBuildPagingBuffer->SignalMonitoredFence.MonitoredFenceValue;
+                ULONGLONG phys = 0;
+                if (pAdapter == NULL || !pAdapter->VaShadowLookup(fenceVa, &phys))
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR,
+                             ("<--- %s monitored-fence signal va=0x%llx val=%llu UNRESOLVED\n",
+                              __FUNCTION__, fenceVa, fenceVal));
+                    return STATUS_SUCCESS;
+                }
+                // One stamp per paging buffer: a second signal batched into
+                // the same buffer has nowhere to park, so it writes now
+                // (early visibility) rather than displacing the first.
+                const BOOLEAN slotTaken =
+                    (pBuildPagingBuffer->pDmaBufferPrivateData == pAdapter->m_PagingStampPriv);
+                // Every fallback below writes the value immediately: early
+                // visibility is the lesser evil against a lost signal, which
+                // strands whatever waits on the fence.
+                if (pBuildPagingBuffer->pDmaBufferPrivateData == NULL ||
+                    pBuildPagingBuffer->DmaBufferPrivateDataSize < sizeof(void *) || slotTaken)
+                {
+                    // No side-band to reach the submit phase.
+                    pAdapter->MFenceWrite(phys, fenceVal);
+                    return STATUS_SUCCESS;
+                }
+                volatile UINT64 *kva = pAdapter->MFenceMapPin(phys);
+                if (kva == NULL)
+                {
+                    // Unmappable, or the map slot is pinned by another page.
+                    pAdapter->MFenceWrite(phys, fenceVal);
+                    return STATUS_SUCCESS;
+                }
+                VioGpuCommand *cmd = new (NonPagedPoolNx) VioGpuCommand(pAdapter);
+                if (cmd == NULL)
+                {
+                    pAdapter->MFenceMapUnpin(phys);
+                    pAdapter->MFenceWrite(phys, fenceVal);
+                    return STATUS_SUCCESS;
+                }
+                cmd->SetMFenceWrite(kva, phys, fenceVal);
+                // Stamp for BOTH submit paths: the non-virtual SubmitCommand
+                // reads the first pointer slot; SubmitCommandVirtual gates
+                // recovery on the mirror magic (empty body).
+                if (pBuildPagingBuffer->DmaBufferPrivateDataSize >= sizeof(VIOGPU_DMA_PRIVATE))
+                {
+                    VIOGPU_DMA_PRIVATE *p = (VIOGPU_DMA_PRIVATE *)pBuildPagingBuffer->pDmaBufferPrivateData;
+                    p->cmd = cmd->ToHandle();
+                    p->magic = VIOGPU_DMA_PRIV_MAGIC;
+                    p->bodySize = 0;
+                }
+                else
+                {
+                    *(void **)pBuildPagingBuffer->pDmaBufferPrivateData = cmd->ToHandle();
+                }
+                pAdapter->m_PagingStampPriv = pBuildPagingBuffer->pDmaBufferPrivateData;
                 DbgPrint(TRACE_LEVEL_VERBOSE,
-                         ("<--- %s (fence op=%d, deferred to submit path)\n",
+                         ("<--- %s monitored-fence signal va=0x%llx val=%llu phys=0x%llx DEFERRED\n",
+                          __FUNCTION__, fenceVa, fenceVal, phys));
+                return STATUS_SUCCESS;
+            }
+        case DXGK_OPERATION_UPDATE_PAGE_TABLE:
+            {
+                // GpuMmu, software page tables (GPUMMUCAPS reports
+                // ExplicitPageTableInvalidation + CPU_VIRTUAL update mode):
+                // nothing on the virtio path consumes GPU VAs, so the PTE
+                // writes are accepted and only mirrored into the shadow that
+                // resolves monitored-fence signal addresses.
+                const DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE *upt = &pBuildPagingBuffer->UpdatePageTable;
+                // GpuMmu residency: these PTE writes are the only paging op
+                // that names the system pages behind an allocation (the
+                // aperture-segment path never runs under GpuMmu), so the
+                // guest backing of TYPE_3D resources is attached/detached
+                // from here.
+                if (upt->hAllocation != NULL)
+                {
+                    VioGpuAllocation *allocation = VioGpuAllocation::FromHandle(upt->hAllocation);
+                    if (allocation != NULL)
+                    {
+                        allocation->HandlePageTableUpdate(upt);
+                    }
+                }
+                DbgPrint(TRACE_LEVEL_VERBOSE,
+                         ("<--- %s (update page table level=%u start=%u num=%u mode=%d repeat=%u)\n",
+                          __FUNCTION__,
+                          upt->PageTableLevel,
+                          upt->StartIndex,
+                          upt->NumPageTableEntries,
+                          upt->UpdateMode,
+                          upt->Flags.Repeat));
+
+                // Monitored-fence VA shadow.  Only leaf entries name data
+                // pages, and Use64KBPages describes a different array
+                // (pPageTableEntries64KB) with a 64KB stride than the 4KB
+                // walk below -- the driver reports neither DualPteSupported
+                // nor 64KB page support, so such an update is not ours to
+                // mirror.
+                if (pAdapter != NULL && upt->PageTableLevel == 0 && upt->pPageTableEntries != NULL &&
+                    upt->NumPageTableEntries > 0 && !upt->Flags.Use64KBPages)
+                {
+                    const ULONGLONG vaBase = (ULONGLONG)upt->FirstPteVirtualAddress & ~((ULONGLONG)PAGE_SIZE - 1);
+                    // Repeat means the array holds exactly ONE entry, whose
+                    // value is replicated across the whole range: indexing it
+                    // per iteration would read off the end of an OS-owned
+                    // allocation.
+                    const BOOLEAN repeat = upt->Flags.Repeat ? TRUE : FALSE;
+                    // Insertions stay confined to the small updates that map
+                    // fence storage; large mappings would only evict them.
+                    // Removals are never skipped: a binding left behind
+                    // resolves a later signal onto a page that has since been
+                    // handed to someone else.
+                    const BOOLEAN mayInsert = (upt->NumPageTableEntries <= 16);
+                    for (UINT i = 0; i < upt->NumPageTableEntries; i++)
+                    {
+                        const DXGK_PTE *p = &upt->pPageTableEntries[repeat ? 0 : i];
+                        const ULONGLONG va = vaBase + ((ULONGLONG)i << PAGE_SHIFT);
+                        // Segment 0 is system memory, and only there is
+                        // PageAddress a physical address; in any other
+                        // segment it is an offset from that segment's base.
+                        // A Zero entry resolves reads to the zero page rather
+                        // than to PageAddress, and LargePage covers more than
+                        // one page -- neither describes a byte of fence
+                        // storage this driver may write through.
+                        if (mayInsert && p->Valid && !p->Zero && !p->LargePage && p->Segment == 0)
+                        {
+                            pAdapter->VaShadowInsert(upt->hProcess, va, (ULONGLONG)p->PageAddress << PAGE_SHIFT);
+                        }
+                        else
+                        {
+                            pAdapter->VaShadowRemove(upt->hProcess, va);
+                        }
+                    }
+                }
+                return STATUS_SUCCESS;
+            }
+        case DXGK_OPERATION_FLUSH_TLB:
+            {
+                // No TLB exists -- there is no hardware GPU MMU behind the
+                // reported page tables. Success no-op.
+                DbgPrint(TRACE_LEVEL_VERBOSE,
+                         ("<--- %s (flush tlb root segment=%u offset=0x%llx) no-op\n",
+                          __FUNCTION__,
+                          pBuildPagingBuffer->FlushTlb.RootPageTableAddress.SegmentId,
+                          pBuildPagingBuffer->FlushTlb.RootPageTableAddress.SegmentOffset));
+                return STATUS_SUCCESS;
+            }
+        case DXGK_OPERATION_COPY_PAGE_TABLE_ENTRIES:
+        case DXGK_OPERATION_UPDATE_CONTEXT_ALLOCATION:
+        case DXGK_OPERATION_VIRTUAL_TRANSFER:
+        case DXGK_OPERATION_VIRTUAL_FILL:
+        case DXGK_OPERATION_INIT_CONTEXT_RESOURCE:
+            {
+                // Success no-ops.  COPY_PAGE_TABLE_ENTRIES only moves PTEs
+                // when the root page table grows, which the VA shadow does not
+                // need to track (it is rebuilt from the leaf updates that
+                // follow); VIRTUAL_TRANSFER/VIRTUAL_FILL are the GPU-VA
+                // analogues of TRANSFER/FILL and carry the same rationale as
+                // TRANSFER above; the context ops carry no state the driver
+                // tracks.
+                DbgPrint(TRACE_LEVEL_VERBOSE,
+                         ("<--- %s (wddm2 op=%d, no-op)\n",
                           __FUNCTION__, pBuildPagingBuffer->Operation));
                 return STATUS_SUCCESS;
             }
@@ -785,8 +997,9 @@ VioGpu3DPatch(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PATCH *pPatch)
     {
         // An error return from the submission DDIs is defined to bugcheck the
         // OS (0x119). dxgkrnl does not submit outside the Start..Stop window,
-        // so this only guards a teardown race -- where dropping the packet is
-        // recoverable and a bugcheck is not.
+        // so this only guards a teardown race -- where skipping the address
+        // fixups is recoverable and a bugcheck is not.  The packet's fence is
+        // retired by the SubmitCommand that follows this call.
         return STATUS_SUCCESS;
     }
     return pAdapter->commander.Patch(pPatch);
@@ -805,9 +1018,11 @@ VioGpu3DSubmitCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SUBMITCOMMA
 
     if (!pAdapter->IsDriverActive())
     {
-        // DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s VioGpu (%p) is being called when not active!\n", __FUNCTION__,
-        // pAdapter));
-        // See VioGpu3DPatch: an error here is a guaranteed 0x119 bugcheck.
+        // See VioGpu3DPatch: an error here is a guaranteed 0x119 bugcheck, so
+        // the packet is dropped and its fence retired instead.
+        pAdapter->CompleteFenceWithoutWork(pSubmitCommand->SubmissionFenceId,
+                                           pSubmitCommand->NodeOrdinal,
+                                           pSubmitCommand->EngineOrdinal);
         return STATUS_SUCCESS;
     }
     return pAdapter->commander.SubmitCommand(pSubmitCommand);
@@ -880,27 +1095,56 @@ VioGpu3DDdiCreateContext(_In_ CONST HANDLE hDevice, _Inout_ DXGKARG_CREATECONTEX
 
         pCreateContext->hContext = pDevice->ToHandle();
 
-        pCreateContext->ContextInfo.DmaBufferSegmentSet = 0;
         pCreateContext->ContextInfo.DmaBufferSize = 1024 * 1024;
-        // Per-command side-band: each submission stores one VioGpuCommand*
-        // at offset 0 (see Present/Render).
-        pCreateContext->ContextInfo.DmaBufferPrivateDataSize = sizeof(VioGpuCommand *);
+        // Per-command side-band: the mirror struct lets build-phase DDIs
+        // carry the DMA body to SubmitCommandVirtual by value (GPU VAs are
+        // not CPU-mappable).
+        pCreateContext->ContextInfo.DmaBufferPrivateDataSize = sizeof(VIOGPU_DMA_PRIVATE);
 
         pCreateContext->ContextInfo.AllocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
         pCreateContext->ContextInfo.PatchLocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
+
+        // Explicit (zero) context caps; single node, so the paging
+        // companion is node 0.
+        pCreateContext->ContextInfo.Caps.Value = 0;
+        pCreateContext->ContextInfo.PagingCompanionNodeId = 0;
+        // DMA buffers must live in the aperture segment (bit 0 =
+        // segment 1).  Leaving the set at 0 makes VidMm take its
+        // legacy contiguous-memory path (MSDN: "allocates contiguous
+        // paged-locked memory") which never creates an allocation
+        // object -- and 26100's GPU-VA pool mapping then dereferences
+        // that never-created allocation (AddDmaBufferToPool AV at
+        // NULL+8, bugcheck 0x3B) when the privileged pool of the CDD
+        // context is built.  MSDN: only APERTURE segments may appear
+        // in DmaBufferSegmentSet.
+        pCreateContext->ContextInfo.DmaBufferSegmentSet = 0x1;
 
         return STATUS_SUCCESS;
     } else {
         pCreateContext->hContext = pDevice->ToHandle();
 
-        pCreateContext->ContextInfo.DmaBufferSegmentSet = 0;
         pCreateContext->ContextInfo.DmaBufferSize = 1024 * 1024;
-        // Per-command side-band: each submission stores one VioGpuCommand*
-        // at offset 0 (see Present/Render).
-        pCreateContext->ContextInfo.DmaBufferPrivateDataSize = sizeof(VioGpuCommand *);
+        // Per-command side-band: the mirror struct lets build-phase DDIs
+        // carry the DMA body to SubmitCommandVirtual by value (GPU VAs are
+        // not CPU-mappable).
+        pCreateContext->ContextInfo.DmaBufferPrivateDataSize = sizeof(VIOGPU_DMA_PRIVATE);
 
+        // GpuMmu virtual contexts (Flags.VirtualAddressing) submit by GPU
+        // VA through DxgkDdiSubmitCommandVirtual; the allocation/patch-
+        // location list sizes are simply unused on that path.
         pCreateContext->ContextInfo.AllocationListSize = 1024;
         pCreateContext->ContextInfo.PatchLocationListSize = 1024;
+
+        // Explicit (zero) context caps; single node, so the paging
+        // companion is node 0.
+        pCreateContext->ContextInfo.Caps.Value = 0;
+        pCreateContext->ContextInfo.PagingCompanionNodeId = 0;
+        // Aperture segment only -- see the GDI/System branch above.
+        pCreateContext->ContextInfo.DmaBufferSegmentSet = 0x1;
+        DbgPrint(TRACE_LEVEL_VERBOSE,
+                 ("<---> %s virtual-addressing context: %d\n",
+                  __FUNCTION__,
+                  pCreateContext->Flags.VirtualAddressing));
 
         return STATUS_SUCCESS;
     }
@@ -918,6 +1162,125 @@ VioGpu3DDdiDestroyContext(_In_ CONST HANDLE hContext)
 
     return STATUS_SUCCESS;
 };
+
+//
+// WDDM2 (GpuMmu) DDIs.
+//
+
+NTSTATUS
+APIENTRY
+VioGpu3DCreateProcess(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_CREATEPROCESS *pCreateProcess)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(hAdapter);
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
+    VIOGPU_ASSERT_CHK(pCreateProcess != NULL);
+
+    // Pure bookkeeping: the struct pointer is the hKmdProcess handle, and
+    // the GPU-VA shadow keys its entries on that value.  There is no root
+    // page table behind it -- nothing dereferences GPU VAs in the
+    // rendering-bypass model.
+    VIOGPU_WDDM2_PROCESS *pProcess = (VIOGPU_WDDM2_PROCESS *)
+        ExAllocatePoolZero(NonPagedPoolNx, sizeof(VIOGPU_WDDM2_PROCESS), VIOGPU3D_PROCESS_TAG);
+    if (pProcess == NULL)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s failed to allocate process struct\n", __FUNCTION__));
+        return STATUS_NO_MEMORY;
+    }
+
+    pProcess->DxgkProcess = pCreateProcess->hDxgkProcess;
+    pProcess->Flags = pCreateProcess->Flags;
+    pCreateProcess->hKmdProcess = (HANDLE)pProcess;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE,
+             ("<--- %s hDxgkProcess=%p flags=0x%x -> hKmdProcess=%p\n",
+              __FUNCTION__,
+              pCreateProcess->hDxgkProcess,
+              pCreateProcess->Flags.Value,
+              pProcess));
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+APIENTRY
+VioGpu3DDestroyProcess(_In_ CONST HANDLE hAdapter, _In_ CONST HANDLE hKmdProcess)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(hAdapter);
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s hKmdProcess=%p\n", __FUNCTION__, hKmdProcess));
+
+
+    if (hKmdProcess != NULL)
+    {
+        ExFreePoolWithTag(hKmdProcess, VIOGPU3D_PROCESS_TAG);
+    }
+    return STATUS_SUCCESS;
+}
+
+// DxgkDdiSubmitCommandVirtual is the GpuMmu replacement for
+// DxgkDdiSubmitCommand and runs on the same DISPATCH_LEVEL scheduler path, so
+// it must not be pageable.  Its callees -- VioGpuCommander::SubmitCommandVirtual
+// and PrepareSubmitVirtual -- are already outside the PAGE section.
+#pragma code_seg(push)
+#pragma code_seg()
+NTSTATUS
+APIENTRY
+VioGpu3DSubmitCommandVirtual(_In_ CONST HANDLE hAdapter,
+                             _In_ CONST DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommandVirtual)
+{
+    VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
+    VIOGPU_ASSERT_CHK(pAdapter != NULL);
+
+    if (!pAdapter->IsDriverActive())
+    {
+        // See VioGpu3DSubmitCommand: drop the packet but retire its fence.
+        pAdapter->CompleteFenceWithoutWork(pSubmitCommandVirtual->SubmissionFenceId,
+                                           pSubmitCommandVirtual->NodeOrdinal,
+                                           pSubmitCommandVirtual->EngineOrdinal);
+        return STATUS_SUCCESS;
+    }
+    return pAdapter->commander.SubmitCommandVirtual(pSubmitCommandVirtual);
+}
+#pragma code_seg(pop)
+
+VOID APIENTRY VioGpu3DSetRootPageTable(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETROOTPAGETABLE *pSetPageTable)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(hAdapter);
+
+    // Bookkeeping no-op: no hardware walks these page tables, so the new
+    // root assignment (after a grow/move) only needs to be acknowledged.
+    DbgPrint(TRACE_LEVEL_VERBOSE,
+             ("<---> %s hContext=%p segment=%u offset=0x%llx entries=%u\n",
+              __FUNCTION__,
+              pSetPageTable->hContext,
+              pSetPageTable->Address.SegmentId,
+              pSetPageTable->Address.SegmentOffset,
+              pSetPageTable->NumEntries));
+}
+
+SIZE_T
+APIENTRY
+VioGpu3DGetRootPageTableSize(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETROOTPAGETABLESIZE *pArgs)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(hAdapter);
+
+    // dxgkrnl only calls this for 2-level page-table configurations, so with
+    // the 4-level geometry reported in GPUMMUCAPS it never runs; the DDI must
+    // still be registered.  Answer consistently anyway: round the requested
+    // PTE count up to a whole page and report how many entries that fits.
+    SIZE_T size = ((SIZE_T)pArgs->NumberOfPte * VIOGPU_WDDM2_PTE_SIZE + PAGE_SIZE - 1) & ~((SIZE_T)PAGE_SIZE - 1);
+    if (size == 0)
+    {
+        size = PAGE_SIZE;
+    }
+    pArgs->NumberOfPte = (UINT)(size / VIOGPU_WDDM2_PTE_SIZE);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s NumberOfPte=%u -> %zu bytes\n", __FUNCTION__, pArgs->NumberOfPte, size));
+    return size;
+}
 
 NTSTATUS
 APIENTRY
@@ -1276,14 +1639,13 @@ VioGpu3DDdiPreemptCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PREEMPT
               __FUNCTION__, pPreemptCommand->PreemptionFenceId,
               pPreemptCommand->NodeOrdinal, pPreemptCommand->EngineOrdinal));
 
-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
-    interrupt.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
-    interrupt.DmaPreempted.PreemptionFenceId = pPreemptCommand->PreemptionFenceId;
-    interrupt.DmaPreempted.LastCompletedFenceId =
-        (UINT)InterlockedOr(&pAdapter->m_LastCompletedFenceId, 0);
-    interrupt.DmaPreempted.NodeOrdinal = pPreemptCommand->NodeOrdinal;
-    interrupt.DmaPreempted.EngineOrdinal = pPreemptCommand->EngineOrdinal;
-    pAdapter->NotifyInterrupt(&interrupt, true);
+    // Ack under the interrupt lock (ReportDmaPreempted): atomically reads
+    // the completed watermark, declares everything submitted-but-uncompleted
+    // preempted (their original-id completions get squashed; dxgkrnl
+    // resubmits them under newer ids), and raises DMA_PREEMPTED.
+    pAdapter->ReportDmaPreempted(pPreemptCommand->PreemptionFenceId,
+                                 pPreemptCommand->NodeOrdinal,
+                                 pPreemptCommand->EngineOrdinal);
 
     return STATUS_SUCCESS;
 };
@@ -1312,6 +1674,43 @@ VioGpu3DDdiCancelCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_CANCELCO
 
 NTSTATUS
 APIENTRY
+VioGpu3DDdiCalibrateGpuClock(_In_ CONST HANDLE hAdapter,
+                             _In_ UINT32 NodeOrdinal,
+                             _In_ UINT32 EngineOrdinal,
+                             _Out_ DXGKARG_CALIBRATEGPUCLOCK *pClockCalibration)
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(NodeOrdinal);
+    UNREFERENCED_PARAMETER(EngineOrdinal);
+
+    // There is no GPU clock -- submissions complete CPU-side.  Report the
+    // CPU performance counter as the "GPU" clock so the two timelines the
+    // scheduler correlates are identical and any timestamp math is exact.
+    // (Callable at DISPATCH_LEVEL: KeQueryPerformanceCounter is fine.)
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter = KeQueryPerformanceCounter(&frequency);
+
+    RtlZeroMemory(pClockCalibration, sizeof(*pClockCalibration));
+    pClockCalibration->GpuFrequency = (ULONGLONG)frequency.QuadPart;
+    pClockCalibration->GpuClockCounter = (ULONGLONG)counter.QuadPart;
+    pClockCalibration->CpuClockCounter = (ULONGLONG)counter.QuadPart;
+
+    return STATUS_SUCCESS;
+}
+
+VOID APIENTRY VioGpu3DDdiSetStablePowerState(_In_ CONST HANDLE hAdapter,
+                                             _In_ CONST DXGKARG_SETSTABLEPOWERSTATE *pArgs)
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+
+    // No clocks or power states to pin; acknowledging is all that's
+    // needed (profiling tools toggle this around benchmark runs).
+    DbgPrint(TRACE_LEVEL_INFORMATION,
+             ("<---> %s Enabled=%d (no-op)\n", __FUNCTION__, pArgs ? pArgs->Enabled : -1));
+}
+
+NTSTATUS
+APIENTRY
 VioGpu3DDdiQueryCurrentFence(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYCURRENTFENCE *pCurrentFence)
 {
     // UNREFERENCED_PARAMETER(hAdapter);
@@ -1331,10 +1730,27 @@ NTSTATUS
 APIENTRY
 VioGpu3DDdiResetEngine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_RESETENGINE *pResetEngine)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pResetEngine);
+    VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
+    VIOGPU_ASSERT_CHK(pAdapter != NULL);
 
-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
+    if (pResetEngine == NULL)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // LastAbortedFenceId is [out] and must be written or the scheduler reads
+    // an uninitialised id.  There is one node here, so an engine reset is the
+    // adapter-wide fence sync-up: everything submitted is declared
+    // aborted/complete and the node is ready for new packets.
+    UINT syncedTo = pAdapter->ResetFenceStateFromTimeout();
+    pResetEngine->LastAbortedFenceId = syncedTo;
+
+    DbgPrint(TRACE_LEVEL_ERROR,
+             ("<---> %s node=%u engine=%u LastAbortedFenceId=%u\n",
+              __FUNCTION__,
+              pResetEngine->NodeOrdinal,
+              pResetEngine->EngineOrdinal,
+              syncedTo));
 
     return STATUS_SUCCESS;
 };
@@ -1388,17 +1804,23 @@ NTSTATUS
 APIENTRY
 VioGpu3DDdiResetFromTimeout(_In_ CONST HANDLE hAdapter)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
+    VioGpuAdapter *adapter = VioGpuAdapter::FromHandle(hAdapter);
 
-    DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s UNSUPPORTED PREEMPTION FUNCTION\n", __FUNCTION__));
+    if (adapter)
     {
-        VioGpuAdapter *adapter = VioGpuAdapter::FromHandle(hAdapter);
-        if (adapter)
-        {
-            DbgPrint(TRACE_LEVEL_ERROR,
-                     ("<---> %s fence submitted=%d completed=%d\n", __FUNCTION__,
-                      adapter->m_LastSubmittedFenceId, adapter->m_LastCompletedFenceId));
-        }
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<---> %s fence submitted=%d completed=%d\n", __FUNCTION__,
+                  adapter->m_LastSubmittedFenceId, adapter->m_LastCompletedFenceId));
+
+        // Sync the fence bookkeeping up to the last submission.  Without this
+        // the watermark stays stuck below it after the timeout -- dxgkrnl's
+        // post-reset accounting never balances and the node cannot restart.
+        // In-flight commands are left to drain naturally (their now-stale
+        // completions are squashed by the skip window the sync-up sets);
+        // tearing them down here would race the host responses that still
+        // reference them.
+        UINT syncedTo = adapter->ResetFenceStateFromTimeout();
+        DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s fence state synced to %u\n", __FUNCTION__, syncedTo));
     }
 
     return STATUS_SUCCESS;

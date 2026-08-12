@@ -35,6 +35,18 @@
 #include "viogpu_command.h"
 #include "viogpu_vidpn.h"
 
+// GpuMmu page-table geometry: the x86-64 shape -- 48-bit VA split into a
+// 12-bit page offset and 4 levels of 9 index bits, each level a 4KB table of
+// 512 8-byte PTEs in system memory.  Anything unusual here is a shape VidMm
+// never sees from real drivers, so it is the safest configuration to claim
+// for page tables that exist only as bookkeeping: the rendering-bypass design
+// runs real GPU work over virtio rings and never dereferences a GPU VA.
+#define VIOGPU_WDDM2_VA_BIT_COUNT  48
+#define VIOGPU_WDDM2_PT_LEVELS     4
+#define VIOGPU_WDDM2_PTE_SIZE      8
+#define VIOGPU_WDDM2_PT_INDEX_BITS 9
+#define VIOGPU_WDDM2_PT_SIZE       4096
+
 #pragma pack(push)
 #pragma pack(1)
 typedef struct
@@ -222,6 +234,65 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     VioGpuAllocation *AllocationFromHandle(D3DKMT_HANDLE handle);
     VioGpuResource *ResourceFromHandle(D3DKMT_HANDLE handle);
 
+    // ---- allocation resolution under GpuMmu ------------------------------
+    //
+    // DxgkCbGetHandleData returns NULL for every allocation handle once the
+    // driver registers a WDDM2 interface version, so the three maps below are
+    // how an open, an escape, or a by-id DMA command finds its allocation.
+    // All of them are guarded by m_PendingCreateLock.
+
+    // Create->open pairing: dxgkrnl calls DxgkDdiCreateAllocation and the
+    // paired DxgkDdiOpenAllocation back-to-back on the same thread, so creates
+    // push here and in-create opens pop their own thread's entry.
+    VOID PendingCreatePush(VioGpuAllocation *allocation);
+    VioGpuAllocation *PendingCreatePop(VOID);
+    VOID PendingCreateRemove(VioGpuAllocation *allocation);
+
+    // D3DKMT handle -> allocation bindings learned at DxgkDdiOpenAllocation,
+    // the only place both are visible together.  The UMD's RES_INFO/RES_BUSY
+    // escapes resolve through this, as does AllocationByResId.
+    VOID KmtMapInsert(D3DKMT_HANDLE handle, VioGpuAllocation *allocation);
+    VOID KmtMapRemove(D3DKMT_HANDLE handle, VioGpuAllocation *allocation);
+    VOID KmtMapRemoveByAllocation(VioGpuAllocation *allocation);
+    VioGpuAllocation *KmtMapLookup(D3DKMT_HANDLE handle);
+
+    // Lookup cookie -> allocation, taken from the allocation private data
+    // dxgkrnl replays at every open.  This is the only binding that survives a
+    // cross-process open, where the create->open pairing (in-create opens
+    // only) and the KMT map (seeded at first open) both miss.
+    VOID CookieMapInsert(ULONGLONG cookie, VioGpuAllocation *allocation);
+    VOID CookieMapRemoveByAllocation(VioGpuAllocation *allocation);
+    VioGpuAllocation *CookieMapLookup(ULONGLONG cookie);
+
+    VioGpuAllocation *AllocationByResId(UINT resId);
+
+    // KMD-owned shmem window suballocation, page granularity.  VidMm never
+    // commits host-backed blobs into the shmem segment under GpuMmu, so the
+    // KMD hands out offsets itself and maps BAR+offset into the UMD process
+    // during the RES_INFO escape.
+    ULONGLONG ShmemAlloc(SIZE_T size);
+    VOID ShmemFree(ULONGLONG offset, SIZE_T size);
+
+    // One node per map; `key` is the D3DKMT handle or the lookup cookie.
+    struct ALLOC_MAP_ENTRY
+    {
+        LIST_ENTRY entry;
+        ULONGLONG key;
+        VioGpuAllocation *allocation;
+    };
+    KSPIN_LOCK m_PendingCreateLock;
+    LIST_ENTRY m_PendingCreateList;
+    LIST_ENTRY m_KmtMapList;
+    LIST_ENTRY m_CookieMapList;
+
+    // Shmem suballocator, lazy-initialized on first ShmemAlloc.
+    RTL_BITMAP m_ShmemBitmap;
+    PULONG m_ShmemBitmapBuffer = NULL;
+    ULONG m_ShmemPageCount = 0;
+    // Where every ShmemAlloc search starts.  Deliberately a FIXED base,
+    // not a rolling bump pointer -- see ShmemAlloc.
+    ULONG m_ShmemSearchBase = 0;
+
     PHYSICAL_ADDRESS GetFrameBufferPA(void)
     {
         return m_PciResources.GetPciBar(0)->GetPA();
@@ -229,6 +300,43 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
 
     volatile LONG m_LastCompletedFenceId;
     volatile LONG m_LastSubmittedFenceId;
+
+    // Fences the preempt-ack declared preempted: everything submitted but
+    // not yet completed at ack time.  dxgkrnl re-owns those packets after
+    // DMA_PREEMPTED (it resubmits them with NEWER fence ids), so their
+    // eventual host completions must NOT raise DMA_COMPLETED with the
+    // original id -- reporting an id past the acknowledged watermark is
+    // an invalid fence report and bugchecks 0x119 arg1=1.
+    volatile LONG m_PreemptSkipThroughFenceId;
+
+    // {advance m_LastCompletedFenceId + raise DMA_COMPLETED} and {read
+    // watermark + set skip-window + raise DMA_PREEMPTED} must be mutually
+    // atomic: a preempt ack must never report an id whose completion interrupt
+    // is still unraised (0x119 arg1=1 duplicate), and completions in the acked
+    // window must be squashed.  A driver spinlock held across
+    // DxgkCbSynchronizeExecution deadlocks, so the atomicity rides the
+    // interrupt lock instead -- both operations run inside a
+    // SynchronizeExecution routine.
+    BOOLEAN ReportDmaCompleted(UINT fenceId, UINT node, UINT engine);
+    void ReportDmaPreempted(UINT preemptFenceId, UINT node, UINT engine);
+
+    // Retire a packet's fence without executing it.  The submission DDIs
+    // cannot report failure -- an error return from them is a defined 0x119
+    // bugcheck -- and cannot silently swallow the packet either, because
+    // dxgkrnl would then wait forever on an id nothing completes and
+    // ResetFenceStateFromTimeout only syncs up to m_LastSubmittedFenceId.
+    // The contiguity window holds the id back until its predecessors land, so
+    // this cannot regress the watermark.
+    void CompleteFenceWithoutWork(UINT fenceId, UINT node, UINT engine);
+
+    // TDR recovery.  DxgkDdiResetFromTimeout must leave the adapter in a
+    // state where the scheduler can resume: everything it submitted has to
+    // read as completed (it re-owns those packets and resubmits under fresh
+    // ids), or DxgkDdiQueryCurrentFence keeps reporting a watermark below
+    // m_LastSubmittedFenceId forever and the node never restarts.  Runs the
+    // sync-up under the interrupt lock for the same atomicity reason as the
+    // preempt ack above.  Returns the fence id everything was synced to.
+    UINT ResetFenceStateFromTimeout(void);
 
     // ---- present-fence tokens (render -> flip ordering) ------------------
     //
@@ -422,6 +530,166 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     };
     NPAGED_LOOKASIDE_LIST m_PresentFenceLookaside;
 
+    // ---- monitored-fence gates (VIOGPU_ARM_GATE / VIOGPU_CMD_GATE) -------
+    //
+    // The D3D12 runtime never calls the queue fence DDIs on this driver; it
+    // services app fences (queue::Signal -> SetEventOnCompletion /
+    // GetCompletedValue) through dxgkrnl's monitored-fence packets on the
+    // queue's kernel context.  Those packets complete when the context's
+    // prior DMA completes -- and without gates a queue context has NO DMA,
+    // so every fence completes at CPU speed while the GPU work is still
+    // running on the host, and the app reads back a frame the GPU has
+    // not produced.
+    //
+    // A gate bridges the gap: the UMD arms an event-ring fence that the
+    // host retires at true GPU completion of the queue's work
+    // (VIOGPU_ARM_GATE -> GateFenceCb), and submits a small DMA packet on
+    // the queue's kernel context (VIOGPU_CMD_GATE{token}) whose completion
+    // is parked until the token fires.  dxgkrnl then releases the
+    // monitored-fence packets only after the GPU truly drained.
+    struct GATE_CONSUMER
+    {
+        LIST_ENTRY Entry;
+        void (*Cb)(void *, void *, void *); // VioGpuCommand::QueueRunningCb
+        void *Ctx;
+        UINT FenceId; // parked packet's submission fence (gate-hold key)
+    };
+    struct GATE_TOKEN_CTX
+    {
+        LIST_ENTRY Entry;
+        VioGpuAdapter *pAdapter;
+        ULONGLONG Token;
+        BOOLEAN Fired;
+        BOOLEAN Consumed;
+        BOOLEAN Expired;      // deadline completed the parked consumers early
+        ULONGLONG ParkTime;   // KeQueryInterruptTime at first consumer park; 0 = none
+        LIST_ENTRY Consumers; // GATE_CONSUMER
+    };
+    NTSTATUS GateArm(class VioGpuDevice *pDevice, ULONG ringIdx, ULONGLONG *outToken);
+    void GateConsume(ULONGLONG token, void (*cb)(void *, void *, void *), void *ctx, UINT fenceId);
+    static void GateFenceCb(void *ctx, void *, void *);
+
+    // Parked-gate deadline.  A gate token fires only if its host render
+    // worker survives to retire the event-ring fence; a dead worker means
+    // the parked VIOGPU_CMD_GATE packet never completes, and dxgkrnl's
+    // scheduler escalates that into a node timeout -> bugcheck 0x116
+    // VIDEO_TDR_FAILURE (a TDR is fatal on this driver).  The flip path
+    // already bounds its token waits; this is the same discipline for the
+    // gate DMA: a periodic DPC completes any consumer parked longer than
+    // the deadline, logging loudly.  Expiring early merely runs that
+    // batch's monitored fences at pre-gate (CPU) speed -- transiently
+    // degraded, recoverable -- instead of bugchecking the OS.  The
+    // deadline + scan period must stay comfortably inside dxgkrnl's
+    // TdrDelay (2 s); healthy gate holds measure in the 10s-100s of ms.
+    static const ULONGLONG VIOGPU_GATE_PARK_DEADLINE_100NS = 12000000ULL; // 1.2 s
+    static const LONG VIOGPU_GATE_EXPIRY_PERIOD_MS = 400;
+    static VOID GateExpiryDpcRoutine(_In_ struct _KDPC *Dpc,
+                                     _In_opt_ PVOID DeferredContext,
+                                     _In_opt_ PVOID SystemArgument1,
+                                     _In_opt_ PVOID SystemArgument2);
+    KTIMER m_GateExpiryTimer;
+    KDPC m_GateExpiryDpc;
+
+    // Deferred monitored-fence value write (SIGNAL_MONITORED_FENCE paging
+    // op).  The value must become visible exactly when dxgkrnl learns the
+    // signal's packet completed -- the DMA_COMPLETED watermark crossing
+    // fenceId -- and not before, so GetCompletedValue pollers can't observe
+    // it ahead of the GPU work it covers.  The record carries a KVA pinned
+    // at build time (PASSIVE): the completion sync routine that advances
+    // the watermark runs at DIRQL, where it may do nothing but a bare
+    // store through it.  The packet itself is never parked; it completes
+    // on its normal schedule.
+    struct MFENCE_DEFER
+    {
+        LIST_ENTRY Entry;
+        UINT FenceId;
+        volatile UINT64 *Kva; // pinned mapping of the fence value cell
+        ULONGLONG Phys;       // pin bookkeeping (MFenceMapUnpin)
+        UINT64 Value;
+    };
+    void MFenceDeferOrWrite(UINT fenceId, volatile UINT64 *kva, ULONGLONG phys, UINT64 value);
+    void MFenceWrite(ULONGLONG phys, UINT64 value);
+    LIST_ENTRY m_MFenceDeferList; // interrupt-lock domain (sync routines only)
+
+    // Private-data area of the paging buffer currently carrying a deferred
+    // monitored-fence command, NULL when none is outstanding.  VidMm batches
+    // several paging operations into one buffer and the driver hands the
+    // private data back unadvanced, so every operation sees the same slot:
+    // without this, the entry-time clear that rejects a recycled buffer's
+    // stale command pointer would also erase a stamp an earlier operation in
+    // the same batch had just placed.  Written at PASSIVE from
+    // DxgkDdiBuildPagingBuffer, cleared from the submit DDIs at DISPATCH.
+    void *volatile m_PagingStampPriv = NULL;
+
+    // Kernel mappings of the monitored-fence storage pages, keyed on the
+    // physical page and direct-mapped.  Every signal writes 8 bytes into
+    // one of a handful of pinned pages, so the mapping is established once
+    // and reused: a map/unmap round trip per signal costs a system-PTE
+    // reservation plus the TLB shootdown IPI that MmUnmapIoSpace broadcasts
+    // to every CPU, on the packet-completion path the scheduler times.
+    // Slots are recycled by eviction and released at adapter teardown.
+    struct MFENCE_MAP_SLOT
+    {
+        ULONGLONG PhysPage;   // page-aligned physical address, 0 = free
+        volatile UINT64 *Kva; // MmMapIoSpaceEx mapping of PhysPage
+        LONG Pins;            // outstanding MFENCE_DEFER records using Kva
+    };
+    static const ULONG MFENCE_MAP_SLOTS = 64;
+    MFENCE_MAP_SLOT m_MFenceMap[MFENCE_MAP_SLOTS];
+    KSPIN_LOCK m_MFenceMapLock;
+    void MFenceMapRelease(void);
+    // Pin the cached mapping of the fence cell at phys (PASSIVE -- may
+    // establish the mapping).  NULL = unmappable / slot contention; the
+    // caller falls back to the immediate write.  A pinned slot is never
+    // evicted, so the returned KVA stays valid until MFenceMapUnpin.
+    volatile UINT64 *MFenceMapPin(ULONGLONG phys);
+    void MFenceMapUnpin(ULONGLONG phys); // <= DISPATCH
+
+    // Completion-contiguity window.  DMA_COMPLETED is a watermark that
+    // acknowledges everything <= N, but gates make the node's completion
+    // sequence SPARSE: a parked gate packet withholds its report while later
+    // submissions keep completing.  Raising any later id would implicitly
+    // complete the gate early, releasing parked monitored-fence writes ahead
+    // of the work they cover.  So completions are recorded per-id and the
+    // watermark raised only to the highest CONTIGUOUSLY-completed one.  Byte i
+    // of m_Win means (m_WinBase + 1 + i) is completed but unraised.  Lives in
+    // the interrupt-lock domain (SynchronizeExecution routines only).
+    static const UINT VIOGPU_FENCE_WINDOW = 256;
+    UINT m_WinBase = 0; // == (UINT)m_LastCompletedFenceId, or skip-through after preempt
+    UCHAR m_Win[VIOGPU_FENCE_WINDOW] = {};
+
+    LIST_ENTRY m_GateList;
+    KSPIN_LOCK m_GateLock;
+    volatile LONG64 m_GateTokenNext = 0;
+
+    // GPU-VA -> physical shadow for monitored-fence signal writes (WDDM2
+    // GpuMmu).  Leaf UPDATE_PAGE_TABLE ops covering system memory are
+    // recorded; SIGNAL_MONITORED_FENCE resolves its GpuVa here and CPU-writes
+    // the fence value, which is what satisfies dxgkrnl's GPU-side signal path
+    // and the CPU waiters behind it.
+    //
+    // GpuMmu virtual addresses are per address space, so the key is
+    // (hProcess, vaPage): DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE::hProcess
+    // names the process whose page tables an update belongs to, and two
+    // processes routinely hold the same GPU VA over different pages.  The
+    // hash mixes only the VA so that every process holding one VA shares a
+    // probe chain -- SIGNAL_MONITORED_FENCE carries no process handle, and
+    // walking that chain is what lets the lookup recognise an ambiguous VA
+    // rather than resolve it into the wrong address space.  Open-addressed
+    // with linear probing; slot states: vaPage==0 => empty, vaPage!=0 &&
+    // phys==0 => tombstone (keeps the chain intact), else occupied.
+    struct VaShadowEntry
+    {
+        HANDLE hProcess;  // owning address space (UpdatePageTable.hProcess)
+        ULONGLONG vaPage; // page-aligned GPU VA, 0 = empty
+        ULONGLONG phys;   // page-aligned system physical address, 0 = tombstone
+    };
+    static const ULONG VA_SHADOW_SIZE = 8192;
+    VaShadowEntry m_vaShadow[VA_SHADOW_SIZE];
+
+    void VaShadowInsert(HANDLE hProcess, ULONGLONG vaPage, ULONGLONG physPage);
+    void VaShadowRemove(HANDLE hProcess, ULONGLONG vaPage);
+    BOOLEAN VaShadowLookup(ULONGLONG va, ULONGLONG *physOut);
   private:
     static ULONG VioGpuThreadTokenHash(HANDLE tid)
     {

@@ -516,10 +516,9 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
     // resurrects that command and PrepareSubmit clobbers its fence id —
     // fences complete wrongly or never (intermittent TDR at first
     // windowed flip). NULL it up front; real writers below overwrite.
-    if (pPresent->pDmaBufferPrivateData)
-    {
-        *(void **)pPresent->pDmaBufferPrivateData = NULL;
-    }
+    // Stamp the packet as ours so the submit phase recovers the command it
+    // carries and never mistakes a paging packet for one.
+    VioGpuDmaPrivClaim(pPresent->pDmaBufferPrivateData, pPresent->DmaBufferPrivateDataSize);
 
     if (pPresent->Flags.Flip)
     {
@@ -527,7 +526,7 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
         // src the new active primary.  Latch m_sourceRes so the next vsync
         // Flip scans out the back buffer the runtime just made current.
         VioGpuAllocation *srcAlloc = NULL;
-        DXGK_ALLOCATIONLIST *dxgk_src = &pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX];
+        DXGK_PRESENTALLOCATIONINFO *dxgk_src = &pPresent->pAllocationInfo[DXGK_PRESENT_SOURCE_INDEX];
         if (dxgk_src->hDeviceSpecificAllocation)
         {
             VioGpuDeviceAllocation *srcDev =
@@ -549,7 +548,14 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
             // stamp never outlives its present.
             ULONGLONG flipToken = m_pAdapter->TakeThreadToken(PsGetCurrentThreadId());
             PHYSICAL_ADDRESS zeroAddr = {};
-            if (srcAlloc && srcAlloc->IsPrimary())
+            // Latch blob sources too, not just PRIMARY-flagged ones: dxgkrnl
+            // flip-promotes a fullscreen-sized borderless window, and those
+            // flips carry the app's NON-primary backbuffers as src.  Without
+            // the latch the vsync keeps reporting the desktop address, so
+            // dxgkrnl never retires the flips and the app blocks forever on
+            // its frame-latency wait.  Backbuffers are share-exported blobs,
+            // so they scan out like blob primaries.
+            if (srcAlloc && (srcAlloc->IsPrimary() || srcAlloc->IsBlob()))
                 m_pAdapter->vidpn.SetScanoutSource(srcAlloc, zeroAddr, flipToken);
         }
 
@@ -586,8 +592,8 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
 
     cmd->SetDmaBuf((char *)pPresent->pDmaBuffer);
 
-    DXGK_ALLOCATIONLIST *dxgk_src = &pPresent->pAllocationList[DXGK_PRESENT_SOURCE_INDEX];
-    DXGK_ALLOCATIONLIST *dxgk_dst = &pPresent->pAllocationList[DXGK_PRESENT_DESTINATION_INDEX];
+    DXGK_PRESENTALLOCATIONINFO *dxgk_src = &pPresent->pAllocationInfo[DXGK_PRESENT_SOURCE_INDEX];
+    DXGK_PRESENTALLOCATIONINFO *dxgk_dst = &pPresent->pAllocationInfo[DXGK_PRESENT_DESTINATION_INDEX];
 
     VioGpuDeviceAllocation *src = NULL;
     VioGpuDeviceAllocation *dst = NULL;
@@ -626,12 +632,12 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
 
     // Register the source/destination in the driver's in-flight set
     // (m_busy via MarkBusy) so EscapeResourceBusy from DxgkDdiDestroyAllocation
-    // sees Present-attached work, matching Render. Present's pAllocationList
+    // sees Present-attached work, matching Render. Present's allocation view
     // is a fixed-size array with index 0 reserved and source/destination at
     // DXGK_PRESENT_SOURCE_INDEX (1) / DXGK_PRESENT_DESTINATION_INDEX (2);
     // there is no separate length field, so the count is
     // DXGK_PRESENT_MAX_INDEX + 1.
-    NTSTATUS attachStatus = cmd->AttachAllocations(pPresent->pAllocationList,
+    NTSTATUS attachStatus = cmd->AttachAllocations(pPresent->pAllocationInfo,
                                                    DXGK_PRESENT_MAX_INDEX + 1);
     if (!NT_SUCCESS(attachStatus))
     {
@@ -681,11 +687,18 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
         }
         if (pPresent->pDmaBuffer && dst && src)
         {
+            char *bodyStart = (char *)pPresent->pDmaBuffer;
             if (true /*m_Context.IsVirgl()*/) {
                 GenerateBltPresent(pPresent, src, dst);
             } else {
                 GenerateBltPresentUM(pPresent, src->GetAllocation(), dst->GetAllocation());
             }
+            // Carry the just-built body to SubmitCommandVirtual by
+            // value (the submit DDI only sees a GPU VA in the virtual model).
+            cmd->MirrorBody(pPresent->pDmaBufferPrivateData,
+                            pPresent->DmaBufferPrivateDataSize,
+                            bodyStart,
+                            (char *)pPresent->pDmaBuffer - bodyStart);
         }
         return STATUS_SUCCESS;
     }
@@ -717,10 +730,8 @@ NTSTATUS VioGpuDevice::Render(DXGKARG_RENDER *pRender)
     // See Present: recycled DMA private data must never carry a stale
     // command pointer into SubmitCommand (multipass/error exits below
     // return before the real write).
-    if (pRender->pDmaBufferPrivateData)
-    {
-        *(void **)pRender->pDmaBufferPrivateData = NULL;
-    }
+    // Stamp as ours (see Present).
+    VioGpuDmaPrivClaim(pRender->pDmaBufferPrivateData, pRender->DmaBufferPrivateDataSize);
 
     char *pDmaBufStart = (char *)pRender->pDmaBuffer;
 
@@ -799,6 +810,15 @@ NTSTATUS VioGpuDevice::Render(DXGKARG_RENDER *pRender)
     cmd->SetDmaBuf(pDmaBufStart);
     cmd->AttachAllocations(pRender->pAllocationList, pRender->AllocationListSize);
 
+    // Mirror the built body for SubmitCommandVirtual.  A render
+    // that exceeds the mirror window is captured on the command here (the
+    // DMA buffer is still CPU-valid) so PrepareSubmitVirtual can execute
+    // it from the heap copy rather than dropping to fence-only.
+    cmd->MirrorBody(pRender->pDmaBufferPrivateData,
+                    pRender->DmaBufferPrivateDataSize,
+                    pDmaBufStart,
+                    (char *)pRender->pDmaBuffer - pDmaBufStart);
+
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     return STATUS_SUCCESS;
@@ -807,14 +827,103 @@ NTSTATUS VioGpuDevice::Render(DXGKARG_RENDER *pRender)
 NTSTATUS VioGpuDevice::OpenAllocation(_In_ CONST DXGKARG_OPENALLOCATION *pOpenAllocation)
 {
     PAGED_CODE();
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+    // Flags.Create=1 marks opens that ride the create call.
+    DbgPrint(TRACE_LEVEL_VERBOSE,
+             ("---> %s n=%u flags=0x%x\n", __FUNCTION__,
+              pOpenAllocation->NumAllocations, pOpenAllocation->Flags.Value));
 
     for (UINT i = 0; i < pOpenAllocation->NumAllocations; i++)
     {
         DXGK_OPENALLOCATIONINFO *openAllocationInfo = &pOpenAllocation->pOpenAllocation[i];
-        VioGpuAllocation *allocation = m_pAdapter->AllocationFromHandle(openAllocationInfo->hAllocation);
+        VioGpuAllocation *allocation = NULL;
+        if (openAllocationInfo->pPrivateDriverData != NULL &&
+            openAllocationInfo->PrivateDriverDataSize >= sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE))
+        {
+            // Cookie resolution comes BEFORE the pending-create FIFO: dxgkrnl
+            // replays the create-time private data at every open, so the
+            // cookie is authoritative, whereas the per-thread FIFO mispairs
+            // when a thread interleaves two creates before their opens and
+            // hands two devices in one process each other's blobs.  It also
+            // covers cross-process opens, which the FIFO cannot see at all.
+            // The cookie is either the trailing EX cookie or, for shared
+            // textures, a key derived from (create_ctx_id, blob_id).
+            VIOGPU_CREATE_ALLOCATION_EXCHANGE *exchange =
+                (VIOGPU_CREATE_ALLOCATION_EXCHANGE *)openAllocationInfo->pPrivateDriverData;
+            ULONGLONG cookie = 0;
+            if (openAllocationInfo->PrivateDriverDataSize >= sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX))
+            {
+                cookie = ((VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX *)exchange)->LookupCookie;
+            }
+            if (cookie == 0 && exchange->Type == VIOGPU_RESOURCE_TYPE_SHARED)
+            {
+                cookie = VioGpuSharedTexCookie(exchange->OptionsShared.create_ctx_id,
+                                               exchange->OptionsShared.blob_id);
+            }
+            if (cookie != 0)
+            {
+                allocation = m_pAdapter->CookieMapLookup(cookie);
+                DbgPrint(TRACE_LEVEL_VERBOSE,
+                         ("<---> %s hAllocation=%x cookie=%llx -> alloc=%p\n",
+                          __FUNCTION__, openAllocationInfo->hAllocation, cookie, allocation));
+                if (allocation != NULL)
+                {
+                    // Keep the FIFO consistent for allocations that lack
+                    // cookies: this open no longer consumes its entry.
+                    m_pAdapter->PendingCreateRemove(allocation);
+                }
+            }
+        }
+        // Handle resolution is only a FALLBACK: a stale KMT-map entry with a
+        // reused handle value resolves silently to the WRONG allocation,
+        // leaving the real one with no paired open and its deferred
+        // CreateBlob unrun, so RES_INFO reports the blob as not created.
+        if (allocation == NULL)
+        {
+            allocation = m_pAdapter->AllocationFromHandle(openAllocationInfo->hAllocation);
+        }
+        if (allocation == NULL && pOpenAllocation->Flags.Create)
+        {
+            // Last resort for allocations that carry no cookie: pair with the
+            // allocation this thread just created.
+            allocation = m_pAdapter->PendingCreatePop();
+            DbgPrint(TRACE_LEVEL_VERBOSE,
+                     ("<---> %s hAllocation=%x paired via pending-create -> alloc=%p\n",
+                      __FUNCTION__, openAllocationInfo->hAllocation, allocation));
+        }
+        // VidMm-internal allocations (DMA pool buffers) never pass through
+        // DxgkDdiCreateAllocation, so there is no driver object behind the
+        // handle.  Opening one on a device is legal: hand back a NULL
+        // device-specific handle, which every consumer already null-checks,
+        // instead of virtual-calling through a NULL this.
+        if (allocation == NULL)
+        {
+            // Only an error for UMD-owned allocations, where the deferred blob
+            // create then silently never happens and the UMD device init
+            // loops; VidMm-internal opens are routine.
+            DbgPrint(openAllocationInfo->PrivateDriverDataSize != 0 ? TRACE_LEVEL_ERROR : TRACE_LEVEL_VERBOSE,
+                     ("<---> %s hAllocation=%x privsize=%u priv=%p no driver allocation; NULL device handle\n",
+                      __FUNCTION__, openAllocationInfo->hAllocation,
+                      openAllocationInfo->PrivateDriverDataSize,
+                      openAllocationInfo->pPrivateDriverData));
+            openAllocationInfo->hDeviceSpecificAllocation = NULL;
+            continue;
+        }
         VioGpuDeviceAllocation *devAlloc = allocation->Open(this);
         openAllocationInfo->hDeviceSpecificAllocation = devAlloc->ToHandle();
+        // Remember the D3DKMT-handle binding: escapes and later DDIs
+        // resolve through it when GetHandleData draws a blank (WDDM2).
+        // Opening the same allocation twice on one device returns the same
+        // device-allocation under a second handle, so bind whatever handle
+        // this open carries rather than only the first: an unbound handle
+        // misses KmtMapLookup and the UMD's escape fails with no way to
+        // reach the res_id.  KmtMapInsert displaces any stale entry for the
+        // value, and the allocation's teardown drops every binding it owns.
+        if (openAllocationInfo->hAllocation != 0 &&
+            devAlloc->m_hKmtAllocation != openAllocationInfo->hAllocation)
+        {
+            devAlloc->m_hKmtAllocation = openAllocationInfo->hAllocation;
+            m_pAdapter->KmtMapInsert(openAllocationInfo->hAllocation, allocation);
+        }
     }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -883,7 +992,11 @@ VioGpuDeviceAllocation::~VioGpuDeviceAllocation()
     if (m_RefCount != 0 || m_pDevice == NULL || m_pAllocation == NULL)
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("---> %s INVALID devalloc: ref=%lld devalloc=%p alloc=%p dev=%p\n", __FUNCTION__, m_RefCount, this, m_pAllocation, m_pDevice));
-        DbgBreakPoint();
+        // Gated break only: with /debug on and no debugger responding, a raw
+        // int3 parks every CPU in KiFreezeTargetExecution polling a dead
+        // serial link.  The object is deliberately leaked rather than
+        // double-freed; the log above is the record.
+        VioGpuDbgBreak();
         return;
     }
 

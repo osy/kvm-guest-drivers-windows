@@ -158,6 +158,45 @@ NTSTATUS
 APIENTRY
 VioGpu3DDestroyDevice(_In_ VOID *pDeviceContext);
 
+// Per-process bookkeeping allocated by DxgkDdiCreateProcess.  The pointer
+// doubles as the hKmdProcess handle, which is what the GPU-VA shadow keys its
+// entries on.  Nothing dereferences GPU VAs in the rendering-bypass model, so
+// there is no real root page table behind it.
+typedef struct _VIOGPU_WDDM2_PROCESS
+{
+    HANDLE DxgkProcess;
+    DXGK_CREATEPROCESSFLAGS Flags;
+} VIOGPU_WDDM2_PROCESS;
+
+NTSTATUS
+APIENTRY
+VioGpu3DCreateProcess(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_CREATEPROCESS *pCreateProcess);
+
+NTSTATUS
+APIENTRY
+VioGpu3DDestroyProcess(_In_ CONST HANDLE hAdapter, _In_ CONST HANDLE hKmdProcess);
+
+NTSTATUS
+APIENTRY
+VioGpu3DSubmitCommandVirtual(_In_ CONST HANDLE hAdapter,
+                             _In_ CONST DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommandVirtual);
+
+VOID APIENTRY VioGpu3DSetRootPageTable(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETROOTPAGETABLE *pSetPageTable);
+
+SIZE_T
+APIENTRY
+VioGpu3DGetRootPageTableSize(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETROOTPAGETABLESIZE *pArgs);
+
+NTSTATUS
+APIENTRY
+VioGpu3DDdiCalibrateGpuClock(_In_ CONST HANDLE hAdapter,
+                             _In_ UINT32 NodeOrdinal,
+                             _In_ UINT32 EngineOrdinal,
+                             _Out_ DXGKARG_CALIBRATEGPUCLOCK *pClockCalibration);
+
+VOID APIENTRY VioGpu3DDdiSetStablePowerState(_In_ CONST HANDLE hAdapter,
+                                             _In_ CONST DXGKARG_SETSTABLEPOWERSTATE *pArgs);
+
 NTSTATUS
 APIENTRY
 VioGpu3DDdiCreateContext(_In_ CONST HANDLE hDevice, _Inout_ DXGKARG_CREATECONTEXT *pCreateContext);

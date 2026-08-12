@@ -96,6 +96,10 @@ class VioGpuDeviceAllocation final : public HandleBase<"VIOGDEAL"_M, VioGpuDevic
         return m_pDevice->m_Context.GetId();
     }
 
+    // D3DKMT handle this open was made under; keys the adapter's KMT map.
+    // 0 when unknown.
+    D3DKMT_HANDLE m_hKmtAllocation = 0;
+
   protected:
     void Ref()
     {

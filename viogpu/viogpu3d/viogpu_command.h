@@ -10,6 +10,51 @@ class VioGpuContext;
 class VioGpuAllocation;
 class VioGpuCommander;
 
+// DMA private-data layout.  Under GpuMmu the submit DDI only sees a GPU VA
+// for the DMA buffer, so the build-phase DDIs (Present/Render) mirror the
+// command body they wrote into the packet's private data, which dxgkrnl
+// carries to SubmitCommandVirtual by value.
+//
+// `magic` is the "WE own this private data" flag: SubmitCommandVirtual also
+// runs for dxgkrnl-originated paging packets whose private data is not ours
+// (stale bytes).  It must NOT interpret those bytes as a VioGpuCommand* --
+// HandleBase::FromHandle makes a virtual call through the candidate pointer,
+// so a garbage pointer wild-calls through a garbage vtable.  Only
+// Present/Render packets stamp magic, so a clear/mismatched magic means the
+// packet is not ours and completes fence-only.
+//
+// `cmd` is first because a paging buffer's private data can be as small as a
+// single pointer, and that slot alone is what the non-virtual submit path
+// reads.
+#define VIOGPU_DMA_PRIV_MAGIC 0x56503244u /* 'VP2D' */
+#define VIOGPU_DMA_PRIV_BODY_MAX 1024u
+typedef struct _VIOGPU_DMA_PRIVATE
+{
+    void *cmd; /* must stay first: see above */
+    ULONG magic;
+    ULONG bodySize; /* 0 = no body (flip); >MAX = oversized (fence-only) */
+    UCHAR body[VIOGPU_DMA_PRIV_BODY_MAX];
+} VIOGPU_DMA_PRIVATE;
+
+// Claim the packet's private data as ours (Present/Render entry).  Private
+// data too small for the mirror still gets its command pointer cleared, so a
+// recycled buffer cannot hand a stale pointer to the submit path.
+inline void VioGpuDmaPrivClaim(void *priv, ULONG privSize)
+{
+    if (!priv || privSize < sizeof(void *))
+    {
+        return;
+    }
+    *(void **)priv = NULL;
+    if (privSize < sizeof(VIOGPU_DMA_PRIVATE))
+    {
+        return;
+    }
+    VIOGPU_DMA_PRIVATE *p = (VIOGPU_DMA_PRIVATE *)priv;
+    p->magic = VIOGPU_DMA_PRIV_MAGIC;
+    p->bodySize = 0;
+}
+
 // Lifetime invariant: VioGpuCommand passes `this` as the complete_ctx
 // of SubmitCommand / TransferHostCmd / MapBlob / UnmapBlob, which the
 // host responds to from a DPC. The object must outlive every such
@@ -32,6 +77,17 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     void Run();
 
     void PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand);
+    void PrepareSubmitVirtual(const DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommand);
+
+    // Build phase (Render/Present): mirror the just-built body into the packet
+    // private data, and for a body too large for the mirror window capture a
+    // heap copy on this command while the build-time DMA buffer is still
+    // CPU-valid, so the submit phase can still execute it.
+    void MirrorBody(void *priv, ULONG privSize, const void *body, SIZE_T size);
+    // Submit phase: recover that body.  Build-time DMA buffer VAs are never
+    // dereferenced here -- under GpuMmu the mapping behind them is not
+    // guaranteed to outlive the build call.
+    void RecoverMirroredBody(const void *pPrivateData, ULONG privateDataSize);
     void QueueRunning();
     static void QueueRunningCb(void *cmd, void *, void *);
 
@@ -49,7 +105,27 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
         m_pDmaBuffer = pDmaBuffer;
     }
 
-    NTSTATUS AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, UINT allocationListLength);
+    // Deferred monitored-fence signal (DXGK_OPERATION_SIGNAL_MONITORED_FENCE):
+    // BuildPagingBuffer resolves the fence GPU VA, pins a kernel mapping of
+    // the value cell, and stamps this command into the paging buffer's
+    // private data; Run() registers (fenceId, kva, value) on the adapter's
+    // defer list and completes normally.  The value is published when the
+    // completion watermark reaches this packet's own fence id -- inside the
+    // sync routine, before the DMA_COMPLETED interrupt -- so
+    // GetCompletedValue pollers can't observe it before the GPU work it
+    // covers, and the packet is never parked.
+    void SetMFenceWrite(volatile UINT64 *kva, ULONGLONG phys, UINT64 value)
+    {
+        m_MFenceKva = kva;
+        m_MFencePhys = phys;
+        m_MFenceValue = value;
+    }
+
+    // Render's allocations arrive as DXGK_ALLOCATIONLIST, Present's as the
+    // other view of the same union (DXGK_PRESENTALLOCATIONINFO).  The two have
+    // different strides, so each needs its own walk; only the element type
+    // differs, hence the template.
+    template <typename T> NTSTATUS AttachAllocations(T *allocations, UINT allocationListLength);
 
     LIST_ENTRY list_entry;
 
@@ -91,6 +167,20 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     char *m_pDmaBuffer;
     char *m_pCommand;
     char *m_pEnd;
+
+    // Heap copy of the body Run() executes, and its length.  Bodies that fit
+    // the mirror window are copied out of the packet private data at submit;
+    // oversized ones are captured at build time, because the private-data
+    // buffer is only valid for the duration of the DDI call and the DMA
+    // buffer is a GPU VA by then.
+    PUCHAR m_privBodyCopy;
+    SIZE_T m_privBodySize;
+
+    // Deferred monitored-fence write (see SetMFenceWrite).  Kva NULL = none;
+    // Phys is the pin bookkeeping handle (MFenceMapUnpin).
+    volatile UINT64 *m_MFenceKva;
+    ULONGLONG m_MFencePhys;
+    UINT64 m_MFenceValue;
 };
 
 class VioGpuCommander
@@ -105,6 +195,7 @@ class VioGpuCommander
 
     NTSTATUS Patch(const DXGKARG_PATCH *pPatch);
     NTSTATUS SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitCommand);
+    NTSTATUS SubmitCommandVirtual(const DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommand);
 
     _IRQL_requires_max_(DISPATCH_LEVEL) _IRQL_saves_global_(OldIrql, Irql) _IRQL_raises_(DISPATCH_LEVEL) void LockQueue(
                                                                                                         KIRQL *Irql);

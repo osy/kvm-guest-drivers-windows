@@ -278,14 +278,16 @@ class CtrlQueue : public VioGpuQueue
     void DestroyResource(UINT id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
     void CtxResource(bool attach, UINT ctx_id, UINT res_id);
 
-    void SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
-    void TransferHostCmd(bool to_host,
-                         ULONG ctx_id,
-                         BOOL has_ring,
-                         ULONG ring_idx,
-                         VIOGPU_TRANSFER_CMD *options,
-                         void (*complete_cb)(void *, void *, void *),
-                         void *complete_ctx);
+    // FALSE => the command could not be queued (vbuf pool exhausted) and
+    // complete_cb will never fire; the caller owns any drop/cleanup.
+    BOOLEAN SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    BOOLEAN TransferHostCmd(bool to_host,
+                            ULONG ctx_id,
+                            BOOL has_ring,
+                            ULONG ring_idx,
+                            VIOGPU_TRANSFER_CMD *options,
+                            void (*complete_cb)(void *, void *, void *),
+                            void *complete_ctx);
 
     void SetScanout(UINT scan_id, UINT res_id, UINT width, UINT height, UINT x, UINT y);
     void SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_BLOB_INFO info);
@@ -299,8 +301,8 @@ class CtrlQueue : public VioGpuQueue
     void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);
     void DetachBacking(UINT id);
 
-    void ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
-    void ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    BOOLEAN ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    BOOLEAN ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
 
     BOOLEAN GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres);
     BOOLEAN AskDisplayInfo(PGPU_VBUFFER *buf);

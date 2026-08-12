@@ -23,6 +23,11 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
     m_pDmaBuffer = NULL;
     m_pCommand = NULL;
     m_pEnd = NULL;
+    m_privBodyCopy = NULL;
+    m_privBodySize = 0;
+    m_MFenceKva = NULL;
+    m_MFencePhys = 0;
+    m_MFenceValue = 0;
 
     m_allocations = NULL;
     m_allocationsLength = 0;
@@ -49,6 +54,12 @@ VioGpuCommand::~VioGpuCommand()
                  ("%s cmd=%p destroyed with %d outstanding callbacks\n",
                   __FUNCTION__, this, pending));
         ASSERT(pending == 0);
+    }
+
+    if (m_privBodyCopy)
+    {
+        delete[] m_privBodyCopy;
+        m_privBodyCopy = NULL;
     }
 }
 
@@ -78,11 +89,15 @@ void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
     m_FenceId = pSubmitCommand->SubmissionFenceId;
     m_NodeOrdinal = pSubmitCommand->NodeOrdinal;
     m_EngineOrdinal = pSubmitCommand->EngineOrdinal;
-    if (m_pDmaBuffer)
-    {
-        m_pCommand = (char *)m_pDmaBuffer + pSubmitCommand->DmaBufferSubmissionStartOffset;
-        m_pEnd = (char *)m_pDmaBuffer + pSubmitCommand->DmaBufferSubmissionEndOffset;
-    }
+    // dxgkrnl still routes some contexts (GDI/system, and any context created
+    // without virtual addressing) through this non-virtual DDI, but under
+    // GpuMmu the build-time CPU mapping behind m_pDmaBuffer is not guaranteed
+    // to outlive the build call -- the commander worker dereferencing it later
+    // faults on an unmapped VA.  Every builder mirrors its body into the
+    // packet private data, so take the body from there and never touch the raw
+    // VA; a packet with no mirror completes fence-only.
+    RecoverMirroredBody(pSubmitCommand->pDmaBufferPrivateData,
+                        pSubmitCommand->DmaBufferPrivateDataSize);
     m_pDevice = VioGpuDevice::FromHandle(pSubmitCommand->hContext);
 
     // Capture the only submit flag we react to. Paging / ContextSwitch /
@@ -91,6 +106,108 @@ void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
     // no special handling. NullRendering does need to short-circuit so
     // the runtime's submission-overhead profiling does not actually
     // execute the body.
+    m_NullRendering = pSubmitCommand->Flags.NullRendering ? TRUE : FALSE;
+}
+
+void VioGpuCommand::MirrorBody(void *priv, ULONG privSize, const void *body, SIZE_T size)
+{
+    if (priv && privSize >= sizeof(VIOGPU_DMA_PRIVATE))
+    {
+        VIOGPU_DMA_PRIVATE *p = (VIOGPU_DMA_PRIVATE *)priv;
+        p->bodySize = (ULONG)size;
+        if (body && size != 0 && size <= VIOGPU_DMA_PRIV_BODY_MAX)
+        {
+            RtlCopyMemory(p->body, body, size);
+        }
+    }
+    // A body larger than the mirror window cannot ride the packet private
+    // data, which only recorded its size; capture a heap copy now, while the
+    // build-time DMA buffer is still CPU-valid, so the submit phase can still
+    // execute it.
+    if (size > VIOGPU_DMA_PRIV_BODY_MAX && body && !m_privBodyCopy)
+    {
+        m_privBodyCopy = new (NonPagedPoolNx) UCHAR[size];
+        if (m_privBodyCopy)
+        {
+            m_privBodySize = size;
+            RtlCopyMemory(m_privBodyCopy, body, size);
+        }
+        else
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s OOM capturing %Iu-byte oversized body; submit will be fence-only\n",
+                      __FUNCTION__, size));
+        }
+    }
+}
+
+// The body arrives one of two ways:
+//  1. Within the mirror window, carried in VIOGPU_DMA_PRIVATE, which is only
+//     valid during the submit call: copy it to a heap buffer Run() executes
+//     later.  Works for a resubmission's fresh command too.
+//  2. Oversized: MirrorBody already captured it on this command at build time,
+//     so execute that.  A resubmission gets a fresh command with no capture
+//     and has no way to recover it, so it completes fence-only.
+// Neither present means a genuinely empty packet (flips, paging).
+void VioGpuCommand::RecoverMirroredBody(const void *pPrivateData, ULONG privateDataSize)
+{
+    m_pCommand = NULL;
+    m_pEnd = NULL;
+
+    const VIOGPU_DMA_PRIVATE *priv = (const VIOGPU_DMA_PRIVATE *)pPrivateData;
+    const BOOLEAN haveMirror = priv && privateDataSize >= sizeof(VIOGPU_DMA_PRIVATE) &&
+                               priv->magic == VIOGPU_DMA_PRIV_MAGIC;
+    if (haveMirror && priv->bodySize != 0 && priv->bodySize <= VIOGPU_DMA_PRIV_BODY_MAX)
+    {
+        // m_privBodyCopy is unused for in-window bodies (only oversized
+        // captures populate it at build), so allocating it here is safe.
+        m_privBodyCopy = new (NonPagedPoolNx) UCHAR[priv->bodySize];
+        if (m_privBodyCopy)
+        {
+            m_privBodySize = priv->bodySize;
+            RtlCopyMemory(m_privBodyCopy, priv->body, priv->bodySize);
+            m_pCommand = (char *)m_privBodyCopy;
+            m_pEnd = m_pCommand + priv->bodySize;
+        }
+        else
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s fence_id=%d OOM copying %u-byte mirrored body; completing fence-only\n",
+                      __FUNCTION__, m_FenceId, priv->bodySize));
+        }
+    }
+    else if (haveMirror && priv->bodySize > VIOGPU_DMA_PRIV_BODY_MAX)
+    {
+        if (m_privBodyCopy && m_privBodySize == priv->bodySize)
+        {
+            m_pCommand = (char *)m_privBodyCopy;
+            m_pEnd = m_pCommand + m_privBodySize;
+        }
+        else
+        {
+            // No build-time capture (resubmission of an oversized body, or
+            // the capture OOM'd): the body cannot be recovered here.
+            DbgPrint(TRACE_LEVEL_WARNING,
+                     ("%s fence_id=%d oversized body (%u bytes) with no capture; fence-only\n",
+                      __FUNCTION__, m_FenceId, priv->bodySize));
+        }
+    }
+}
+
+void VioGpuCommand::PrepareSubmitVirtual(const DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommand)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+
+    m_FenceId = pSubmitCommand->SubmissionFenceId;
+    m_NodeOrdinal = pSubmitCommand->NodeOrdinal;
+    m_EngineOrdinal = pSubmitCommand->EngineOrdinal;
+
+    // DmaBufferVirtualAddress is a GPU virtual address, not a CPU-mappable
+    // pointer, so the body rides the private-data mirror.
+    RecoverMirroredBody(pSubmitCommand->pDmaBufferPrivateData,
+                        pSubmitCommand->DmaBufferPrivateDataSize);
+
+    m_pDevice = VioGpuDevice::FromHandle(pSubmitCommand->hContext);
     m_NullRendering = pSubmitCommand->Flags.NullRendering ? TRUE : FALSE;
 }
 
@@ -115,11 +232,48 @@ void VioGpuCommand::Run()
         goto end;
     }
 
+    if (m_MFenceKva != NULL)
+    {
+        // Deferred monitored-fence signal (see SetMFenceWrite): register the
+        // write on the adapter's defer list and fall through.  The packet
+        // completes on its normal schedule -- parking it instead would hold
+        // the commander's only running slot across a full CPU-GPU round trip,
+        // making every GPU-path Signal a pipeline barrier -- and the value is
+        // published when the completion watermark reaches this fence id.
+        volatile UINT64 *kva = m_MFenceKva;
+        ULONGLONG phys = m_MFencePhys;
+        UINT64 value = m_MFenceValue;
+        m_MFenceKva = NULL;
+        m_MFencePhys = 0;
+        m_pAdapter->MFenceDeferOrWrite(m_FenceId, kva, phys, value);
+    }
+
     while (m_pCommand < m_pEnd)
     {
+        // The body is a user-mode-authored stream (the D3D12 UMD builds
+        // VIOGPU_DMA_PRIVATE itself), so every header and its declared
+        // size must be bounded against the buffer before use -- an
+        // unchecked cmdHdr->size would read past the mirrored copy and
+        // ship kernel pool bytes to the host.
+        if ((size_t)(m_pEnd - m_pCommand) < sizeof(VIOGPU_COMMAND_HDR))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s fence_id=%d truncated command header (%Iu bytes left)\n",
+                      __FUNCTION__, m_FenceId, (size_t)(m_pEnd - m_pCommand)));
+            goto end;
+        }
 
         VIOGPU_COMMAND_HDR *cmdHdr = (VIOGPU_COMMAND_HDR *)m_pCommand;
         m_pCommand += sizeof(VIOGPU_COMMAND_HDR);
+
+        if (cmdHdr->size > (size_t)(m_pEnd - m_pCommand))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s fence_id=%d command body size=%u exceeds %Iu bytes left\n",
+                      __FUNCTION__, m_FenceId, cmdHdr->size,
+                      (size_t)(m_pEnd - m_pCommand)));
+            goto end;
+        }
 
         void *cmdBody = m_pCommand;
         m_pCommand += cmdHdr->size;
@@ -142,14 +296,77 @@ void VioGpuCommand::Run()
                     }
                     RtlCopyMemory(submitCmd, cmdBody, cmdHdr->size);
 
+                    if ((cmdHdr->flags & VIOGPU_EXECBUF_RING_IDX) != 0 && cmdHdr->ring_idx != 0)
+                    {
+                        // Ring-fenced submit: the host defers its virtio
+                        // response until the ring's ARM wire-command decodes
+                        // (npt event pairing), and the ARM travels THIS
+                        // commander -- holding the only running slot on that
+                        // response deadlocks the moment a ring's first fence
+                        // beats its first ARM (dxgkrnl then TDRs the engine).
+                        // The event ring is the real synchronization for
+                        // ring-fenced work, so submit fire-and-forget (the
+                        // response DPC auto-releases the vbuf and frees the
+                        // body) and complete the packet on its normal
+                        // schedule.  Ctrl-queue FIFO keeps host-side order.
+                        if (!m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
+                                                                 cmdHdr->size,
+                                                                 (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
+                                                                 TRUE,
+                                                                 cmdHdr->ring_idx,
+                                                                 NULL,
+                                                                 NULL))
+                        {
+                            DbgPrint(TRACE_LEVEL_ERROR,
+                                     ("%s fence_id=%d ring submit not queued (size=%u)\n",
+                                      __FUNCTION__, m_FenceId, cmdHdr->size));
+                            delete[] submitCmd;
+                        }
+                        break;
+                    }
+
                     AddPending();
-                    m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
-                                                        cmdHdr->size,
-                                                        (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
-                                                        (cmdHdr->flags & VIOGPU_EXECBUF_RING_IDX) != 0,
-                                                        cmdHdr->ring_idx,
-                                                        VioGpuCommand::QueueRunningCb,
-                                                        this);
+                    if (!m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
+                                                             cmdHdr->size,
+                                                             (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
+                                                             (cmdHdr->flags & VIOGPU_EXECBUF_RING_IDX) != 0,
+                                                             cmdHdr->ring_idx,
+                                                             VioGpuCommand::QueueRunningCb,
+                                                             this))
+                    {
+                        // The command never reached the queue, so it never took
+                        // ownership of the body and QueueRunningCb will not
+                        // fire.  Leaving the count raised strands this fence id
+                        // below the completion watermark for good.
+                        DbgPrint(TRACE_LEVEL_ERROR,
+                                 ("%s fence_id=%d submit not queued (size=%u)\n",
+                                  __FUNCTION__, m_FenceId, cmdHdr->size));
+                        delete[] submitCmd;
+                        if (DropPending() == 0)
+                        {
+                            goto end;
+                        }
+                    }
+                    return;
+                }
+
+            case VIOGPU_CMD_GATE:
+                {
+                    // Monitored-fence gate: park this packet's DMA completion
+                    // until the VIOGPU_ARM_GATE token fires at real GPU
+                    // completion.  Never touches virtio; same requeue contract
+                    // as SUBMIT.
+                    if (cmdHdr->size < sizeof(ULONGLONG))
+                    {
+                        DbgPrint(TRACE_LEVEL_ERROR,
+                                 ("%s fence_id=%d GATE with short body (%u)\n",
+                                  __FUNCTION__, m_FenceId, cmdHdr->size));
+                        break;
+                    }
+                    ULONGLONG token;
+                    RtlCopyMemory(&token, cmdBody, sizeof(token));
+                    AddPending();
+                    m_pAdapter->GateConsume(token, VioGpuCommand::QueueRunningCb, this, m_FenceId);
                     return;
                 }
 
@@ -159,13 +376,78 @@ void VioGpuCommand::Run()
                     VIOGPU_TRANSFER_CMD *transferCmd = (VIOGPU_TRANSFER_CMD *)cmdBody;
 
                     AddPending();
-                    m_pAdapter->ctrlQueue.TransferHostCmd(cmdHdr->type == VIOGPU_CMD_TRANSFER_TO_HOST,
-                                                          (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
-                                                          false,
-                                                          0,
-                                                          transferCmd,
-                                                          VioGpuCommand::QueueRunningCb,
-                                                          this);
+                    if (!m_pAdapter->ctrlQueue.TransferHostCmd(cmdHdr->type == VIOGPU_CMD_TRANSFER_TO_HOST,
+                                                               (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
+                                                               false,
+                                                               0,
+                                                               transferCmd,
+                                                               VioGpuCommand::QueueRunningCb,
+                                                               this))
+                    {
+                        // See VIOGPU_CMD_SUBMIT: no callback will re-enter
+                        // Run(), so the fence has to be retired here.
+                        DbgPrint(TRACE_LEVEL_ERROR,
+                                 ("%s fence_id=%d transfer not queued res_id=%d\n",
+                                  __FUNCTION__, m_FenceId, transferCmd->res_id));
+                        if (DropPending() == 0)
+                        {
+                            goto end;
+                        }
+                    }
+                    return;
+                }
+
+            case VIOGPU_CMD_MAP_BLOB_BY_ID:
+            case VIOGPU_CMD_UNMAP_BLOB_BY_ID:
+                {
+                    // Virtual contexts carry no allocation list, so the UMD
+                    // names the blob by res_id; resolve through the adapter's
+                    // open-time bindings.  Both directions route through the
+                    // allocation rather than the queue because
+                    // VioGpuAllocation::MapBlob/UnmapBlob own m_Blob.Mapped:
+                    // a mapping torn down behind that flag makes the next map
+                    // short-circuit as already mapped, leaving the UMD reading
+                    // and writing a BAR window the host no longer backs.  A
+                    // stale host mapping over a segment range VidMm has freed
+                    // also poisons the next blob placed in the reused range.
+                    const BOOLEAN mapping = (cmdHdr->type == VIOGPU_CMD_MAP_BLOB_BY_ID);
+                    const UINT *res_ids = (const UINT *)cmdBody;
+                    const size_t count = cmdHdr->size / sizeof(UINT);
+
+                    AddPending();
+                    for (size_t i = 0; i < count; i++)
+                    {
+                        if (!res_ids[i])
+                        {
+                            continue;
+                        }
+                        VioGpuAllocation *allocation = m_pAdapter->AllocationByResId(res_ids[i]);
+                        if (allocation == NULL)
+                        {
+                            DbgPrint(TRACE_LEVEL_ERROR,
+                                     ("<---> %s fence_id=%d %s unknown res_id=%d\n",
+                                      __FUNCTION__, m_FenceId,
+                                      mapping ? "MAP_BLOB_BY_ID" : "UNMAP_BLOB_BY_ID", res_ids[i]));
+                            continue;
+                        }
+                        UINT ctxId = m_pDevice->m_Context.GetId();
+                        AddPending();
+                        BOOLEAN issued = mapping
+                                             ? allocation->MapBlob(ctxId, VioGpuCommand::QueueRunningCb, this)
+                                             : allocation->UnmapBlob(ctxId, VioGpuCommand::QueueRunningCb, this);
+                        DbgPrint(TRACE_LEVEL_VERBOSE,
+                                 ("<---> %s fence_id=%d %s blob res_id=%d issued=%d\n",
+                                  __FUNCTION__, m_FenceId,
+                                  mapping ? "map-by-id" : "unmap-by-id", res_ids[i], issued));
+                        if (!issued)
+                        {
+                            DropPending();
+                        }
+                    }
+                    if (DropPending() == 0)
+                    {
+                        break;
+                    }
                     return;
                 }
 
@@ -285,7 +567,7 @@ end:
     delete this;
 }
 
-NTSTATUS VioGpuCommand::AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, UINT allocationListLength)
+template <typename T> NTSTATUS VioGpuCommand::AttachAllocations(T *allocations, UINT allocationListLength)
 {
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
@@ -299,7 +581,8 @@ NTSTATUS VioGpuCommand::AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, U
     m_allocationsLength = allocationListLength;
     for (UINT i = 0; i < allocationListLength; i++)
     {
-        VioGpuDeviceAllocation *deviceAllocation = VioGpuDeviceAllocation::FromHandle(allocationList[i].hDeviceSpecificAllocation);
+        VioGpuDeviceAllocation *deviceAllocation =
+            VioGpuDeviceAllocation::FromHandle(allocations[i].hDeviceSpecificAllocation);
         if (deviceAllocation)
         {
             m_allocations[i] = deviceAllocation->GetAllocation();
@@ -312,6 +595,9 @@ NTSTATUS VioGpuCommand::AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, U
     }
     return STATUS_SUCCESS;
 }
+
+template NTSTATUS VioGpuCommand::AttachAllocations(DXGK_ALLOCATIONLIST *, UINT);
+template NTSTATUS VioGpuCommand::AttachAllocations(DXGK_PRESENTALLOCATIONINFO *, UINT);
 
 PAGED_CODE_SEG_END
 
@@ -332,16 +618,25 @@ void VioGpuCommand::NotifyCompletion()
         return;
     }
 
-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
-    interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
-    interrupt.DmaCompleted.SubmissionFenceId = m_FenceId;
-    interrupt.DmaCompleted.NodeOrdinal = m_NodeOrdinal;
-    interrupt.DmaCompleted.EngineOrdinal = m_EngineOrdinal;
-    m_pAdapter->NotifyInterrupt(&interrupt, true);
-
-    // Completions arrive in submission order (VIOGPU_MAX_RUNNING == 1, dxgkrnl
-    // serializes SubmitCommand), so the reported fence only ever advances.
-    InterlockedExchange(&m_pAdapter->m_LastCompletedFenceId, m_FenceId);
+    // The reported fence must only ever ADVANCE.  dxgkrnl can preempt and
+    // RESUBMIT a DMA buffer: the resubmission builds a fresh fence-only
+    // command (consume-once) with a NEWER id that completes instantly, while
+    // the preempted original still has async host ops in flight -- when those
+    // finish, this path would report the OLDER id after the newer one.  dxgmms2
+    // treats a regressing DMA_COMPLETED as fatal (bugcheck 0x119 arg1=1), and
+    // without verifier the mis-ordered completion corrupts packet lifetime
+    // under load.  A skipped report is semantically covered by the newer id,
+    // since DMA_COMPLETED acknowledges everything <= N.
+    //
+    // ReportDmaCompleted runs the watermark check/advance and the interrupt
+    // raise atomically under the interrupt lock, which is what makes them
+    // mutually exclusive with the preempt ack.
+    if (!m_pAdapter->ReportDmaCompleted(m_FenceId, m_NodeOrdinal, m_EngineOrdinal))
+    {
+        DbgPrint(TRACE_LEVEL_WARNING,
+                 ("<---> %s SKIP fence_id=%d (duplicate/regressing or preempt-acked)\n",
+                  __FUNCTION__, m_FenceId));
+    }
 }
 
 void VioGpuCommand::QueueRunningCb(void *cmd, void *, void *)
@@ -555,8 +850,40 @@ NTSTATUS VioGpuCommander::Patch(const DXGKARG_PATCH *pPatch)
         }
         if (allocation && allocation->IsBlob())
         {
-
-            allocation->m_Blob.MapOffset = allocList->PhysicalAddress.QuadPart - VioGpuAdapter::SHMEM_GPU_BASE_VA;
+            // The KMD-owned shmem placement (EscapeResourceInfo) is the
+            // single authority for a mappable blob's window offset: the
+            // guest user mapping AND the host MAP_BLOB both derive from
+            // it.  VidMm's allocation lists (paging buffers under WDDM2)
+            // carry VidMm's OWN segment placement, assigned independently
+            // of ShmemAlloc; letting it overwrite MapOffset makes the host
+            // map diverge from the guest window and stacks different blobs
+            // on one BAR offset, so each guest window aliases foreign
+            // memory.
+            //
+            // The test is the allocation CLASS, not IsKmdShmemPlaced(): this
+            // runs at DISPATCH_LEVEL and cannot take the allocation lock the
+            // escape holds, so testing the latch would still let a Patch that
+            // read it as clear overwrite the offset the escape is publishing.
+            // Every blob the escape places is mappable, so
+            // declining the whole class leaves no writer to race.
+            if (allocation->IsMappable())
+            {
+                ULONGLONG vidmmOff = allocList->PhysicalAddress.QuadPart - VioGpuAdapter::SHMEM_GPU_BASE_VA;
+                if (vidmmOff != allocation->m_Blob.MapOffset)
+                {
+                    DbgPrint(TRACE_LEVEL_VERBOSE,
+                             ("<--> %s res_id=%d KEEPING kmd-owned off=0x%llx (VidMm wanted 0x%llx)\n",
+                              __FUNCTION__,
+                              allocation->GetId(),
+                              allocation->m_Blob.MapOffset,
+                              vidmmOff));
+                }
+            }
+            else
+            {
+                allocation->m_Blob.MapOffset = allocList->PhysicalAddress.QuadPart -
+                                               VioGpuAdapter::SHMEM_GPU_BASE_VA;
+            }
             DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s res_id=%d base=%p addr=%p off=%llx\n",
                                            __FUNCTION__,
                                            allocation->GetId(),
@@ -580,9 +907,21 @@ NTSTATUS VioGpuCommander::SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitComm
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s fence_id=%d\n", __FUNCTION__, pSubmitCommand->SubmissionFenceId));
 
     VioGpuCommand *cmd = NULL;
-    if (pSubmitCommand->pDmaBufferPrivateData)
+    if (pSubmitCommand->pDmaBufferPrivateData && pSubmitCommand->DmaBufferPrivateDataSize >= sizeof(void *))
     {
         cmd = VioGpuCommand::FromHandle(*(void **)pSubmitCommand->pDmaBufferPrivateData);
+        // Consume-once: dxgkrnl can resubmit the same DMA buffer (and
+        // recycles private data with it); resurrecting the same command
+        // object twice double-inserts it into the submit queue after it
+        // may already have run and been freed, which bugchecks 0x139
+        // CORRUPT_LIST_ENTRY in QueueSubmitted.  A later resubmission builds a
+        // fresh fence-only command instead.
+        *(void **)pSubmitCommand->pDmaBufferPrivateData = NULL;
+        // Release the build-phase hold that kept this slot from being
+        // cleared by later operations batched into the same paging buffer.
+        InterlockedCompareExchangePointer(&m_pAdapter->m_PagingStampPriv,
+                                          NULL,
+                                          pSubmitCommand->pDmaBufferPrivateData);
     }
 
     if (!cmd)
@@ -590,7 +929,75 @@ NTSTATUS VioGpuCommander::SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitComm
         cmd = new (NonPagedPoolNx) VioGpuCommand(m_pAdapter);
     }
 
+    if (!cmd)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("%s failed to allocate command; completing fence_id=%d without work\n",
+                  __FUNCTION__,
+                  pSubmitCommand->SubmissionFenceId));
+        m_pAdapter->CompleteFenceWithoutWork(pSubmitCommand->SubmissionFenceId,
+                                             pSubmitCommand->NodeOrdinal,
+                                             pSubmitCommand->EngineOrdinal);
+        return STATUS_SUCCESS;
+    }
+
     cmd->PrepareSubmit(pSubmitCommand);
+    InterlockedExchange(&m_pAdapter->m_LastSubmittedFenceId, pSubmitCommand->SubmissionFenceId);
+    QueueSubmitted(cmd);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS VioGpuCommander::SubmitCommandVirtual(const DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommand)
+{
+    VIOGPU_ASSERT(pSubmitCommand != NULL);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s fence_id=%d\n", __FUNCTION__, pSubmitCommand->SubmissionFenceId));
+
+    // Only recover a VioGpuCommand* from private data WE stamped: dxgkrnl
+    // paging packets reach this DDI too, and their private-data bytes are
+    // not ours -- interpreting them as a handle makes FromHandle do a
+    // virtual call through a garbage pointer (wild call, bugcheck 0x7E).
+    // The magic gate proves the data is a Present/Render packet.
+    VioGpuCommand *cmd = NULL;
+    if (pSubmitCommand->pDmaBufferPrivateData &&
+        pSubmitCommand->DmaBufferPrivateDataSize >= sizeof(VIOGPU_DMA_PRIVATE))
+    {
+        VIOGPU_DMA_PRIVATE *priv = (VIOGPU_DMA_PRIVATE *)pSubmitCommand->pDmaBufferPrivateData;
+        if (priv->magic == VIOGPU_DMA_PRIV_MAGIC)
+        {
+            // priv->cmd is a pointer we stored (or NULL) -- FromHandle is
+            // safe on it.  Consume-once (see SubmitCommand): a
+            // resubmission of the same DMA buffer must not resurrect the
+            // same command object; the mirrored body stays in priv so a
+            // fresh command still re-executes it.
+            cmd = VioGpuCommand::FromHandle(priv->cmd);
+            priv->cmd = NULL;
+            // See SubmitCommand: release the build-phase hold on this slot.
+            InterlockedCompareExchangePointer(&m_pAdapter->m_PagingStampPriv,
+                                              NULL,
+                                              pSubmitCommand->pDmaBufferPrivateData);
+        }
+    }
+
+    if (!cmd)
+    {
+        cmd = new (NonPagedPoolNx) VioGpuCommand(m_pAdapter);
+        if (!cmd)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s failed to allocate command; completing fence_id=%d without work\n",
+                      __FUNCTION__,
+                      pSubmitCommand->SubmissionFenceId));
+            m_pAdapter->CompleteFenceWithoutWork(pSubmitCommand->SubmissionFenceId,
+                                                 pSubmitCommand->NodeOrdinal,
+                                                 pSubmitCommand->EngineOrdinal);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    cmd->PrepareSubmitVirtual(pSubmitCommand);
     InterlockedExchange(&m_pAdapter->m_LastSubmittedFenceId, pSubmitCommand->SubmissionFenceId);
     QueueSubmitted(cmd);
 

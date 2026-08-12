@@ -922,7 +922,7 @@ void CtrlQueue::CtxResource(bool attach, UINT ctx_id, UINT res_id)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-void CtrlQueue::SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+BOOLEAN CtrlQueue::SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     PAGED_CODE();
 
@@ -933,7 +933,7 @@ void CtrlQueue::SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_r
     cmd = (PGPU_CMD_SUBMIT)AllocCmd(&vbuf, sizeof(*cmd));
     if (!cmd)
     {
-        return;
+        return FALSE;
     }
     RtlZeroMemory(cmd, sizeof(*cmd));
 
@@ -961,15 +961,16 @@ void CtrlQueue::SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_r
     QueueBuffer(vbuf);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
 }
 
-void CtrlQueue::TransferHostCmd(bool to_host,
-                                ULONG ctx_id,
-                                BOOL has_ring,
-                                ULONG ring_idx,
-                                VIOGPU_TRANSFER_CMD *options,
-                                void (*complete_cb)(void *, void *, void *),
-                                void *complete_ctx)
+BOOLEAN CtrlQueue::TransferHostCmd(bool to_host,
+                                   ULONG ctx_id,
+                                   BOOL has_ring,
+                                   ULONG ring_idx,
+                                   VIOGPU_TRANSFER_CMD *options,
+                                   void (*complete_cb)(void *, void *, void *),
+                                   void *complete_ctx)
 {
     PAGED_CODE();
 
@@ -980,7 +981,7 @@ void CtrlQueue::TransferHostCmd(bool to_host,
     cmd = (PGPU_CMD_TRANSFER_HOST_3D)AllocCmd(&vbuf, sizeof(*cmd));
     if (!cmd)
     {
-        return;
+        return FALSE;
     }
     RtlZeroMemory(cmd, sizeof(*cmd));
 
@@ -1018,9 +1019,10 @@ void CtrlQueue::TransferHostCmd(bool to_host,
     QueueBuffer(vbuf);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
 }
 
-void CtrlQueue::ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+BOOLEAN CtrlQueue::ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     PAGED_CODE();
 
@@ -1031,7 +1033,7 @@ void CtrlQueue::ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void
     cmd = (PGPU_RES_MAP_BLOB)AllocCmdResp(&vbuf, sizeof(*cmd), NULL, sizeof(GPU_RESP_MAP_INFO));
     if (!cmd)
     {
-        return;
+        return FALSE;
     }
 
     RtlZeroMemory(cmd, sizeof(*cmd));
@@ -1049,9 +1051,10 @@ void CtrlQueue::ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void
     QueueBuffer(vbuf);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
 }
 
-void CtrlQueue::ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+BOOLEAN CtrlQueue::ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     PAGED_CODE();
 
@@ -1062,7 +1065,7 @@ void CtrlQueue::ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(
     cmd = (PGPU_RES_UNMAP_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
     if (!cmd)
     {
-        return;
+        return FALSE;
     }
     RtlZeroMemory(cmd, sizeof(*cmd));
 
@@ -1078,6 +1081,7 @@ void CtrlQueue::ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(
     QueueBuffer(vbuf);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
 }
 
 PAGED_CODE_SEG_END

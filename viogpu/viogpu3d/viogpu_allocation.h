@@ -135,6 +135,13 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
         return m_IsBlob && m_Blob.Created && (m_Blob.Options.blob_flags & VIOGPU_BLOB_FLAG_USE_MAPPABLE) != 0;
     }
 
+    // The KMD-owned shmem window placement is latched, making it the single
+    // authority for this blob's map offset.
+    inline BOOL IsKmdShmemPlaced() const
+    {
+        return m_KmdShmem.Placed;
+    }
+
     inline BOOL IsPinned() const
     {
         return m_IsBlob && (m_Blob.Options.blob_flags & VIOGPU_BLOB_FLAG_PINNED) != 0;
@@ -174,6 +181,13 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // this resource has no pages behind it.
     BOOLEAN AttachBacking(MDL *pMdl, size_t pageCount, size_t pageOffset);
     void DetachBacking();
+
+    // WDDM2/GpuMmu: capture the allocation's system pages from level-0
+    // UPDATE_PAGE_TABLE writes and keep the host resource's guest backing in
+    // step with residency.  Under GpuMmu VidMm points GPU PTEs straight at
+    // system memory and never maps the aperture segment, so this paging op is
+    // the only place the pages behind a TYPE_3D allocation are ever named.
+    void HandlePageTableUpdate(const DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE *upt);
 
     void FlushToScreen(UINT scan_id);
 
@@ -243,6 +257,11 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
   public:
     VioGpuDeviceAllocation *Open(VioGpuDevice *pDevice);
     void Close(VioGpuDeviceAllocation *pDeviceAllocation);
+    // Whether pDevice has this allocation open.  dxgkrnl validates an
+    // allocation handle against the calling device for every DDI that takes
+    // one, but escape payloads are unvalidated UMD bytes, so this is what
+    // stands between a caller and an allocation it never opened.
+    BOOLEAN IsOpenOn(VioGpuDevice *pDevice);
   private:
     inline LinkedList<VioGpuDeviceAllocation>::Entry *Find(VioGpuDevice *pDevice);
     inline BOOLEAN MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
@@ -255,6 +274,38 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     VioGpuAdapter *m_adapter;
     UINT m_Id;
 
+  public:
+    // Create->open pairing state, owned by VioGpuAdapter's
+    // m_PendingCreateLock.
+    LIST_ENTRY m_PendingCreateEntry;
+    PKTHREAD m_PendingCreateThread;
+
+    // Segment placement arrives via paging ops (NotifyResidency /
+    // UpdatePageTable PTEs / Transfer destinations), because DxgkDdiPatch
+    // never runs for GpuMmu virtual contexts.  Normalizes to the
+    // segment-global convention and refreshes m_Blob.MapOffset.
+    void SetSegmentPlacement(UINT segmentId, ULONGLONG addr, const char *source);
+
+    // KMD-owned shmem mappings for mappable blobs.  Placement happens once per
+    // allocation; user mappings are created by EscapeResourceInfo in the
+    // calling process, one per process, because a shared blob is legitimately
+    // RES_INFO'd by both its creator and every cross-process opener.  All torn
+    // down in the destructor.
+    struct KmdShmemMapping
+    {
+        KmdShmemMapping *Next;
+        PEPROCESS Process; // referenced (identity must outlive the entry)
+        PMDL Mdl;
+        PVOID UserVa;
+    };
+    struct
+    {
+        BOOLEAN Placed = FALSE;
+        SIZE_T MapSize = 0;
+        KmdShmemMapping *Maps = NULL;
+    } m_KmdShmem;
+
+  private:
     FAST_MUTEX m_Lock;
 
     LinkedList<VioGpuDeviceAllocation> m_DeviceAllocations;
@@ -264,6 +315,14 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     size_t m_pageOffset;
     // RESOURCE_ATTACH_BACKING reached the host; gates the paired detach.
     BOOLEAN m_BackingAttached;
+
+    // GpuMmu residency capture (HandlePageTableUpdate): per-page physical
+    // addresses harvested from UPDATE_PAGE_TABLE, GPUMMU_PAGE_UNFILLED where
+    // the page is not (or no longer) resident.  Backing is attached when
+    // every page is known and detached the moment any page is invalidated.
+    static constexpr ULONGLONG GPUMMU_PAGE_UNFILLED = ~0ull;
+    ULONGLONG *m_GpummuPages = NULL;
+    size_t m_GpummuFilled = 0;
 
     size_t m_DxPhysicalAddress;
 
