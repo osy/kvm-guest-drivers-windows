@@ -49,8 +49,9 @@ int bBreakAlways;
 // deregister the trace provider it registered against this driver object.
 static DRIVER_OBJECT *g_pDriverObject = NULL;
 
-// Pool tag ('VgPr' in the pool tracker; tags display reversed).
+// Pool tags ('VgPr' / 'VgRp' in the pool tracker; tags display reversed).
 #define VIOGPU3D_PROCESS_TAG ((ULONG)'rPgV')
+#define VIOGPU3D_REGPATH_TAG ((ULONG)'pRgV')
 
 tDebugPrintFunc VirtioDebugPrintProc;
 
@@ -83,6 +84,54 @@ void InitializeDebugPrints(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Re
 
 #pragma code_seg(push)
 #pragma code_seg("PAGE")
+
+// Read tuning values from <pRegistryPath>\Parameters.  Absent values,
+// wrong types, or any failure leave the compiled-in defaults untouched.
+static VOID VioGpuReadDriverParameters(_In_ PUNICODE_STRING pRegistryPath)
+{
+    PAGED_CODE();
+
+    static const WCHAR paramsSuffix[] = L"\\Parameters";
+    ULONG debugLevel = 0;
+    ULONG defaultValue = 0;
+
+    // Build a NUL-terminated "<service>\Parameters" path for
+    // RTL_REGISTRY_ABSOLUTE (pRegistryPath is counted, not terminated).
+    SIZE_T cb = pRegistryPath->Length + sizeof(paramsSuffix);
+    PWCHAR path = (PWCHAR)ExAllocatePoolZero(PagedPool, cb, VIOGPU3D_REGPATH_TAG);
+    if (path == NULL)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("%s failed to allocate registry path\n", __FUNCTION__));
+        return;
+    }
+    RtlCopyMemory(path, pRegistryPath->Buffer, pRegistryPath->Length);
+    RtlCopyMemory((PUCHAR)path + pRegistryPath->Length, paramsSuffix, sizeof(paramsSuffix));
+
+    RTL_QUERY_REGISTRY_TABLE query[2];
+    RtlZeroMemory(query, sizeof(query));
+    // DbgPrint verbosity (TRACE_LEVEL_*).  Absent or 0 keeps the
+    // compiled-in level, which is silent unless DBG_VERBOSE was defined --
+    // this value is the only way to turn KMD tracing on without a rebuild.
+    query[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+    query[0].Name = (PWSTR)L"DebugLevel";
+    query[0].EntryContext = &debugLevel;
+    query[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD;
+    query[0].DefaultData = &defaultValue;
+    query[0].DefaultLength = sizeof(defaultValue);
+
+    NTSTATUS status = RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, path, query, NULL, NULL);
+    ExFreePoolWithTag(path, VIOGPU3D_REGPATH_TAG);
+
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s RtlQueryRegistryValues failed 0x%X\n", __FUNCTION__, status));
+        return;
+    }
+    if (debugLevel != 0)
+    {
+        nDebugLevel = (int)debugLevel;
+    }
+}
 
 extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_STRING *pRegistryPath)
 {
@@ -187,6 +236,8 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
     // DDI", then 549 StartAdapter_AddAdapterFailed, 0xC000000D).
     InitialData.DxgkDdiCalibrateGpuClock = VioGpu3DDdiCalibrateGpuClock;
     InitialData.DxgkDdiSetStablePowerState = VioGpu3DDdiSetStablePowerState;
+
+    VioGpuReadDriverParameters(pRegistryPath);
 
     NTSTATUS Status = DxgkInitialize(pDriverObject, pRegistryPath, &InitialData);
 
