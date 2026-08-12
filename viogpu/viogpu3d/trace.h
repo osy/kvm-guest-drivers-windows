@@ -17,8 +17,8 @@
 #endif // TRACE_LEVEL_INFORMATION
 
 #if DBG
-//#define PRINT_DEBUG 1
-#define COM_DEBUG 1
+#define PRINT_DEBUG 1
+//#define COM_DEBUG 1
 
     extern int nDebugLevel;
     extern int bBreakAlways;
