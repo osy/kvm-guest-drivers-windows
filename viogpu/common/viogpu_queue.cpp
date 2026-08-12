@@ -63,6 +63,7 @@ PVIOGPU_WAIT_CTX VioGpuAllocWaitCtx()
     KeInitializeEvent(&ctx->event, NotificationEvent, FALSE);
     ctx->refCount = 1;
     ctx->vbuf = NULL;
+    ctx->abandoned = 0;
     return ctx;
 }
 
@@ -74,9 +75,19 @@ void VioGpuWaitCtxCompleteCB(void *p, void *, void *)
     ASSERT(remaining >= 0);
     if (remaining == 0)
     {
-        // Caller already gave up its ref; flip auto_release so the DPC
-        // frees the vbuf on the way out.
-        if (ctx->vbuf)
+        // Reaching zero here happens two ways, and they need opposite
+        // vbuf treatment.  TIMEOUT: the caller abandoned the wait (it
+        // set ctx->abandoned before dropping its ref), nobody will
+        // release the vbuf -- flip auto_release so the DPC frees it on
+        // the way out.  SUCCESS: the caller woke on the KeSetEvent
+        // above and decremented before we did; it still OWNS the vbuf,
+        // is reading the response, and will ReleaseBuffer it itself.
+        // Flipping auto_release then made the DPC free/recycle the vbuf
+        // under the caller, and the caller's own later ReleaseBuffer
+        // released a vbuf that meanwhile belonged to a DIFFERENT
+        // in-flight command -- eating that command's completion (the
+        // commander wedges on its running slot and dxgkrnl TDRs).
+        if (ctx->abandoned && ctx->vbuf)
         {
             ctx->vbuf->auto_release = true;
         }
@@ -101,6 +112,9 @@ BOOLEAN VioGpuWaitCtxFinish(PVIOGPU_WAIT_CTX ctx,
         return TRUE;
     }
 
+    // Publish the abandonment BEFORE dropping the ref: the callback
+    // observing refCount 0 must be able to trust the flag.
+    InterlockedExchange(&ctx->abandoned, 1);
     LONG remaining = InterlockedDecrement(&ctx->refCount);
     ASSERT(remaining >= 0);
     if (remaining == 0)

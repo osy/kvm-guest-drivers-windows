@@ -72,6 +72,12 @@ typedef struct viogpu_wait_ctx
     KEVENT event;
     volatile LONG refCount;
     PGPU_VBUFFER vbuf;
+    // Set by the caller's TIMEOUT path before it drops its ref.  The
+    // completion callback reaching refCount 0 is ambiguous without it:
+    // on the success path the caller can decrement between the
+    // callback's KeSetEvent and its own decrement, and the callback
+    // must then NOT auto-release a vbuf the caller still owns.
+    volatile LONG abandoned;
 } VIOGPU_WAIT_CTX, *PVIOGPU_WAIT_CTX;
 
 class VioGpuQueue;
