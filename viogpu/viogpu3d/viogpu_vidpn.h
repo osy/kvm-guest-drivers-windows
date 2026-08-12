@@ -65,6 +65,12 @@ class VioGpuVidPN
 
     BOOLEAN GpuObjectAttach(UINT res_id, VioGpuObj *obj);
     PBYTE GetEdidData(UINT Idx);
+    // Valid bytes behind GetEdidData: the host EDID is a full raw block, the
+    // built-in fallback is a single 128-byte block.
+    ULONG GetEdidSize(void)
+    {
+        return m_bEDID ? EDID_RAW_BLOCK_SIZE : EDID_V1_BLOCK_SIZE;
+    }
 
     PBYTE GetCTA861Data(void);
     void SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo);

@@ -27,6 +27,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_
     m_pMDL = NULL;
     m_pageCount = 0;
     m_pageOffset = 0;
+    m_BackingAttached = FALSE;
     m_DxPhysicalAddress = 0;
 
     KeInitializeEvent(&m_busyNotification, NotificationEvent, TRUE);
@@ -63,6 +64,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_3D_OP
     m_pMDL = NULL;
     m_pageCount = 0;
     m_pageOffset = 0;
+    m_BackingAttached = FALSE;
     m_DxPhysicalAddress = 0;
 
     KeInitializeEvent(&m_busyNotification, NotificationEvent, TRUE);
@@ -110,6 +112,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_IMPOR
     m_pMDL = NULL;
     m_pageCount = 0;
     m_pageOffset = 0;
+    m_BackingAttached = FALSE;
     m_DxPhysicalAddress = 0;
 
     KeInitializeEvent(&m_busyNotification, NotificationEvent, TRUE);
@@ -162,6 +165,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_SHARE
     m_pMDL = NULL;
     m_pageCount = 0;
     m_pageOffset = 0;
+    m_BackingAttached = FALSE;
     m_DxPhysicalAddress = 0;
 
     KeInitializeEvent(&m_busyNotification, NotificationEvent, TRUE);
@@ -440,7 +444,7 @@ _IRQL_requires_max_(APC_LEVEL) VOID VioGpuAllocation::Unlock()
     ExReleaseFastMutex(&m_Lock);
 }
 
-void VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t pageOffset)
+BOOLEAN VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t pageOffset)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d, IsBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));
 
@@ -451,6 +455,12 @@ void VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t pageOff
     m_pageOffset = pageOffset;
 
     GPU_MEM_ENTRY *ents = new (NonPagedPoolNx) GPU_MEM_ENTRY[pageCount];
+    if (ents == NULL)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<--- %s res_id=%d cannot allocate %zu backing entries\n", __FUNCTION__, m_Id, pageCount));
+        return FALSE;
+    }
 
     for (UINT i = 0; i < pageCount; i++)
     {
@@ -462,7 +472,9 @@ void VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t pageOff
     }
 
     m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)pageCount);
+    m_BackingAttached = TRUE;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
 }
 
 void VioGpuAllocation::DetachBacking()
@@ -474,6 +486,15 @@ void VioGpuAllocation::DetachBacking()
     m_pMDL = NULL;
     m_pageCount = 0;
     m_pageOffset = 0;
+
+    // Detaching backing the host never received answers with an error for
+    // every allocation whose attach was dropped.
+    if (!m_BackingAttached)
+    {
+        DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s res_id=%d no backing to detach\n", __FUNCTION__, m_Id));
+        return;
+    }
+    m_BackingAttached = FALSE;
 
     m_adapter->ctrlQueue.DetachBacking(m_Id);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -779,6 +800,16 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
+    // Only element [0] is ever filled in below, so a multi-allocation create
+    // would hand dxgkrnl uninitialised hAllocation values to destroy later.
+    // The paired UMD always asks for exactly one.
+    if (pCreateAllocation->NumAllocations != 1)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<--- %s unsupported NumAllocations %d\n", __FUNCTION__, pCreateAllocation->NumAllocations));
+        return STATUS_INVALID_PARAMETER;
+    }
+
     DXGK_ALLOCATIONINFO *allocationInfo = pCreateAllocation->pAllocationInfo;
 
 
@@ -824,11 +855,28 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             return STATUS_INVALID_PARAMETER;
     }
 
+    if (allocation == NULL)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s failed to allocate VioGpuAllocation\n", __FUNCTION__));
+        return STATUS_NO_MEMORY;
+    }
+
     allocationInfo->hAllocation = allocation->ToHandle();
 
-    if (pCreateAllocation->Flags.Resource)
+    // Only mint a resource for the first allocation of one: when dxgkrnl adds
+    // an allocation to an existing resource it passes that resource's handle
+    // back in, and overwriting it stranded the previous VioGpuResource (only
+    // the final handle is ever destroyed).
+    if (pCreateAllocation->Flags.Resource && pCreateAllocation->hResource == NULL)
     {
         VioGpuResource *resource = new (NonPagedPoolNx) VioGpuResource();
+        if (resource == NULL)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s failed to allocate VioGpuResource\n", __FUNCTION__));
+            allocationInfo->hAllocation = NULL;
+            allocation->Release();
+            return STATUS_NO_MEMORY;
+        }
         pCreateAllocation->hResource = resource->ToHandle();
     }
 
@@ -849,6 +897,10 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
     allocationInfo->PhysicalAdapterIndex = 0;
 
     allocationInfo->PreferredSegment.Value = 0;
+    // Every [out] field must be written: the type-specific blocks below only
+    // set EvictionSegmentSet for 3D and SHARED, leaving BLOB/IMPORT to inherit
+    // whatever was in the caller's array.
+    allocationInfo->EvictionSegmentSet = 0;
 
     switch (resourceExchange->Type) {
         case VIOGPU_RESOURCE_TYPE_3D:
@@ -1047,7 +1099,18 @@ NTSTATUS VioGpuAllocation::MapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildP
     MDL *pMdl = pBuildPagingBuffer->MapApertureSegment.pMdl;
 
     if (!IsBlob() || IsGuestBlob()) {
-        AttachBacking(pMdl, pageCount, mdlPageOffset);
+        if (!AttachBacking(pMdl, pageCount, mdlPageOffset))
+        {
+            // Every transfer against this res_id now moves nothing, so say
+            // so loudly.  The status cannot carry it: dxgkrnl treats any
+            // failure other than ALLOCATION_BUSY / INSUFFICIENT_DMA_BUFFER
+            // as fatal, and retrying through INSUFFICIENT_DMA_BUFFER spins
+            // -- VidMm hands back a fresh paging buffer, which is not what
+            // ran out.  DetachBacking is gated on the attach having landed
+            // so the host is not asked to detach backing it never received.
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("<--- %s res_id=%d aperture mapped with NO host backing\n", __FUNCTION__, m_Id));
+        }
         SetDxPhysicalAddress(pBuildPagingBuffer->MapApertureSegment.OffsetInPages * PAGE_SIZE);
         return STATUS_SUCCESS;
     }

@@ -45,6 +45,10 @@ int virtioDebugLevel;
 int bDebugPrint;
 int bBreakAlways;
 
+// DxgkDdiUnload takes no arguments, so stash what WPP_CLEANUP needs to
+// deregister the trace provider it registered against this driver object.
+static DRIVER_OBJECT *g_pDriverObject = NULL;
+
 tDebugPrintFunc VirtioDebugPrintProc;
 
 #ifdef DBG
@@ -80,6 +84,7 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
 {
     PAGED_CODE();
     WPP_INIT_TRACING(pDriverObject, pRegistryPath)
+    g_pDriverObject = pDriverObject;
     DbgPrint(TRACE_LEVEL_FATAL, ("---> VIOGPU FULL build on on %s %s\n", __DATE__, __TIME__));
     DRIVER_INITIALIZATION_DATA InitialData = {0};
 
@@ -179,7 +184,8 @@ VOID VioGpu3DUnload(VOID)
 {
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_INFORMATION, ("<--> %s\n", __FUNCTION__));
-    WPP_CLEANUP(NULL);
+    WPP_CLEANUP(g_pDriverObject);
+    g_pDriverObject = NULL;
 }
 
 NTSTATUS
@@ -393,7 +399,12 @@ VioGpu3DSetPointerPosition(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPOI
         VioGpuDbgBreak();
         return STATUS_UNSUCCESSFUL;
     }
-    return STATUS_NOT_IMPLEMENTED;
+    // Positioning alone never draws anything (no shape is ever programmed --
+    // see the zeroed PointerCaps in QueryAdapterInfo), and the DDI is
+    // documented to return STATUS_SUCCESS while making no state changes.
+    // DxgkDdiSetPointerShape deliberately keeps returning an error instead:
+    // success there would claim a hardware pointer had been drawn.
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -772,7 +783,11 @@ VioGpu3DPatch(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PATCH *pPatch)
 
     if (!pAdapter->IsDriverActive())
     {
-        return STATUS_UNSUCCESSFUL;
+        // An error return from the submission DDIs is defined to bugcheck the
+        // OS (0x119). dxgkrnl does not submit outside the Start..Stop window,
+        // so this only guards a teardown race -- where dropping the packet is
+        // recoverable and a bugcheck is not.
+        return STATUS_SUCCESS;
     }
     return pAdapter->commander.Patch(pPatch);
 };
@@ -792,7 +807,8 @@ VioGpu3DSubmitCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SUBMITCOMMA
     {
         // DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s VioGpu (%p) is being called when not active!\n", __FUNCTION__,
         // pAdapter));
-        return STATUS_UNSUCCESSFUL;
+        // See VioGpu3DPatch: an error here is a guaranteed 0x119 bugcheck.
+        return STATUS_SUCCESS;
     }
     return pAdapter->commander.SubmitCommand(pSubmitCommand);
 };

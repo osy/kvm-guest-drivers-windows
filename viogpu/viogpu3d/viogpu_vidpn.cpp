@@ -46,6 +46,14 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
     m_CustomModeIndex = 0;
     m_pFrameBuf = NULL;
 
+    // The destructor runs on ANY remove -- including a device whose
+    // Start() failed before these were ever assigned.  Leaving them as
+    // pool garbage turns the teardown waits/derefs/releases below into
+    // corruption of whatever object the garbage aliases, which surfaces
+    // as a REFERENCE_BY_POINTER bugcheck on the PnP remove.
+    m_pFlipThread = NULL;
+    m_sourceRes = NULL;
+
     m_SystemDisplaySourceId = D3DDDI_ID_UNINITIALIZED;
     KeInitializeSpinLock(&m_sourceLock);
     // Auto-reset: each retiring present fence is one promotion opportunity,
@@ -217,19 +225,26 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
     m_shouldFlipStop = TRUE;
     KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
 
-    // The caller destroys the VidPN once this returns, and the flip thread
-    // publishes into it (m_displayedAddress) until it exits, so returning
-    // before it does leaves those writes landing in freed pool.  The thread
-    // observes m_shouldFlipStop within one vsync period; this DDI is called
-    // at PASSIVE_LEVEL, where waiting for it indefinitely is legal.
-    while (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
+    // Guard + NULL after the deref: Stop can precede this DDI (Stop-then-
+    // Remove, failed bring-up, ownership handback), in which case the
+    // thread is already gone; and ~VioGpuVidPN would otherwise dereference
+    // the same thread object a second time (REFERENCE_BY_POINTER).
+    if (m_pFlipThread)
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("---> flip thread has not exited after 1s; still waiting\n"));
-        VioGpuDbgBreak();
-    }
+        // The caller destroys the VidPN once this returns, and the flip thread
+        // publishes into it (m_displayedAddress) until it exits, so returning
+        // before it does leaves those writes landing in freed pool.  The thread
+        // observes m_shouldFlipStop within one vsync period; this DDI is called
+        // at PASSIVE_LEVEL, where waiting for it indefinitely is legal.
+        while (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
+        {
+            DbgPrint(TRACE_LEVEL_FATAL, ("---> flip thread has not exited after 1s; still waiting\n"));
+            VioGpuDbgBreak();
+        }
 
-    ObDereferenceObject(m_pFlipThread);
-    m_pFlipThread = NULL;
+        ObDereferenceObject(m_pFlipThread);
+        m_pFlipThread = NULL;
+    }
 
     BlackOutScreen(&m_CurrentModes[SourceId]);
     DestroyFrameBufferObj(TRUE);
@@ -482,6 +497,11 @@ NTSTATUS VioGpuVidPN::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSou
 
     if (NT_SUCCESS(Status))
     {
+        // Nothing is applied until a mode matches: reporting success for a
+        // pinned mode this driver never programmed tells dxgkrnl the commit
+        // took effect while the display keeps the old mode.
+        Status = STATUS_GRAPHICS_INVALID_VIDPN_SOURCEMODESET;
+
         pCurrentMode->Flags.FullscreenPresent = TRUE;
         for (USHORT ModeIndex = 0; ModeIndex < GetModeCount(); ++ModeIndex)
         {
@@ -495,6 +515,45 @@ NTSTATUS VioGpuVidPN::SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSou
                     m_CurrentModeIndex = ModeIndex;
                 }
                 break;
+            }
+        }
+
+        if (Status == STATUS_GRAPHICS_INVALID_VIDPN_SOURCEMODESET)
+        {
+            // The table is rewritten whenever the host changes resolution, so
+            // a mode that was in the source mode set at EnumCofuncModality can
+            // be gone by the commit.  Failing here fails the whole CommitVidPn
+            // and the desktop goes black; the mode is a legal one dxgkrnl
+            // pinned from what this driver published, so program it into the
+            // custom slot -- the same slot a host-driven resolution change
+            // uses -- instead.
+            DbgPrint(TRACE_LEVEL_WARNING,
+                     ("%s no internal mode matches pinned %dx%d; programming custom\n",
+                      __FUNCTION__,
+                      pCurrentMode->DispInfo.Width,
+                      pCurrentMode->DispInfo.Height));
+            SetCustomDisplay((USHORT)pCurrentMode->DispInfo.Width, (USHORT)pCurrentMode->DispInfo.Height);
+            // SetCustomDisplay clamps to the minimum size unless the adapter
+            // reports flexible resolutions, so confirm the slot really holds
+            // the pinned mode before claiming the commit took effect.
+            const PVIDEO_MODE_INFORMATION pCustom = &m_ModeInfo[m_CustomModeIndex];
+            if (pCustom->VisScreenWidth == pCurrentMode->DispInfo.Width &&
+                pCustom->VisScreenHeight == pCurrentMode->DispInfo.Height)
+            {
+                Status = SetCurrentMode(m_ModeNumbers[m_CustomModeIndex], pCurrentMode);
+                if (NT_SUCCESS(Status))
+                {
+                    m_CurrentModeIndex = m_CustomModeIndex;
+                }
+            }
+            if (!NT_SUCCESS(Status))
+            {
+                DbgPrint(TRACE_LEVEL_ERROR,
+                         ("<--- %s cannot program pinned %dx%d (0x%X)\n",
+                          __FUNCTION__,
+                          pCurrentMode->DispInfo.Width,
+                          pCurrentMode->DispInfo.Height,
+                          Status));
             }
         }
     }
@@ -536,8 +595,9 @@ NTSTATUS VioGpuVidPN::IsVidPnPathFieldsValid(CONST D3DKMDT_VIDPN_PRESENT_PATH *p
                  ("pPath contains a non-identity scaling (0x%I64x)", pPath->ContentTransformation.Scaling));
         return STATUS_GRAPHICS_VIDPN_MODALITY_NOT_SUPPORTED;
     }
+    // Identity only: the present/scanout path cannot rotate, so accepting
+    // a rotated path would only produce failed presents.
     else if ((pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_IDENTITY) &&
-             (pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_ROTATE90) &&
              (pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_NOTSPECIFIED) &&
              (pPath->ContentTransformation.Rotation != D3DKMDT_VPPR_UNINITIALIZED))
     {
@@ -755,6 +815,11 @@ void VioGpuVidPN::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURREN
     resid = m_pAdapter->resourceIdr.GetId();
     m_pAdapter->ctrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
     obj = new (NonPagedPoolNx) VioGpuObj();
+    if (!obj)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to allocate frame buffer object\n", __FUNCTION__));
+        return;
+    }
     if (!obj->Init(size, &m_pAdapter->frameSegment))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to init obj size = %d\n", __FUNCTION__, size));
@@ -793,6 +858,17 @@ void VioGpuVidPN::DestroyFrameBufferObj(BOOLEAN bReset)
         delete m_pFrameBuf;
         m_pFrameBuf = NULL;
         // m_pAdapter->resourceIdr.PutId(resid);
+
+        // Clear the mode's view of the framebuffer with it: a caller that
+        // destroys it without going through Powerdown/SetCurrentMode would
+        // otherwise leave FrameBufferIsActive set over a dangling
+        // FrameBuffer.Ptr, which BlackOutScreen and the SystemDisplayEnable
+        // source search both trust.
+        for (UINT i = 0; i < MAX_VIEWS; i++)
+        {
+            m_CurrentModes[i].Flags.FrameBufferIsActive = FALSE;
+            m_CurrentModes[i].FrameBuffer.Ptr = NULL;
+        }
     }
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
@@ -853,7 +929,10 @@ NTSTATUS VioGpuVidPN::QueryVidPnHWCapability(_Inout_ DXGKARG_QUERYVIDPNHWCAPABIL
     VIOGPU_ASSERT(pVidPnHWCaps->SourceId < MAX_VIEWS);
     VIOGPU_ASSERT(pVidPnHWCaps->TargetId < MAX_CHILDREN);
 
-    pVidPnHWCaps->VidPnHWCaps.DriverRotation = 1;
+    // No rotation capability: DxgkDdiPresent rejects Flags.Rotate and the
+    // scanout path cannot rotate, so claiming it here (it would mean "driver
+    // rotates via an intermediate blit") was a promise the driver can't keep.
+    pVidPnHWCaps->VidPnHWCaps.DriverRotation = 0;
     pVidPnHWCaps->VidPnHWCaps.DriverScaling = 0;
     pVidPnHWCaps->VidPnHWCaps.DriverCloning = 0;
     pVidPnHWCaps->VidPnHWCaps.DriverColorConvert = 1;
@@ -943,7 +1022,7 @@ VioGpuVidPN::RecommendFunctionalVidPn(_In_ CONST DXGKARG_RECOMMENDFUNCTIONALVIDP
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
 
-    VIOGPU_ASSERT(pRecommendFunctionalVidPn == NULL);
+    VIOGPU_ASSERT(pRecommendFunctionalVidPn != NULL);
 
     return STATUS_GRAPHICS_NO_RECOMMENDED_FUNCTIONAL_VIDPN;
 }
@@ -954,7 +1033,7 @@ NTSTATUS VioGpuVidPN::RecommendVidPnTopology(_In_ CONST DXGKARG_RECOMMENDVIDPNTO
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
 
-    VIOGPU_ASSERT(pRecommendVidPnTopology == NULL);
+    VIOGPU_ASSERT(pRecommendVidPnTopology != NULL);
 
     return STATUS_GRAPHICS_NO_RECOMMENDED_FUNCTIONAL_VIDPN;
 }
@@ -1205,7 +1284,9 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
                                                                                 pMonitorSourceMode);
     if (!NT_SUCCESS(Status))
     {
-        if (Status != STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET)
+        BOOLEAN alreadyPresent = (Status == STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET);
+
+        if (!alreadyPresent)
         {
             DbgPrint(TRACE_LEVEL_ERROR,
                      ("pfnAddMode failed with Status = 0x%X, hMonitorSourceModeSet = 0x%llu, pMonitorSourceMode = "
@@ -1223,7 +1304,15 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
                                                                                                          pMonitorSourceMode);
         UNREFERENCED_PARAMETER(TempStatus);
         NT_ASSERT(NT_SUCCESS(TempStatus));
-        return Status;
+
+        // The preferred mode already being in the set (likely once the host
+        // supplies a real EDID) is not a reason to skip the rest: the loop
+        // below is what contributes the custom host resolution.  Only a real
+        // failure returns here.
+        if (!alreadyPresent)
+        {
+            return Status;
+        }
     }
 
     for (UINT Idx = 0; Idx < GetModeCount(); ++Idx)
@@ -1603,16 +1692,25 @@ NTSTATUS VioGpuVidPN::EnumVidPnCofuncModality(_In_ CONST DXGKARG_ENUMVIDPNCOFUNC
             }
         }
 
-        if (!((pEnumCofuncModality->EnumPivotType != D3DKMDT_EPT_ROTATION) &&
+        // The pivot's mode set must not be modified: skip the block for
+        // exactly the pinned rotation pivot on this source/target pair.
+        if (!((pEnumCofuncModality->EnumPivotType == D3DKMDT_EPT_ROTATION) &&
               (pEnumCofuncModality->EnumPivot.VidPnSourceId == pVidPnPresentPath->VidPnSourceId) &&
               (pEnumCofuncModality->EnumPivot.VidPnTargetId == pVidPnPresentPath->VidPnTargetId)))
         {
             if (pVidPnPresentPath->ContentTransformation.Rotation == D3DKMDT_VPPR_UNPINNED)
             {
+                // Identity only.  Rotate90 was advertised here, but nothing
+                // downstream can honour it: DxgkDdiPresent rejects
+                // Flags.Rotate and the scanout path (SET_SCANOUT /
+                // SET_SCANOUT_BLOB) cannot rotate, so a user rotating the
+                // display got failed presents.
+                RtlZeroMemory(&(LocalVidPnPresentPath.ContentTransformation.RotationSupport),
+                              sizeof(D3DKMDT_VIDPN_PRESENT_PATH_ROTATION_SUPPORT));
                 LocalVidPnPresentPath.ContentTransformation.RotationSupport.Identity = 1;
-                LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate90 = 1;
-                LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate180 = 0;
-                LocalVidPnPresentPath.ContentTransformation.RotationSupport.Rotate270 = 0;
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM1_3_PATH_INDEPENDENT_ROTATION)
+                LocalVidPnPresentPath.ContentTransformation.RotationSupport.Offset0 = 1;
+#endif
                 SupportFieldsModified = TRUE;
             }
         }
@@ -1751,7 +1849,9 @@ VOID VioGpuVidPN::BlackOutScreen(CURRENT_MODE *pCurrentMod)
 
     DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s\n", __FUNCTION__));
 
-    if (pCurrentMod->Flags.FrameBufferIsActive)
+    // m_pFrameBuf is dereferenced below; the flag alone is not proof it is
+    // still there (a teardown can outrun the per-mode state).
+    if (pCurrentMod->Flags.FrameBufferIsActive && m_pFrameBuf != NULL)
     {
         UINT ScreenHeight = pCurrentMod->DispInfo.Height;
         UINT ScreenPitch = pCurrentMod->DispInfo.Pitch;

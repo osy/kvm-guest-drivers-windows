@@ -876,6 +876,10 @@ void CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
     cmd = (PGPU_RES_ATTACH_BACKING)AllocCmd(&vbuf, sizeof(*cmd));
     if (!cmd)
     {
+        // The entry array is handed over unconditionally -- on the success
+        // path it is freed with the vbuf, so free it here too rather than
+        // leaking it back to a caller that has already forgotten it.
+        delete[] reinterpret_cast<PBYTE>(ents);
         return;
     }
     RtlZeroMemory(cmd, sizeof(*cmd));

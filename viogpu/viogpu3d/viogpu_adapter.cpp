@@ -40,6 +40,10 @@
 
 static UINT g_InstanceId = 0;
 
+// HWClose waits this many 1s rounds for the worker thread before giving up on
+// it (and leaking it rather than freeing the adapter underneath it).
+#define HW_CLOSE_THREAD_WAIT_RETRIES 5
+
 struct NOTIFY_CONTEXT
 {
     DXGKRNL_INTERFACE *pDxgkInterface;
@@ -246,12 +250,23 @@ NTSTATUS VioGpuAdapter::StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
         return Status;
     }
 
-    commander.Start();
+    Status = commander.Start();
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("VioGpuCommander::Start failed with status 0x%X\n", Status));
+        VioGpuDbgBreak();
+        return Status;
+    }
+
     Status = vidpn.Start(pNumberOfViews, pNumberOfChildren);
     if (!NT_SUCCESS(Status))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("VioGpuVidPN::Start failed with status 0x%X\n", Status));
         VioGpuDbgBreak();
+        // A failed StartDevice is followed by RemoveDevice, never StopDevice,
+        // so the commander worker has to be torn down here or it outlives the
+        // adapter it dereferences.
+        commander.Stop();
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -474,15 +489,18 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
     VIOGPU_ASSERT(pDeviceDescriptor != NULL);
     VIOGPU_ASSERT(ChildUid < MAX_CHILDREN);
     PBYTE edid = vidpn.GetEdidData(ChildUid);
+    // Bound the copy by what actually backs the pointer: the built-in fallback
+    // EDID is one 128-byte block, so bounding by EDID_RAW_BLOCK_SIZE would
+    // serve adjacent .data for any offset past block 0.
+    ULONG edidSize = vidpn.GetEdidSize();
 
     if (!edid)
     {
         return STATUS_GRAPHICS_CHILD_DESCRIPTOR_NOT_SUPPORTED;
     }
-    else if (pDeviceDescriptor->DescriptorOffset < EDID_RAW_BLOCK_SIZE)
+    else if (pDeviceDescriptor->DescriptorOffset < edidSize)
     {
-        ULONG len = min(pDeviceDescriptor->DescriptorLength,
-                        (EDID_RAW_BLOCK_SIZE - pDeviceDescriptor->DescriptorOffset));
+        ULONG len = min(pDeviceDescriptor->DescriptorLength, (edidSize - pDeviceDescriptor->DescriptorOffset));
         RtlCopyMemory(pDeviceDescriptor->DescriptorBuffer, (edid + pDeviceDescriptor->DescriptorOffset), len);
         pDeviceDescriptor->DescriptorLength = len;
         return STATUS_SUCCESS;
@@ -529,12 +547,18 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
             }
         case DXGKQAITYPE_DRIVERCAPS:
             {
+                // Do NOT compare against sizeof(DXGK_DRIVERCAPS) here.  The
+                // struct grows with DXGKDDI_INTERFACE_VERSION, and dxgkrnl
+                // sizes the buffer for the version this driver REGISTERED, not
+                // the version its headers were compiled against, so a sizeof()
+                // check rejects a perfectly legal call, fails
+                // DxgkDdiStartDevice, and leaves the device in code 43.  The
+                // zero-fill and all field writes below stay inside
+                // OutputDataSize.
                 if (!pQueryAdapterInfo->OutputDataSize)
                 {
                     DbgPrint(TRACE_LEVEL_ERROR,
-                             ("pQueryAdapterInfo->OutputDataSize (0x%u) is smaller than sizeof(DXGK_DRIVERCAPS) "
-                              "(0x%u)\n",
-                              pQueryAdapterInfo->OutputDataSize,
+                             ("pQueryAdapterInfo->OutputDataSize is 0 (sizeof(DXGK_DRIVERCAPS) = 0x%zx)\n",
                               sizeof(DXGK_DRIVERCAPS)));
                     return STATUS_BUFFER_TOO_SMALL;
                 }
@@ -581,7 +605,10 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 pDriverCaps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
 
                 pDriverCaps->SupportSmoothRotation = FALSE;
-                pDriverCaps->SupportNonVGA = IsVgaDevice();
+                // The cap means "implements DxgkDdiStopDeviceAndReleasePost-
+                // DisplayOwnership", which this driver does unconditionally --
+                // it is not a statement about the PCI class of the device.
+                pDriverCaps->SupportNonVGA = TRUE;
 
                 // Disable pointer on viogpu3d for now
                 // if (IsPointerEnabled()) {
@@ -689,14 +716,18 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
     PVIOGPU_ESCAPE pVioGpuEscape = (PVIOGPU_ESCAPE)pEscape->pPrivateDriverData;
     NTSTATUS status = STATUS_SUCCESS;
 
+    // The guard must cover the whole VIOGPU_ESCAPE, not a pointer to one:
+    // every case below reads and several write union members that extend far
+    // past 8 bytes, and the per-case DataLength checks validate the caller's
+    // own declared length, not the buffer dxgkrnl actually captured.
     UINT size = pEscape->PrivateDriverDataSize;
-    if (size < sizeof(PVIOGPU_ESCAPE))
+    if (size < sizeof(VIOGPU_ESCAPE))
     {
         DbgPrint(TRACE_LEVEL_ERROR,
                  ("%s buffer too small %d, should be at least %zu\n",
                   __FUNCTION__,
                   size,
-                  sizeof(PVIOGPU_ESCAPE)));
+                  sizeof(VIOGPU_ESCAPE)));
         return STATUS_INVALID_BUFFER_SIZE;
     }
 
@@ -1879,13 +1910,40 @@ NTSTATUS VioGpuAdapter::HWClose(void)
     m_bStopWorkThread = TRUE;
     KeSetEvent(&m_ConfigUpdateEvent, IO_NO_INCREMENT, FALSE);
 
-    if (KeWaitForSingleObject(m_pWorkThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
+    // The worker exists only from a successful HWInit onwards: a StartDevice
+    // that failed earlier (CheckHardware, PciResources.Init, VioGpuAdapterInit)
+    // still reaches here through ~VioGpuAdapter on the PnP remove that follows,
+    // and KeWaitForSingleObject(NULL) bugchecks.
+    if (m_pWorkThread != NULL)
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to exit the worker thread\n"));
-        VioGpuDbgBreak();
-    }
+        // A wedged host can keep the worker inside a ring wait past the
+        // timeout.  Dereferencing and freeing the adapter out from under a
+        // live thread is worse than leaking the reference, so on a persistent
+        // timeout we deliberately keep both the ETHREAD reference and the
+        // frame segment alive.
+        BOOLEAN exited = FALSE;
 
-    ObDereferenceObject(m_pWorkThread);
+        for (UINT i = 0; i < HW_CLOSE_THREAD_WAIT_RETRIES; i++)
+        {
+            if (KeWaitForSingleObject(m_pWorkThread, Executive, KernelMode, FALSE, &timeout) != STATUS_TIMEOUT)
+            {
+                exited = TRUE;
+                break;
+            }
+            KeSetEvent(&m_ConfigUpdateEvent, IO_NO_INCREMENT, FALSE);
+        }
+
+        if (!exited)
+        {
+            DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to exit the worker thread; leaking it to avoid a UAF\n"));
+            VioGpuDbgBreak();
+            DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s\n", __FUNCTION__));
+            return STATUS_SUCCESS;
+        }
+
+        ObDereferenceObject(m_pWorkThread);
+        m_pWorkThread = NULL;
+    }
 
     frameSegment.Close();
 

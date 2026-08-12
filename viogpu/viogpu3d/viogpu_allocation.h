@@ -170,7 +170,9 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // first byte in the guest backing, so partial transfers must include x/y.
     BOOLEAN GetTransferLayout(LONG x, LONG y, ULONG *pStride, ULONGLONG *pOffset) const;
 
-    void AttachBacking(MDL *pMdl, size_t pageCount, size_t pageOffset);
+    // FALSE => RESOURCE_ATTACH_BACKING was never issued, so the host side of
+    // this resource has no pages behind it.
+    BOOLEAN AttachBacking(MDL *pMdl, size_t pageCount, size_t pageOffset);
     void DetachBacking();
 
     void FlushToScreen(UINT scan_id);
@@ -260,6 +262,8 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     MDL *m_pMDL;
     size_t m_pageCount;
     size_t m_pageOffset;
+    // RESOURCE_ATTACH_BACKING reached the host; gates the paired detach.
+    BOOLEAN m_BackingAttached;
 
     size_t m_DxPhysicalAddress;
 

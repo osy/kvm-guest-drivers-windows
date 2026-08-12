@@ -421,9 +421,30 @@ NTSTATUS VioGpuCommander::Start()
         return status;
     }
 
-    ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)(&m_pWorkThread), NULL);
+    // Without the ETHREAD reference Stop() has nothing to wait on, so treat a
+    // reference failure the way HWInit does: tell the worker to exit and fail
+    // the start rather than leave an orphan running against a torn-down adapter.
+    status = ObReferenceObjectByHandle(threadHandle,
+                                       THREAD_ALL_ACCESS,
+                                       NULL,
+                                       KernelMode,
+                                       (PVOID *)(&m_pWorkThread),
+                                       NULL);
 
     ZwClose(threadHandle);
+
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s ObReferenceObjectByHandle failed status=0x%x; signalling worker to exit\n",
+                  __FUNCTION__,
+                  status));
+        m_pWorkThread = NULL;
+        m_bStopWorkThread = TRUE;
+        KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
+        VioGpuDbgBreak();
+        return status;
+    }
 
     return status;
 }
@@ -439,11 +460,22 @@ void VioGpuCommander::Stop()
     m_bStopWorkThread = TRUE;
     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
 
+    // Idempotent: Stop runs both from the StartDevice error path and from
+    // DxgkDdiStopDevice, and the thread only exists after a successful Start.
+    if (m_pWorkThread == NULL)
+    {
+        return;
+    }
+
     if (KeWaitForSingleObject(m_pWorkThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
     {
-        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to exit the worker thread\n"));
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> Failed to exit the worker thread; leaking it to avoid a UAF\n"));
         VioGpuDbgBreak();
+        return;
     }
+
+    ObDereferenceObject(m_pWorkThread);
+    m_pWorkThread = NULL;
 }
 
 void VioGpuCommander::ThreadWork(PVOID Context)
