@@ -395,6 +395,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     InitializeListHead(&m_CookieMapList);
     KeInitializeSpinLock(&m_GateLock);
     InitializeListHead(&m_GateList);
+    InitializeListHead(&m_PresentWaitList);
     InitializeListHead(&m_MFenceDeferList);
     // Parked-gate deadline scan.  Started here and cancelled in the
     // destructor; an empty-list pass is a spinlock acquire + list-head check
@@ -436,6 +437,16 @@ VioGpuAdapter::~VioGpuAdapter(void)
             delete c;
         }
         delete g;
+    }
+    // Packet-gated presents parked on a token that never retired: complete
+    // them so the commander can drain (same contract as the gate consumers
+    // above).
+    while (!IsListEmpty(&m_PresentWaitList))
+    {
+        PRESENT_WAIT_CONSUMER *w =
+            CONTAINING_RECORD(RemoveHeadList(&m_PresentWaitList), PRESENT_WAIT_CONSUMER, Entry);
+        w->Cb(w->Ctx, NULL, NULL);
+        delete w;
     }
     while (!IsListEmpty(&m_MFenceDeferList))
     {
@@ -1681,6 +1692,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                              ("%s SUBMIT_PRESENT_FENCE not queued; retiring token %llu\n",
                               __FUNCTION__, pCtx->Token));
                     PresentTokenRetire(pCtx->Token);
+                    PresentWaitSweep();
                     if (pCtx->pEvent != NULL)
                     {
                         KeSetEvent(pCtx->pEvent, IO_NO_INCREMENT, FALSE);
@@ -1708,6 +1720,10 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_INVALID_PARAMETER;
                 }
                 return GateArm(pDevice, pVioGpuEscape->GateArm.RingIdx, &pVioGpuEscape->GateArm.Token);
+            }
+        case VIOGPU_PRESENT_GATE_HINT:
+            {
+                return MarkThreadTokenPacketGate(PsGetCurrentThreadId()) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
             }
         default:
             DbgPrint(TRACE_LEVEL_ERROR, ("%s: invalid Escape type 0x%x\n", __FUNCTION__, pVioGpuEscape->Type));
@@ -1766,6 +1782,8 @@ static void PresentFenceCb(void *ctx, void *, void *)
     // Publish the retirement BEFORE waking anyone, so a waiter that runs the
     // instant it is signalled already sees the token as done.
     pAdapter->PresentTokenRetire(pCtx->Token);
+    // Release any packet-gated present parked on a now-retired token.
+    pAdapter->PresentWaitSweep();
 
     if (pCtx->pEvent != NULL)
     {
@@ -1880,10 +1898,85 @@ void VioGpuAdapter::GateFenceCb(void *ctx, void *, void *)
     }
 }
 
-// Deadline sweep for parked gate DMAs (period + rationale at the
-// declaration).  Runs at DISPATCH; the consumer callback
-// (VioGpuCommand::QueueRunningCb) is DPC-safe by contract -- GateFenceCb
-// already invokes it from the response DPC drain.
+// ---- packet-gated presents (see the block comment in viogpu_adapter.h) ----
+
+// Park a flip present's DMA packet until `token` retires.  Runs at PASSIVE
+// (commander worker, VioGpuCommand::Run); the callback fires from
+// PresentWaitSweep at DISPATCH (retire DPC / expiry DPC) or inline here when
+// the token has already retired.
+void VioGpuAdapter::PresentWaitConsume(ULONGLONG token, void (*cb)(void *, void *, void *), void *ctx, UINT fenceId)
+{
+    PRESENT_WAIT_CONSUMER *w = new (NonPagedPoolNx) PRESENT_WAIT_CONSUMER;
+    BOOLEAN immediate = (w == NULL); // OOM: complete EARLY, degraded but safe
+    if (w != NULL)
+    {
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&m_PresentTokenLock, &oldIrql);
+        if (PresentTokenRetiredLocked(token))
+        {
+            immediate = TRUE;
+        }
+        else
+        {
+            w->Token = token;
+            w->Cb = cb;
+            w->Ctx = ctx;
+            w->ParkTime = KeQueryInterruptTime();
+            InsertTailList(&m_PresentWaitList, &w->Entry);
+        }
+        KeReleaseSpinLock(&m_PresentTokenLock, oldIrql);
+    }
+
+    if (immediate)
+    {
+        if (w != NULL)
+        {
+            delete w;
+        }
+        else
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s: OOM parking present token %llu; completing fence_id=%u EARLY\n",
+                      __FUNCTION__, token, fenceId));
+        }
+        cb(ctx, NULL, NULL);
+    }
+}
+
+// Fire every parked consumer whose token has retired.  <= DISPATCH; the
+// callbacks run outside the lock (QueueRunningCb is DPC-safe by the same
+// contract GateFenceCb relies on).
+void VioGpuAdapter::PresentWaitSweep(void)
+{
+    LIST_ENTRY fired;
+    InitializeListHead(&fired);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&m_PresentTokenLock, &oldIrql);
+    for (LIST_ENTRY *e = m_PresentWaitList.Flink; e != &m_PresentWaitList;)
+    {
+        PRESENT_WAIT_CONSUMER *w = CONTAINING_RECORD(e, PRESENT_WAIT_CONSUMER, Entry);
+        e = e->Flink;
+        if (PresentTokenRetiredLocked(w->Token))
+        {
+            RemoveEntryList(&w->Entry);
+            InsertTailList(&fired, &w->Entry);
+        }
+    }
+    KeReleaseSpinLock(&m_PresentTokenLock, oldIrql);
+
+    while (!IsListEmpty(&fired))
+    {
+        PRESENT_WAIT_CONSUMER *w = CONTAINING_RECORD(RemoveHeadList(&fired), PRESENT_WAIT_CONSUMER, Entry);
+        w->Cb(w->Ctx, NULL, NULL);
+        delete w;
+    }
+}
+
+// Parked-gate deadline scan (period + rationale at the declaration).  Runs
+// at DISPATCH; the consumer callback (VioGpuCommand::QueueRunningCb) is
+// DPC-safe by contract -- GateFenceCb already invokes it from the response
+// DPC drain.
 VOID VioGpuAdapter::GateExpiryDpcRoutine(_In_ struct _KDPC *Dpc,
                                          _In_opt_ PVOID DeferredContext,
                                          _In_opt_ PVOID SystemArgument1,
@@ -1937,6 +2030,37 @@ VOID VioGpuAdapter::GateExpiryDpcRoutine(_In_ struct _KDPC *Dpc,
         GATE_CONSUMER *c = CONTAINING_RECORD(RemoveHeadList(&expired), GATE_CONSUMER, Entry);
         c->Cb(c->Ctx, NULL, NULL);
         delete c;
+    }
+
+    // Same deadline for packet-gated presents: a present token that never
+    // retires (dead host worker) must not park its packet into dxgkrnl's
+    // TDR budget either.
+    LIST_ENTRY expiredPresents;
+    InitializeListHead(&expiredPresents);
+    KeAcquireSpinLock(&a->m_PresentTokenLock, &oldIrql);
+    for (LIST_ENTRY *e = a->m_PresentWaitList.Flink; e != &a->m_PresentWaitList;)
+    {
+        PRESENT_WAIT_CONSUMER *w = CONTAINING_RECORD(e, PRESENT_WAIT_CONSUMER, Entry);
+        e = e->Flink;
+        if (now - w->ParkTime < VIOGPU_GATE_PARK_DEADLINE_100NS)
+        {
+            continue;
+        }
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("%s: present token %llu parked %llu ms > deadline; completing its "
+                  "DMA EARLY (host worker dead or badly stalled)\n",
+                  __FUNCTION__, w->Token, (now - w->ParkTime) / 10000ULL));
+        RemoveEntryList(&w->Entry);
+        InsertTailList(&expiredPresents, &w->Entry);
+    }
+    KeReleaseSpinLock(&a->m_PresentTokenLock, oldIrql);
+
+    while (!IsListEmpty(&expiredPresents))
+    {
+        PRESENT_WAIT_CONSUMER *w =
+            CONTAINING_RECORD(RemoveHeadList(&expiredPresents), PRESENT_WAIT_CONSUMER, Entry);
+        w->Cb(w->Ctx, NULL, NULL);
+        delete w;
     }
 }
 

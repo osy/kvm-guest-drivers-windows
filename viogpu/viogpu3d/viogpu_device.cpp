@@ -526,6 +526,8 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
         // src the new active primary.  Latch m_sourceRes so the next vsync
         // Flip scans out the back buffer the runtime just made current.
         VioGpuAllocation *srcAlloc = NULL;
+        ULONGLONG flipToken = 0;
+        BOOLEAN packetGate = FALSE;
         DXGK_PRESENTALLOCATIONINFO *dxgk_src = &pPresent->pAllocationInfo[DXGK_PRESENT_SOURCE_INDEX];
         if (dxgk_src->hDeviceSpecificAllocation)
         {
@@ -546,7 +548,7 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
             // completed at present time -- the UMD then never armed, and the
             // flip correctly runs un-gated.  Consumed unconditionally so a
             // stamp never outlives its present.
-            ULONGLONG flipToken = m_pAdapter->TakeThreadToken(PsGetCurrentThreadId());
+            flipToken = m_pAdapter->TakeThreadToken(PsGetCurrentThreadId(), &packetGate);
             PHYSICAL_ADDRESS zeroAddr = {};
             // Latch blob sources too, not just PRIMARY-flagged ones: dxgkrnl
             // flip-promotes a fullscreen-sized borderless window, and those
@@ -559,10 +561,44 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
                 m_pAdapter->vidpn.SetScanoutSource(srcAlloc, zeroAddr, flipToken);
         }
 
-        // No host command is needed for a flip: the primary IS the blob
-        // the KMD scans out, and FlushToScreen re-emits SET_SCANOUT_BLOB
-        // at vsync.  The flip's (empty) DMA packet completes on submission
-        // order like any other packet.
+        // Packet-gated present (VIOGPU_PRESENT_GATE_HINT): carry a
+        // PRESENT_WAIT{token} body so the packet's DMA completion -- the
+        // signal dxgkrnl and the compositor read as "frame ready" -- is
+        // parked until the token retires at real host-GPU completion.  On any
+        // allocation failure the flip falls back to completing on submission
+        // order (one frame's ordering hole, never a stall).
+        if (packetGate && flipToken != 0 && pPresent->pDmaBufferPrivateData &&
+            pPresent->DmaBufferPrivateDataSize >= sizeof(VIOGPU_DMA_PRIVATE))
+        {
+            VioGpuCommand *cmd = new (NonPagedPoolNx) VioGpuCommand(m_pAdapter);
+            if (cmd)
+            {
+                UCHAR body[sizeof(VIOGPU_COMMAND_HDR) + sizeof(ULONGLONG)];
+                VIOGPU_COMMAND_HDR *hdr = (VIOGPU_COMMAND_HDR *)body;
+                hdr->type = VIOGPU_CMD_PRESENT_WAIT;
+                hdr->size = sizeof(ULONGLONG);
+                hdr->flags = 0;
+                hdr->ring_idx = 0;
+                RtlCopyMemory(body + sizeof(VIOGPU_COMMAND_HDR), &flipToken, sizeof(ULONGLONG));
+
+                void **privateData = (void **)pPresent->pDmaBufferPrivateData;
+                *privateData = cmd->ToHandle();
+                cmd->MirrorBody(pPresent->pDmaBufferPrivateData,
+                                pPresent->DmaBufferPrivateDataSize,
+                                body,
+                                sizeof(body));
+            }
+            else
+            {
+                DbgPrint(TRACE_LEVEL_ERROR,
+                         ("%s OOM building PRESENT_WAIT; flip completes ungated\n", __FUNCTION__));
+            }
+        }
+
+        // Without a packet gate no host command is needed for a flip: the
+        // primary IS the blob the KMD scans out, and FlushToScreen re-emits
+        // SET_SCANOUT_BLOB at vsync.  The flip's (empty) DMA packet then
+        // completes on submission order like any other packet.
         return STATUS_SUCCESS;
     }
 

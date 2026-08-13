@@ -419,6 +419,9 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     {
         HANDLE Tid;
         ULONGLONG Token;
+        // VIOGPU_PRESENT_GATE_HINT: the flip consuming this stamp parks its
+        // own DMA packet on the token (see PresentWaitConsume).
+        BOOLEAN PacketGate;
     };
 
     void StampThreadToken(HANDLE tid, ULONGLONG token)
@@ -438,13 +441,39 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
         }
         m_ThreadTokens[victim].Tid = tid;
         m_ThreadTokens[victim].Token = token;
+        m_ThreadTokens[victim].PacketGate = FALSE;
         KeReleaseSpinLock(&m_ThreadTokenLock, oldIrql);
     }
 
-    ULONGLONG TakeThreadToken(HANDLE tid)
+    // VIOGPU_PRESENT_GATE_HINT: flag the caller's live stamp.  FALSE = no
+    // stamp to flag (fast-path present whose fence already completed, or the
+    // stamp was displaced) -- the escape reports it so the UMD can fall back
+    // to its CPU wait for that frame.
+    BOOLEAN MarkThreadTokenPacketGate(HANDLE tid)
+    {
+        ULONG home = VioGpuThreadTokenHash(tid);
+        BOOLEAN marked = FALSE;
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&m_ThreadTokenLock, &oldIrql);
+        for (ULONG i = 0; i < VIOGPU_THREAD_TOKEN_PROBE; i++)
+        {
+            ULONG idx = (home + i) & (VIOGPU_THREAD_TOKEN_SLOTS - 1);
+            if (m_ThreadTokens[idx].Tid == tid)
+            {
+                marked = m_ThreadTokens[idx].Token != 0;
+                m_ThreadTokens[idx].PacketGate = marked;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&m_ThreadTokenLock, oldIrql);
+        return marked;
+    }
+
+    ULONGLONG TakeThreadToken(HANDLE tid, BOOLEAN *pPacketGate = NULL)
     {
         ULONG home = VioGpuThreadTokenHash(tid);
         ULONGLONG token = 0;
+        BOOLEAN packetGate = FALSE;
         KIRQL oldIrql;
         KeAcquireSpinLock(&m_ThreadTokenLock, &oldIrql);
         for (ULONG i = 0; i < VIOGPU_THREAD_TOKEN_PROBE; i++)
@@ -453,12 +482,18 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
             if (m_ThreadTokens[idx].Tid == tid)
             {
                 token = m_ThreadTokens[idx].Token;
+                packetGate = m_ThreadTokens[idx].PacketGate;
                 m_ThreadTokens[idx].Tid = NULL;
                 m_ThreadTokens[idx].Token = 0;
+                m_ThreadTokens[idx].PacketGate = FALSE;
                 break;
             }
         }
         KeReleaseSpinLock(&m_ThreadTokenLock, oldIrql);
+        if (pPacketGate != NULL)
+        {
+            *pPacketGate = packetGate;
+        }
         return token;
     }
 
@@ -514,6 +549,34 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
         }
         KeReleaseSpinLock(&m_PresentTokenLock, oldIrql);
     }
+
+    // ---- packet-gated presents (VIOGPU_PRESENT_GATE_HINT) ----------------
+    //
+    // A windowed flip present's empty DMA packet completes on submission
+    // order -- CPU speed -- and that completion is what dxgkrnl, and the
+    // compositor behind it, read as "frame ready".  On real hardware packet
+    // completion IS GPU completion; here the GPU work runs host-side, so an
+    // un-parked packet reports the frame ready while the host GPU is still
+    // rendering it and the compositor samples a half-written backbuffer.
+    // Parking the packet on the frame's present token restores that
+    // equivalence without a CPU wait in the present DDI, so CPU frame N+1
+    // overlaps GPU frame N.  Same deadline discipline as the monitored-fence
+    // gates (GateExpiryDpcRoutine) so a dead host worker degrades instead of
+    // TDR-bugchecking.
+    struct PRESENT_WAIT_CONSUMER
+    {
+        LIST_ENTRY Entry;
+        ULONGLONG Token;
+        void (*Cb)(void *, void *, void *); // VioGpuCommand::QueueRunningCb
+        void *Ctx;
+        ULONGLONG ParkTime; // KeQueryInterruptTime at park
+    };
+    // Park `cb` until `token` retires (immediate when it already has).
+    void PresentWaitConsume(ULONGLONG token, void (*cb)(void *, void *, void *), void *ctx, UINT fenceId);
+    // Fire every parked consumer whose token has retired.  Called after each
+    // PresentTokenRetire (and from the expiry DPC for deadline sweeps).
+    void PresentWaitSweep(void);
+    LIST_ENTRY m_PresentWaitList; // guarded by m_PresentTokenLock
 
     // Per-escape completion context, carried through SubmitCommand to
     // PresentFenceCb.  Allocated from a nonpaged lookaside list: fixed-size,

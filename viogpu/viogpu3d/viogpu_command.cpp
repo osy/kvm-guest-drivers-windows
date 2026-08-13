@@ -370,6 +370,27 @@ void VioGpuCommand::Run()
                     return;
                 }
 
+            case VIOGPU_CMD_PRESENT_WAIT:
+                {
+                    // Packet-gated flip present: park this packet's DMA
+                    // completion until the present-fence token retires at
+                    // real host-GPU completion (KMD-authored body, see
+                    // VioGpuDevice::Present).  Never touches virtio; same
+                    // requeue contract as GATE.
+                    if (cmdHdr->size < sizeof(ULONGLONG))
+                    {
+                        DbgPrint(TRACE_LEVEL_ERROR,
+                                 ("%s fence_id=%d PRESENT_WAIT with short body (%u)\n",
+                                  __FUNCTION__, m_FenceId, cmdHdr->size));
+                        break;
+                    }
+                    ULONGLONG token;
+                    RtlCopyMemory(&token, cmdBody, sizeof(token));
+                    AddPending();
+                    m_pAdapter->PresentWaitConsume(token, VioGpuCommand::QueueRunningCb, this, m_FenceId);
+                    return;
+                }
+
             case VIOGPU_CMD_TRANSFER_TO_HOST:
             case VIOGPU_CMD_TRANSFER_FROM_HOST:
                 {

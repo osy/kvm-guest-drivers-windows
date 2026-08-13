@@ -139,6 +139,19 @@ typedef struct _VIOGPU_ADAPTERINFO
 // (queue::Signal -> SetEventOnCompletion / GetCompletedValue) GPU-true.
 #define VIOGPU_ARM_GATE              0x401
 
+// Mark the calling thread's present-fence stamp (the token the preceding
+// SUBMIT_PRESENT_FENCE escape stamped on this thread) as PACKET-GATED: the
+// flip present that consumes the stamp parks its own DMA packet until the
+// token retires at real host-GPU completion, instead of the UMD blocking
+// the present thread on a CPU wait.  dxgkrnl (and through it the
+// compositor's frame-ready view) keys on the present packet's completion,
+// so parking it restores real-hardware semantics -- packet completion ==
+// GPU completion -- while the app's CPU keeps building the next frame.
+// Returns STATUS_NOT_FOUND when the thread has no stamp (the fence had
+// already completed, or an older KMD): the UMD then falls back to its CPU
+// wait for that frame.  No payload.
+#define VIOGPU_PRESENT_GATE_HINT     0x402
+
 #pragma pack(1)
 typedef struct _VIOGPU_DISP_MODE
 {
@@ -457,6 +470,11 @@ struct _VIOGPU_BLIT_PRESENT
 #define VIOGPU_CMD_GATE               0x9 // Hold DMA completion until the VIOGPU_ARM_GATE
                                           // token (ULONGLONG body) fires -- KMD-internal,
                                           // never reaches virtio
+#define VIOGPU_CMD_PRESENT_WAIT       0xA // Hold DMA completion until the present-fence
+                                          // token (ULONGLONG body) retires -- built BY the
+                                          // KMD for packet-gated flip presents
+                                          // (VIOGPU_PRESENT_GATE_HINT); never reaches
+                                          // virtio and never authored by the UMD
 
 // #define VIOGPU_EXECBUF_FENCE_FD_IN  0x01
 // #define VIOGPU_EXECBUF_FENCE_FD_OUT 0x02
