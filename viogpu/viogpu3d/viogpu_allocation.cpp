@@ -1589,9 +1589,33 @@ NTSTATUS VioGpuAllocation::EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy)
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d\n", __FUNCTION__, m_Id));
 
+    // The busy count only drops when the host worker answers the in-flight
+    // command and the vbuf callback runs UnmarkBusy, so an untimed wait
+    // would strand this thread on a dead host until adapter teardown.  Wait
+    // in 1 s rounds up to 10 s, bail early once the adapter stops, and
+    // report a status the UMD can treat as device-lost.
+    ULONG rounds = 0;
     while (resBusy->Wait && m_busy != 0)
     {
-        KeWaitForSingleObject(&m_busyNotification, UserRequest, KernelMode, FALSE, NULL);
+        if (!m_adapter->IsDriverActive())
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s res_id=%d abandoned: adapter stopped\n", __FUNCTION__, m_Id));
+            resBusy->IsBusy = TRUE;
+            return STATUS_DEVICE_REMOVED;
+        }
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -10LL * 1000 * 1000; // 1 s, relative
+        NTSTATUS waitStatus = KeWaitForSingleObject(&m_busyNotification, UserRequest, KernelMode, FALSE, &timeout);
+        if (waitStatus == STATUS_TIMEOUT && ++rounds >= 10)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s res_id=%d still busy after %u s -- host worker dead? "
+                      "returning DEVICE_HUNG\n",
+                      __FUNCTION__, m_Id, rounds));
+            resBusy->IsBusy = TRUE;
+            return STATUS_DEVICE_HUNG;
+        }
     }
 
     resBusy->IsBusy = m_busy != 0;

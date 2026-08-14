@@ -292,6 +292,9 @@ void VioGpuCommand::Run()
                                   __FUNCTION__,
                                   m_FenceId,
                                   cmdHdr->size));
+                        // A preceding ring submit may have deferred its kick
+                        // to this command; flush before bailing.
+                        m_pAdapter->ctrlQueue.FlushKick();
                         goto end;
                     }
                     RtlCopyMemory(submitCmd, cmdBody, cmdHdr->size);
@@ -309,18 +312,42 @@ void VioGpuCommand::Run()
                         // response DPC auto-releases the vbuf and frees the
                         // body) and complete the packet on its normal
                         // schedule.  Ctrl-queue FIFO keeps host-side order.
+                        //
+                        // Kick batching: when the NEXT command in this body is
+                        // another ring-fenced submit, defer the virtqueue
+                        // notify to it -- one MMIO VM exit covers the run of
+                        // consecutive submits instead of one per command.
+                        // Safe only across this fire-and-forget arm: every
+                        // other command type either kicks itself or parks
+                        // without further virtio traffic, so the run always
+                        // ends in a kicking submit (and QueueBuffer's failure
+                        // paths kick unconditionally).
+                        BOOLEAN nextIsRingSubmit = FALSE;
+                        if ((size_t)(m_pEnd - m_pCommand) >= sizeof(VIOGPU_COMMAND_HDR))
+                        {
+                            const VIOGPU_COMMAND_HDR *nextHdr = (const VIOGPU_COMMAND_HDR *)m_pCommand;
+                            nextIsRingSubmit = nextHdr->type == VIOGPU_CMD_SUBMIT &&
+                                               (nextHdr->flags & VIOGPU_EXECBUF_RING_IDX) != 0 &&
+                                               nextHdr->ring_idx != 0 &&
+                                               nextHdr->size <= (size_t)(m_pEnd - m_pCommand) - sizeof(VIOGPU_COMMAND_HDR);
+                        }
                         if (!m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
                                                                  cmdHdr->size,
                                                                  (cmdHdr->flags & VIOGPU_EXECBUF_VIRGL) != 0 ? m_pDevice->m_Virgl.GetId() : m_pDevice->m_Context.GetId(),
                                                                  TRUE,
                                                                  cmdHdr->ring_idx,
                                                                  NULL,
-                                                                 NULL))
+                                                                 NULL,
+                                                                 /*kick*/ !nextIsRingSubmit))
                         {
                             DbgPrint(TRACE_LEVEL_ERROR,
                                      ("%s fence_id=%d ring submit not queued (size=%u)\n",
                                       __FUNCTION__, m_FenceId, cmdHdr->size));
                             delete[] submitCmd;
+                            // This submit was supposed to carry the deferred
+                            // kick for its predecessors; flush so they are
+                            // not stranded in the avail ring un-notified.
+                            m_pAdapter->ctrlQueue.FlushKick();
                         }
                         break;
                     }

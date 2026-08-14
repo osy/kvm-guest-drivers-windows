@@ -257,6 +257,16 @@ typedef struct _VIOGPU_PRESENT_FENCE_REQ
     VIOGPU_UM_HANDLE EventUM; // UMD auto-reset event the KMD signals from the
                               // completion DPC
     ULONG RingIdx;            // event ring (>= NPT_EVENT_RING_BASE) to carry the fence
+
+    // Optional second event: the APP'S OWN wait event (SetEventOnCompletion
+    // hEvent).  When nonzero and referenceable, the completion DPC KeSetEvents
+    // it directly -- before EventUM -- removing the UMD waiter-thread hop
+    // (KMD DPC -> waiter wake -> SetEvent(app)) from the app's wake path.
+    // EventUM keeps its role as the UMD waiter's bookkeeping wake (token
+    // release).  DirectOk (out) reports whether the KMD took the reference;
+    // when clear the UMD waiter signals the app event itself.
+    VIOGPU_UM_HANDLE AppEventUM;
+    ULONG DirectOk; // out
 } VIOGPU_PRESENT_FENCE_REQ;
 #pragma pack()
 

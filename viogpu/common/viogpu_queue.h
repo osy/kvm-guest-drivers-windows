@@ -224,6 +224,16 @@ class VioGpuQueue
             virtqueue_kick_always(m_pVirtQueue);
         }
     }
+    // Kick under the queue lock: a kick notifies the host of everything
+    // added to the queue before it, so this flushes any buffer a caller
+    // queued with kick=FALSE (see QueueBuffer's batching).
+    void FlushKick()
+    {
+        KIRQL SavedIrql;
+        Lock(&SavedIrql);
+        Kick();
+        Unlock(SavedIrql);
+    }
     bool EnableInterrupt(void)
     {
         return m_pVirtQueue ? virtqueue_enable_cb(m_pVirtQueue) : false;
@@ -269,7 +279,12 @@ class CtrlQueue : public VioGpuQueue
     PVOID AllocCmd(PGPU_VBUFFER *buf, int sz);
     PVOID AllocCmdResp(PGPU_VBUFFER *buf, int cmd_sz, PVOID resp_buf, int resp_sz);
 
-    UINT QueueBuffer(PGPU_VBUFFER buf);
+    // kick=FALSE queues without the MMIO notify (one VM exit per kick);
+    // the caller MUST guarantee a later kick on this queue -- either a
+    // following QueueBuffer(kick=TRUE) or FlushKick() -- before anything
+    // waits on this buffer's response.  Failure paths inside always kick,
+    // so an earlier deferred buffer is never stranded by a failed later one.
+    UINT QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick = TRUE);
     PGPU_VBUFFER DequeueBuffer(_Out_ UINT *len);
 
     void CreateResource(UINT res_id, UINT format, UINT width, UINT height);
@@ -280,7 +295,9 @@ class CtrlQueue : public VioGpuQueue
 
     // FALSE => the command could not be queued (vbuf pool exhausted) and
     // complete_cb will never fire; the caller owns any drop/cleanup.
-    BOOLEAN SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    // kick=FALSE defers the virtqueue notify (see QueueBuffer); the caller
+    // owns issuing a later kick.
+    BOOLEAN SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx, BOOLEAN kick = TRUE);
     BOOLEAN TransferHostCmd(bool to_host,
                             ULONG ctx_id,
                             BOOL has_ring,

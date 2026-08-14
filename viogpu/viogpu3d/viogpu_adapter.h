@@ -430,12 +430,14 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
         KIRQL oldIrql;
         KeAcquireSpinLock(&m_ThreadTokenLock, &oldIrql);
         ULONG victim = home;
+        BOOLEAN displaced = TRUE;
         for (ULONG i = 0; i < VIOGPU_THREAD_TOKEN_PROBE; i++)
         {
             ULONG idx = (home + i) & (VIOGPU_THREAD_TOKEN_SLOTS - 1);
             if (m_ThreadTokens[idx].Tid == tid || m_ThreadTokens[idx].Tid == NULL)
             {
                 victim = idx;
+                displaced = FALSE;
                 break;
             }
         }
@@ -443,6 +445,18 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
         m_ThreadTokens[victim].Token = token;
         m_ThreadTokens[victim].PacketGate = FALSE;
         KeReleaseSpinLock(&m_ThreadTokenLock, oldIrql);
+        if (displaced)
+        {
+            // Another thread's live stamp was overwritten: that thread's
+            // next flip gates on token 0 (always retired) and can scan out
+            // one frame early -- a one-frame flash, never a stall.  Counted
+            // and logged so the artifact is diagnosable.
+            LONG n = InterlockedIncrement(&m_ThreadTokenDisplaced);
+            DbgPrint(TRACE_LEVEL_WARNING,
+                     ("%s: thread-token slot displaced (#%ld, tid=%p) -- "
+                      "victim's next flip runs un-gated\n",
+                      __FUNCTION__, n, tid));
+        }
     }
 
     // VIOGPU_PRESENT_GATE_HINT: flag the caller's live stamp.  FALSE = no
@@ -589,7 +603,10 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     {
         VioGpuAdapter *pAdapter;
         ULONGLONG Token;
-        PKEVENT pEvent; // optional user-mode wake; NULL for kernel-gated flips
+        PKEVENT pEvent;    // optional user-mode wake; NULL for kernel-gated flips
+        PKEVENT pAppEvent; // optional direct app wake (SetEventOnCompletion
+                           // hEvent), signalled from the DPC before pEvent so
+                           // the app never waits out the UMD waiter-thread hop
     };
     NPAGED_LOOKASIDE_LIST m_PresentFenceLookaside;
 
@@ -763,6 +780,9 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
 
     THREAD_TOKEN_SLOT m_ThreadTokens[VIOGPU_THREAD_TOKEN_SLOTS] = {};
     KSPIN_LOCK m_ThreadTokenLock;
+    // Diagnostic: live foreign stamps overwritten by StampThreadToken (each
+    // one is a potential single-frame early scanout on the victim thread).
+    volatile LONG m_ThreadTokenDisplaced = 0;
 
     // Caller holds m_PresentTokenLock.
     BOOLEAN PresentTokenRetiredLocked(ULONGLONG token)

@@ -1655,6 +1655,24 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_INVALID_HANDLE;
                 }
 
+                // Optional direct app wake: reference the app's own
+                // SetEventOnCompletion event so the completion DPC can
+                // KeSetEvent it without the UMD waiter-thread hop.  A failed
+                // reference (handle not an event, wrong rights) is NOT fatal:
+                // DirectOk stays 0 and the UMD waiter signals the app itself.
+                PKEVENT pAppEvent = NULL;
+                pVioGpuEscape->PresentFence.DirectOk = 0;
+                if (pVioGpuEscape->PresentFence.AppEventUM != 0 &&
+                    NT_SUCCESS(ObReferenceObjectByHandle(VioGpuUmHandleValue(pVioGpuEscape->PresentFence.AppEventUM),
+                                                         SYNCHRONIZE | EVENT_MODIFY_STATE,
+                                                         *ExEventObjectType,
+                                                         UserMode,
+                                                         (void **)&pAppEvent,
+                                                         NULL)))
+                {
+                    pVioGpuEscape->PresentFence.DirectOk = 1;
+                }
+
                 PRESENT_FENCE_CTX *pCtx = (PRESENT_FENCE_CTX *)
                     ExAllocateFromNPagedLookasideList(&m_PresentFenceLookaside);
                 if (pCtx == NULL)
@@ -1663,11 +1681,16 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     {
                         ObDereferenceObject(pEvent);
                     }
+                    if (pAppEvent != NULL)
+                    {
+                        ObDereferenceObject(pAppEvent);
+                    }
                     return STATUS_INSUFFICIENT_RESOURCES;
                 }
                 pCtx->pAdapter = this;
                 pCtx->Token = PresentTokenSubmit();
                 pCtx->pEvent = pEvent;
+                pCtx->pAppEvent = pAppEvent;
 
                 // Pair the arm with the flip that follows it on this same
                 // thread (the UMD arms and then presents without switching
@@ -1693,6 +1716,11 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                               __FUNCTION__, pCtx->Token));
                     PresentTokenRetire(pCtx->Token);
                     PresentWaitSweep();
+                    if (pCtx->pAppEvent != NULL)
+                    {
+                        KeSetEvent(pCtx->pAppEvent, IO_NO_INCREMENT, FALSE);
+                        ObDereferenceObject(pCtx->pAppEvent);
+                    }
                     if (pCtx->pEvent != NULL)
                     {
                         KeSetEvent(pCtx->pEvent, IO_NO_INCREMENT, FALSE);
@@ -1784,6 +1812,17 @@ static void PresentFenceCb(void *ctx, void *, void *)
     pAdapter->PresentTokenRetire(pCtx->Token);
     // Release any packet-gated present parked on a now-retired token.
     pAdapter->PresentWaitSweep();
+
+    // Direct app wake first: KeSetEvent on the app's own auto-reset
+    // event from the DPC is exactly SetEventOnCompletion semantics, and
+    // skips the UMD waiter-thread scheduler round trip.  The UMD's own
+    // handle keeps both objects referenced, so the derefs never trigger
+    // deletion at raised IRQL.
+    if (pCtx->pAppEvent != NULL)
+    {
+        KeSetEvent(pCtx->pAppEvent, IO_NO_INCREMENT, FALSE);
+        ObDereferenceObject(pCtx->pAppEvent);
+    }
 
     if (pCtx->pEvent != NULL)
     {

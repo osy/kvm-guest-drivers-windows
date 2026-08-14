@@ -922,7 +922,7 @@ void CtrlQueue::CtxResource(bool attach, UINT ctx_id, UINT res_id)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-BOOLEAN CtrlQueue::SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+BOOLEAN CtrlQueue::SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx, BOOLEAN kick)
 {
     PAGED_CODE();
 
@@ -958,7 +958,7 @@ BOOLEAN CtrlQueue::SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL ha
     vbuf->complete_cb = complete_cb;
     vbuf->complete_ctx = complete_ctx;
 
-    QueueBuffer(vbuf);
+    QueueBuffer(vbuf, kick);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return TRUE;
@@ -1222,7 +1222,7 @@ void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_
 }
 
 #define SGLIST_SIZE 256
-UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
+UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
@@ -1243,6 +1243,9 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
             buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
         if (buf->auto_release)
             ReleaseBuffer(buf);
+        // A previously deferred (kick=FALSE) buffer must not be stranded by
+        // this one's failure.
+        FlushKick();
         return 0;
     }
 
@@ -1272,6 +1275,8 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
                         buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
                     if (buf->auto_release)
                         ReleaseBuffer(buf);
+                    // See the size-guard arm: never strand a deferred buffer.
+                    FlushKick();
                     return 0;
                 }
             }
@@ -1297,7 +1302,14 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf)
 
     Lock(&SavedIrql);
     int rc = AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0);
-    Kick();
+    // Deferred-kick batching (kick=FALSE): the caller queues several buffers
+    // for one DMA body and kicks once at the end -- each kick is an MMIO VM
+    // exit.  On AddBuf failure kick anyway so a previously deferred buffer
+    // is never stranded behind this one's failure.
+    if (kick || rc < 0)
+    {
+        Kick();
+    }
     Unlock(SavedIrql);
 
     if (rc < 0)
