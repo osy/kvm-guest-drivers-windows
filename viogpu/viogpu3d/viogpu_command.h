@@ -75,6 +75,14 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     ~VioGpuCommand();
 
     void Run();
+    // Hand a queued, never-started command back to dxgkrnl at a preempt
+    // ack: it is re-stamped into the packet's private data (undoing the
+    // submit's consume-once) so the resubmission recovers this same object
+    // -- monitored-fence write, oversized-body capture, busy allocations --
+    // and executes it once, in resubmission order.  Nothing is executed
+    // or reported here.  A packet that carried no private data is
+    // fence-only and is simply freed.
+    void Discard();
 
     void PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand);
     void PrepareSubmitVirtual(const DXGKARG_SUBMITCOMMANDVIRTUAL *pSubmitCommand);
@@ -138,6 +146,14 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     UINT m_allocationsLength;
 
     UINT m_FenceId;
+
+  public:
+    UINT FenceId() const
+    {
+        return m_FenceId;
+    }
+
+  private:
     // The node/engine dxgkrnl submitted this DMA buffer on. The
     // DMA_COMPLETED interrupt must report these back unchanged so the
     // scheduler matches the completion to the right engine; reporting a
@@ -176,6 +192,12 @@ class VioGpuCommand final : public HandleBase<"VIOGCOMM"_M, VioGpuCommand>
     PUCHAR m_privBodyCopy;
     SIZE_T m_privBodySize;
 
+    // The packet's private data as seen at submit, kept only so Discard()
+    // can re-stamp this command into it.
+    void *m_pPriv;
+    ULONG m_PrivSize;
+    BOOLEAN m_PrivVirtual;
+
     // Deferred monitored-fence write (see SetMFenceWrite).  Kva NULL = none;
     // Phys is the pin bookkeeping handle (MFenceMapUnpin).
     volatile UINT64 *m_MFenceKva;
@@ -207,6 +229,15 @@ class VioGpuCommander
     VioGpuCommand *DequeueSubmitted();
     void QueueSubmitted(VioGpuCommand *cmd);
 
+    // Preempt request: stop starting queued packets and report the highest
+    // fence id ever dequeued for execution (the preempt target).  Taken
+    // under the queue lock so a dequeue cannot slip between the two.
+    void PreemptHold(UINT *lastDequeued);
+    // Preempt ack: resume, discarding every queued packet with an id at or
+    // below dropThrough (dxgkrnl re-owns and resubmits those); 0 resumes
+    // without discarding.  Callable at DISPATCH (the completion DPC).
+    void PreemptRelease(UINT dropThrough);
+
   private:
     static void ThreadWork(PVOID Context);
     void ThreadWorkRoutine(void);
@@ -223,4 +254,10 @@ class VioGpuCommander
     KSPIN_LOCK m_Lock;
 
     UINT m_running;
+
+    // Under m_Lock.
+    BOOLEAN m_PreemptHold;
+    UINT m_LastDequeuedFenceId;
+    BOOLEAN m_DropActive;
+    UINT m_DropThroughFenceId;
 };

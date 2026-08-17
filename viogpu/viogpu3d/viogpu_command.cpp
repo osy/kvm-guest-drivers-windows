@@ -25,6 +25,9 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
     m_pEnd = NULL;
     m_privBodyCopy = NULL;
     m_privBodySize = 0;
+    m_pPriv = NULL;
+    m_PrivSize = 0;
+    m_PrivVirtual = FALSE;
     m_MFenceKva = NULL;
     m_MFencePhys = 0;
     m_MFenceValue = 0;
@@ -98,6 +101,9 @@ void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
     // VA; a packet with no mirror completes fence-only.
     RecoverMirroredBody(pSubmitCommand->pDmaBufferPrivateData,
                         pSubmitCommand->DmaBufferPrivateDataSize);
+    m_pPriv = pSubmitCommand->pDmaBufferPrivateData;
+    m_PrivSize = pSubmitCommand->DmaBufferPrivateDataSize;
+    m_PrivVirtual = FALSE;
     m_pDevice = VioGpuDevice::FromHandle(pSubmitCommand->hContext);
 
     // Capture the only submit flag we react to. Paging / ContextSwitch /
@@ -160,7 +166,15 @@ void VioGpuCommand::RecoverMirroredBody(const void *pPrivateData, ULONG privateD
     if (haveMirror && priv->bodySize != 0 && priv->bodySize <= VIOGPU_DMA_PRIV_BODY_MAX)
     {
         // m_privBodyCopy is unused for in-window bodies (only oversized
-        // captures populate it at build), so allocating it here is safe.
+        // captures populate it at build), so allocating it here is safe; a
+        // leftover copy is from an earlier submit of this same command
+        // (Discard -> resubmit) and is replaced.
+        if (m_privBodyCopy)
+        {
+            delete[] m_privBodyCopy;
+            m_privBodyCopy = NULL;
+            m_privBodySize = 0;
+        }
         m_privBodyCopy = new (NonPagedPoolNx) UCHAR[priv->bodySize];
         if (m_privBodyCopy)
         {
@@ -206,6 +220,9 @@ void VioGpuCommand::PrepareSubmitVirtual(const DXGKARG_SUBMITCOMMANDVIRTUAL *pSu
     // pointer, so the body rides the private-data mirror.
     RecoverMirroredBody(pSubmitCommand->pDmaBufferPrivateData,
                         pSubmitCommand->DmaBufferPrivateDataSize);
+    m_pPriv = pSubmitCommand->pDmaBufferPrivateData;
+    m_PrivSize = pSubmitCommand->DmaBufferPrivateDataSize;
+    m_PrivVirtual = TRUE;
 
     m_pDevice = VioGpuDevice::FromHandle(pSubmitCommand->hContext);
     m_NullRendering = pSubmitCommand->Flags.NullRendering ? TRUE : FALSE;
@@ -615,6 +632,53 @@ end:
     delete this;
 }
 
+void VioGpuCommand::Discard()
+{
+    PAGED_CODE();
+
+    // The private data outlives this call: dxgkrnl keeps the packet it is
+    // about to resubmit.  A monitored-fence signal must NOT be written
+    // here -- the packets queued ahead of it were handed back too and have
+    // not executed -- it rides along to the resubmission instead.
+    const BOOLEAN virt = m_PrivVirtual && m_PrivSize >= sizeof(VIOGPU_DMA_PRIVATE) &&
+                         ((VIOGPU_DMA_PRIVATE *)m_pPriv)->magic == VIOGPU_DMA_PRIV_MAGIC;
+    const BOOLEAN legacy = !m_PrivVirtual && m_PrivSize >= sizeof(void *);
+    if (m_pPriv && (virt || legacy))
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<---> %s fence_id=%d re-owned by dxgkrnl at preempt ack; parked for resubmission\n",
+                  __FUNCTION__, m_FenceId));
+        if (virt)
+        {
+            ((VIOGPU_DMA_PRIVATE *)m_pPriv)->cmd = ToHandle();
+        }
+        else
+        {
+            *(void **)m_pPriv = ToHandle();
+        }
+        return;
+    }
+
+    // No private data: nothing was recovered from the packet (fence-only)
+    // and nothing needs to survive to the resubmission.
+    DbgPrint(TRACE_LEVEL_ERROR,
+             ("<---> %s fence_id=%d re-owned by dxgkrnl at preempt ack; fence-only, freed\n",
+              __FUNCTION__, m_FenceId));
+    if (m_allocations)
+    {
+        for (UINT i = 0; i < m_allocationsLength; i++)
+        {
+            if (m_allocations[i])
+            {
+                m_allocations[i]->UnmarkBusy();
+            }
+        }
+        delete m_allocations;
+        m_allocations = NULL;
+    }
+    delete this;
+}
+
 template <typename T> NTSTATUS VioGpuCommand::AttachAllocations(T *allocations, UINT allocationListLength)
 {
     PAGED_CODE();
@@ -740,6 +804,10 @@ VioGpuCommander::VioGpuCommander(VioGpuAdapter *pAdapter)
     KeInitializeSpinLock(&m_Lock);
 
     m_running = 0;
+    m_PreemptHold = FALSE;
+    m_LastDequeuedFenceId = 0;
+    m_DropActive = FALSE;
+    m_DropThroughFenceId = 0;
 }
 
 NTSTATUS VioGpuCommander::Start()
@@ -848,10 +916,33 @@ void VioGpuCommander::ThreadWorkRoutine(void)
 
         while (m_running < VIOGPU_MAX_RUNNING)
         {
-            VioGpuCommand *command = DequeueSubmitted();
+            VioGpuCommand *command = NULL;
+            BOOLEAN drop = FALSE;
+            KIRQL oldIrql;
+            LockQueue(&oldIrql);
+            if (!m_PreemptHold && !IsListEmpty(&m_SubmittedQueue))
+            {
+                command = CONTAINING_RECORD(RemoveHeadList(&m_SubmittedQueue), VioGpuCommand, list_entry);
+                if (m_DropActive && (LONG)(command->FenceId() - m_DropThroughFenceId) <= 0)
+                {
+                    drop = TRUE;
+                }
+                else
+                {
+                    // Every id dxgkrnl re-owned is behind this one now.
+                    m_DropActive = FALSE;
+                    m_LastDequeuedFenceId = command->FenceId();
+                }
+            }
+            UnlockQueue(oldIrql);
             if (command == NULL)
             {
                 break;
+            }
+            if (drop)
+            {
+                command->Discard();
+                continue;
             }
             QueueRunning(command);
             m_running++;
@@ -876,6 +967,27 @@ void VioGpuCommander::CommandFinished()
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
 
     m_running--;
+    KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
+}
+
+void VioGpuCommander::PreemptHold(UINT *lastDequeued)
+{
+    KIRQL oldIrql;
+    LockQueue(&oldIrql);
+    m_PreemptHold = TRUE;
+    *lastDequeued = m_LastDequeuedFenceId;
+    UnlockQueue(oldIrql);
+}
+
+void VioGpuCommander::PreemptRelease(UINT dropThrough)
+{
+    KIRQL oldIrql;
+    LockQueue(&oldIrql);
+    m_PreemptHold = FALSE;
+    // 0 is never a submission id: it means "resume, drop nothing".
+    m_DropActive = dropThrough != 0;
+    m_DropThroughFenceId = dropThrough;
+    UnlockQueue(oldIrql);
     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
 }
 

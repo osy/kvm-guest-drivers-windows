@@ -301,13 +301,28 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     volatile LONG m_LastCompletedFenceId;
     volatile LONG m_LastSubmittedFenceId;
 
-    // Fences the preempt-ack declared preempted: everything submitted but
-    // not yet completed at ack time.  dxgkrnl re-owns those packets after
-    // DMA_PREEMPTED (it resubmits them with NEWER fence ids), so their
-    // eventual host completions must NOT raise DMA_COMPLETED with the
-    // original id -- reporting an id past the acknowledged watermark is
-    // an invalid fence report and bugchecks 0x119 arg1=1.
+    // Fences dxgkrnl re-owned at a preempt ack or an engine reset: it
+    // resubmits (or aborts) those packets under NEWER ids, so a stray
+    // completion carrying an original id must NOT raise DMA_COMPLETED --
+    // reporting an id past the acknowledged watermark is an invalid fence
+    // report and bugchecks 0x119 arg1=1.
     volatile LONG m_PreemptSkipThroughFenceId;
+
+    // Pending preempt request (interrupt-lock domain).  The engine cannot
+    // preempt a packet the commander has already started -- its body has
+    // been handed to the host and will execute -- so a preempt is acked only
+    // once the completion watermark reaches PreemptTargetFenceId, the last
+    // id dequeued for execution when the request arrived.  Packets behind
+    // it never start (the commander is held) and are the ones dxgkrnl
+    // resubmits.  Acking earlier declares executed packets preempted, and
+    // dxgkrnl then submits their bodies a second time (a CREATE_RING twice
+    // for one blob kills the host context; a MAP/UNMAP twice, a present
+    // twice, ...).
+    BOOLEAN m_PreemptPending;
+    UINT m_PreemptFenceId;
+    UINT m_PreemptNode;
+    UINT m_PreemptEngine;
+    UINT m_PreemptTargetFenceId;
 
     // {advance m_LastCompletedFenceId + raise DMA_COMPLETED} and {read
     // watermark + set skip-window + raise DMA_PREEMPTED} must be mutually
@@ -318,6 +333,8 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     // interrupt lock instead -- both operations run inside a
     // SynchronizeExecution routine.
     BOOLEAN ReportDmaCompleted(UINT fenceId, UINT node, UINT engine);
+    // Record the request; acks immediately when nothing is executing, else
+    // the ack rides the completion that reaches the target.
     void ReportDmaPreempted(UINT preemptFenceId, UINT node, UINT engine);
 
     // Retire a packet's fence without executing it.  The submission DDIs

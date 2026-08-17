@@ -76,8 +76,14 @@ struct FENCE_REPORT_CONTEXT
     UINT Node;
     UINT Engine;
     BOOLEAN Raised;
-    // Preempt ack: deferred monitored-fence writes dropped from the
-    // defer list (dxgkrnl resubmits their packets); the caller completes
+    // Set when this call acked a pending preempt: the caller releases the
+    // commander, which discards queued packets with ids <= DropThrough.
+    BOOLEAN PreemptAcked;
+    UINT DropThrough;
+    // Preempt request: the highest fence id the commander has started.
+    UINT PreemptTarget;
+    // Engine reset: deferred monitored-fence writes dropped from the
+    // defer list (dxgkrnl re-owns their packets); the caller completes
     // them without writing.
     LIST_ENTRY Dropped;
     // Completed path: deferred monitored-fence writes the advanced
@@ -86,6 +92,7 @@ struct FENCE_REPORT_CONTEXT
 };
 
 static void MFenceDeferWriteReadyLocked(VioGpuAdapter *a, LIST_ENTRY *done);
+static void PreemptAckLocked(VioGpuAdapter *a, FENCE_REPORT_CONTEXT *ctx);
 
 static BOOLEAN ReportCompletedSyncRoutine(PVOID ctx_void)
 {
@@ -161,61 +168,74 @@ static BOOLEAN ReportCompletedSyncRoutine(PVOID ctx_void)
     dxgk->DxgkCbNotifyInterrupt(dxgk->DeviceHandle, &interrupt);
     dxgk->DxgkCbQueueDpc(dxgk->DeviceHandle);
     ctx->Raised = TRUE;
+
+    // The last packet the commander started has now completed: everything
+    // still queued is preemptible.
+    if (a->m_PreemptPending &&
+        (LONG)((UINT)a->m_LastCompletedFenceId - a->m_PreemptTargetFenceId) >= 0)
+    {
+        PreemptAckLocked(a, ctx);
+    }
     return TRUE;
+}
+
+// Ack the pending preempt.  Interrupt lock held; the watermark has reached
+// the target, so every id at or below it has executed and completed and
+// every id above it is queued unstarted -- those are what dxgkrnl re-owns
+// and resubmits under newer ids.  Report the true watermark, then jump the
+// contiguity window past everything submitted so the re-owned ids (which
+// never complete under their original numbers) cannot pin it, and squash
+// any stray original-id completion.
+static void PreemptAckLocked(VioGpuAdapter *a, FENCE_REPORT_CONTEXT *ctx)
+{
+    DXGKRNL_INTERFACE *dxgk = ctx->pDxgk;
+    const UINT lastCompleted = (UINT)a->m_LastCompletedFenceId;
+    const UINT lastSubmitted = (UINT)a->m_LastSubmittedFenceId;
+
+    a->m_PreemptPending = FALSE;
+    a->m_PreemptSkipThroughFenceId = (LONG)lastSubmitted;
+    RtlZeroMemory(a->m_Win, sizeof(a->m_Win));
+    if ((LONG)(lastSubmitted - a->m_WinBase) > 0)
+    {
+        a->m_WinBase = lastSubmitted;
+    }
+    if ((LONG)(a->m_WinBase - (UINT)a->m_LastCompletedFenceId) > 0)
+    {
+        a->m_LastCompletedFenceId = (LONG)a->m_WinBase;
+    }
+    // Nothing above the target ever ran, so no deferred write is newer than
+    // the watermark; this only publishes leftovers of the completed set.
+    MFenceDeferWriteReadyLocked(a, &ctx->Ready);
+
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
+    interrupt.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
+    interrupt.DmaPreempted.PreemptionFenceId = a->m_PreemptFenceId;
+    interrupt.DmaPreempted.LastCompletedFenceId = lastCompleted;
+    interrupt.DmaPreempted.NodeOrdinal = a->m_PreemptNode;
+    interrupt.DmaPreempted.EngineOrdinal = a->m_PreemptEngine;
+    dxgk->DxgkCbNotifyInterrupt(dxgk->DeviceHandle, &interrupt);
+    dxgk->DxgkCbQueueDpc(dxgk->DeviceHandle);
+    ctx->PreemptAcked = TRUE;
+    ctx->DropThrough = lastSubmitted;
 }
 
 static BOOLEAN ReportPreemptedSyncRoutine(PVOID ctx_void)
 {
     FENCE_REPORT_CONTEXT *ctx = (FENCE_REPORT_CONTEXT *)ctx_void;
     VioGpuAdapter *a = ctx->pAdapter;
-    DXGKRNL_INTERFACE *dxgk = ctx->pDxgk;
 
-    // dxgkrnl defines DmaPreempted.LastCompletedFenceId as the last id the
-    // GPU finished BEFORE the preemption, so report the watermark as it
-    // stands and advance it afterwards.
-    const UINT lastCompleted = (UINT)a->m_LastCompletedFenceId;
+    a->m_PreemptPending = TRUE;
+    a->m_PreemptFenceId = ctx->FenceId;
+    a->m_PreemptNode = ctx->Node;
+    a->m_PreemptEngine = ctx->Engine;
+    a->m_PreemptTargetFenceId = ctx->PreemptTarget;
 
-    // Everything submitted but not completed is declared preempted;
-    // squash their original-id completions from here on (dxgkrnl
-    // resubmits them under newer ids).
-    a->m_PreemptSkipThroughFenceId = a->m_LastSubmittedFenceId;
-
-    // Parked gate packets are in the acked window too: dxgkrnl re-owns and
-    // resubmits them (the resubmission re-parks on the same token), and
-    // everything deferred behind them is <= skipThrough -- squashed.  Clear
-    // the hold state so the stale ids can't pin the watermark forever.
-    RtlZeroMemory(a->m_Win, sizeof(a->m_Win));
-    if ((LONG)((UINT)a->m_PreemptSkipThroughFenceId - a->m_WinBase) > 0)
+    if ((LONG)((UINT)a->m_LastCompletedFenceId - a->m_PreemptTargetFenceId) >= 0)
     {
-        a->m_WinBase = (UINT)a->m_PreemptSkipThroughFenceId;
+        // Nothing executing: ack now.
+        PreemptAckLocked(a, ctx);
     }
-    // m_WinBase and m_LastCompletedFenceId are one watermark expressed twice,
-    // and the deferred monitored-fence gate keys on the latter: leaving it
-    // behind makes MFenceDeferReadyLocked unsatisfiable
-    // for the first id dxgkrnl resubmits, which parks that packet forever and
-    // pins the window base it would have advanced.
-    if ((LONG)(a->m_WinBase - (UINT)a->m_LastCompletedFenceId) > 0)
-    {
-        a->m_LastCompletedFenceId = (LONG)a->m_WinBase;
-    }
-
-    // Parked monitored-fence writes are re-owned too: drop them without
-    // writing (the resubmitted paging packet re-executes the write); the
-    // caller completes their packets so the commander drains.
-    while (!IsListEmpty(&a->m_MFenceDeferList))
-    {
-        InsertTailList(&ctx->Dropped, RemoveHeadList(&a->m_MFenceDeferList));
-    }
-
-    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
-    interrupt.InterruptType = DXGK_INTERRUPT_DMA_PREEMPTED;
-    interrupt.DmaPreempted.PreemptionFenceId = ctx->FenceId;
-    interrupt.DmaPreempted.LastCompletedFenceId = lastCompleted;
-    interrupt.DmaPreempted.NodeOrdinal = ctx->Node;
-    interrupt.DmaPreempted.EngineOrdinal = ctx->Engine;
-    dxgk->DxgkCbNotifyInterrupt(dxgk->DeviceHandle, &interrupt);
-    dxgk->DxgkCbQueueDpc(dxgk->DeviceHandle);
-    ctx->Raised = TRUE;
+    ctx->Raised = ctx->PreemptAcked;
     return TRUE;
 }
 
@@ -233,6 +253,15 @@ static BOOLEAN ResetFenceStateSyncRoutine(PVOID ctx_void)
     RtlZeroMemory(a->m_Win, sizeof(a->m_Win));
     a->m_WinBase = (UINT)a->m_LastSubmittedFenceId;
     a->m_LastCompletedFenceId = a->m_LastSubmittedFenceId;
+    // A preempt still pending is moot: dxgkrnl reset the engine instead of
+    // waiting for the ack.  Nothing is dropped -- everything queued reads as
+    // aborted-and-complete to dxgkrnl and executes as before.
+    if (a->m_PreemptPending)
+    {
+        a->m_PreemptPending = FALSE;
+        ctx->PreemptAcked = TRUE;
+        ctx->DropThrough = 0;
+    }
 
     // Deferred monitored-fence writes belong to packets dxgkrnl re-owns:
     // drop them without writing, exactly as the preempt path does.  The
@@ -257,6 +286,12 @@ UINT VioGpuAdapter::ResetFenceStateFromTimeout(void)
     BOOLEAN bRet;
     m_DxgkInterface.DxgkCbSynchronizeExecution(m_DxgkInterface.DeviceHandle,
                                                ResetFenceStateSyncRoutine, &ctx, 0, &bRet);
+    if (ctx.PreemptAcked)
+    {
+        // Resume the held commander; DropThrough 0 discards nothing (id 0
+        // is never a submission).
+        commander.PreemptRelease(0);
+    }
     while (!IsListEmpty(&ctx.Dropped))
     {
         MFENCE_DEFER *d = CONTAINING_RECORD(RemoveHeadList(&ctx.Dropped), MFENCE_DEFER, Entry);
@@ -287,27 +322,53 @@ BOOLEAN VioGpuAdapter::ReportDmaCompleted(UINT fenceId, UINT node, UINT engine)
         MFenceMapUnpin(d->Phys);
         delete d;
     }
+    if (ctx.PreemptAcked)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<---> %s preempt fence %u ACKED at completed=%u (re-owned through %u)\n",
+                  __FUNCTION__, m_PreemptFenceId, fenceId, ctx.DropThrough));
+        commander.PreemptRelease(ctx.DropThrough);
+    }
     return ctx.Raised;
 }
 
 void VioGpuAdapter::ReportDmaPreempted(UINT preemptFenceId, UINT node, UINT engine)
 {
+    // Hold the commander first, so no further packet starts executing
+    // after the target is read.
+    UINT target = 0;
+    commander.PreemptHold(&target);
+
     FENCE_REPORT_CONTEXT ctx = {};
     ctx.pAdapter = this;
     ctx.pDxgk = &m_DxgkInterface;
     ctx.FenceId = preemptFenceId;
     ctx.Node = node;
     ctx.Engine = engine;
+    ctx.PreemptTarget = target;
     InitializeListHead(&ctx.Dropped);
     InitializeListHead(&ctx.Ready);
     BOOLEAN bRet;
     m_DxgkInterface.DxgkCbSynchronizeExecution(m_DxgkInterface.DeviceHandle,
                                                ReportPreemptedSyncRoutine, &ctx, 0, &bRet);
-    while (!IsListEmpty(&ctx.Dropped))
+    while (!IsListEmpty(&ctx.Ready))
     {
-        MFENCE_DEFER *d = CONTAINING_RECORD(RemoveHeadList(&ctx.Dropped), MFENCE_DEFER, Entry);
-        MFenceMapUnpin(d->Phys); // dropped unwritten: dxgkrnl re-owns the packet
+        MFENCE_DEFER *d = CONTAINING_RECORD(RemoveHeadList(&ctx.Ready), MFENCE_DEFER, Entry);
+        MFenceMapUnpin(d->Phys);
         delete d;
+    }
+    if (ctx.PreemptAcked)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<---> %s preempt fence %u ACKED immediately (idle; re-owned through %u)\n",
+                  __FUNCTION__, preemptFenceId, ctx.DropThrough));
+        commander.PreemptRelease(ctx.DropThrough);
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<---> %s preempt fence %u PENDING until fence %u completes\n",
+                  __FUNCTION__, preemptFenceId, target));
     }
 }
 
@@ -370,6 +431,11 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     m_LastCompletedFenceId = 0;
     m_PreemptSkipThroughFenceId = 0;
     m_LastSubmittedFenceId = 0;
+    m_PreemptPending = FALSE;
+    m_PreemptFenceId = 0;
+    m_PreemptNode = 0;
+    m_PreemptEngine = 0;
+    m_PreemptTargetFenceId = 0;
     KeInitializeEvent(&m_ConfigUpdateEvent, SynchronizationEvent, FALSE);
     m_bStopWorkThread = FALSE;
     m_pWorkThread = NULL;

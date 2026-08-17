@@ -847,6 +847,9 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
                     pBuildPagingBuffer->DmaBufferPrivateDataSize < sizeof(void *) || slotTaken)
                 {
                     // No side-band to reach the submit phase.
+                    DbgPrint(TRACE_LEVEL_WARNING,
+                             ("<--- %s monitored-fence signal va=0x%llx val=%llu written EARLY (%s)\n",
+                              __FUNCTION__, fenceVa, fenceVal, slotTaken ? "stamp slot taken" : "no private data"));
                     pAdapter->MFenceWrite(phys, fenceVal);
                     return STATUS_SUCCESS;
                 }
@@ -1676,24 +1679,20 @@ VioGpu3DDdiPreemptCommand(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PREEMPT
     }
 
     // SchedulingCaps.PreemptionAware=1 lets dxgkrnl request engine
-    // preemption.  The engine cannot actually preempt (PreemptionCaps
-    // granularity is NONE), and the host executes everything submitted, so
-    // any command dxgkrnl believes is in flight has effectively completed.
-    // WDDM requires acknowledging the request by raising
-    // DXGK_INTERRUPT_DMA_PREEMPTED with the preemption fence id and the
-    // latest completed fence id; without it the GPU scheduler waits on the
-    // preempt forever and declares a hardware hang (TDR).
+    // preemption; PreemptionCaps granularity NONE means it happens only at
+    // packet boundaries.  A packet the commander has started is not
+    // preemptible -- its body is already on the host and will execute -- so
+    // the ack (DXGK_INTERRUPT_DMA_PREEMPTED with the true completed
+    // watermark) is raised once that packet completes, and only the queued
+    // packets behind it are handed back for resubmission.  Without the ack
+    // the scheduler waits forever and declares a hardware hang (TDR).
     VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
 
     DbgPrint(TRACE_LEVEL_ERROR,
-             ("<---> %s PreemptionFenceId=%d node=%u engine=%u -> notify DMA_PREEMPTED\n",
+             ("<---> %s PreemptionFenceId=%d node=%u engine=%u\n",
               __FUNCTION__, pPreemptCommand->PreemptionFenceId,
               pPreemptCommand->NodeOrdinal, pPreemptCommand->EngineOrdinal));
 
-    // Ack under the interrupt lock (ReportDmaPreempted): atomically reads
-    // the completed watermark, declares everything submitted-but-uncompleted
-    // preempted (their original-id completions get squashed; dxgkrnl
-    // resubmits them under newer ids), and raises DMA_PREEMPTED.
     pAdapter->ReportDmaPreempted(pPreemptCommand->PreemptionFenceId,
                                  pPreemptCommand->NodeOrdinal,
                                  pPreemptCommand->EngineOrdinal);
