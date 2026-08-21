@@ -103,6 +103,9 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
  * priority so VidMm won't DISCARD their backing under VRAM pressure (a discard
  * zeroes the guest mapping -> ring wedge). */
 #define VIOGPU_BLOB_FLAG_PINNED           0x0008
+// See wddm_hw.h: a blob that names no host resource, created only so its
+// D3D12 resource owns a kernel allocation.
+#define VIOGPU_BLOB_FLAG_RESIDENCY_ONLY   0x0010
 
     inline BOOL IsCoherent() const
     {

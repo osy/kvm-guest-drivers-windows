@@ -30,7 +30,13 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s BLOB\n", __FUNCTION__));
 
     m_adapter = adapter;
-    m_Id = m_adapter->resourceIdr.GetId();
+    // A residency-only blob names no host resource: minting a res_id would
+    // burn the id space at one id per D3D12 resource and then unref an id the
+    // host never created.  Born "Created" so Open() never issues
+    // RESOURCE_CREATE_BLOB either.
+    const BOOLEAN residencyOnly =
+        !!(options->blob_flags & VIOGPU_BLOB_FLAG_RESIDENCY_ONLY);
+    m_Id = residencyOnly ? 0 : m_adapter->resourceIdr.GetId();
     m_IsImport = FALSE;
     m_IsPrimary = FALSE;
     m_IsShared = FALSE;
@@ -39,7 +45,7 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_
     // TODO: find a way to make valid
     // Probably via escape or something
     m_Blob.InfoValid = FALSE;
-    m_Blob.Created = FALSE;
+    m_Blob.Created = residencyOnly ? TRUE : FALSE;
     m_Size = size;
     m_IsBlob = TRUE;
     m_Blob.Mapped = FALSE;
@@ -491,6 +497,12 @@ VioGpuAllocation::~VioGpuAllocation(void)
         // was already cleared above, detaching the id from this device's context.
         DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s IMPORT res_id=%d: skip DestroyResource (not owner)\n", __FUNCTION__, m_Id));
     }
+    else if (m_Id == 0)
+    {
+        // Residency-only blob: no res_id was minted and no host resource was
+        // created, so RESOURCE_UNREF would be rejected INVALID_RESOURCE_ID
+        // once per resource.
+    }
     else
     {
         m_adapter->ctrlQueue.DestroyResource(m_Id, NotifyResourceDestroyed, &m_adapter->resourceIdr);
@@ -533,6 +545,17 @@ BOOLEAN VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t page
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d, IsBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));
 
     auto lock_guard = LockGuard();
+
+    if (m_Id == 0)
+    {
+        // Residency-only blob: no host resource to attach pages to.  Record
+        // the MDL so DetachBacking stays symmetric.
+        m_pMDL = pMDL;
+        m_pageCount = pageCount;
+        m_pageOffset = pageOffset;
+        m_BackingAttached = TRUE;
+        return TRUE;
+    }
 
     m_pMDL = pMDL;
     m_pageCount = pageCount;
@@ -579,6 +602,14 @@ void VioGpuAllocation::DetachBacking()
         return;
     }
     m_BackingAttached = FALSE;
+
+    if (m_Id == 0)
+    {
+        // Residency-only blob: the attach recorded state only, so there is
+        // no host backing to detach.
+        DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s residency-only\n", __FUNCTION__));
+        return;
+    }
 
     m_adapter->ctrlQueue.DetachBacking(m_Id);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
