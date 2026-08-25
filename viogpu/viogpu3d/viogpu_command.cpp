@@ -897,9 +897,17 @@ void VioGpuCommander::ThreadWork(PVOID Context)
     pdev->ThreadWorkRoutine();
 }
 
+PAGED_CODE_SEG_END
+
+#pragma code_seg(push)
+#pragma code_seg()
+
+/* Must stay resident even though it is entered at PASSIVE_LEVEL: the
+ * dequeue loop executes between LockQueue and UnlockQueue, i.e. at
+ * DISPATCH_LEVEL, where an instruction fetch from a paged-out page is
+ * bugcheck 0xD1 (EXECUTE) rather than a fault the system can service. */
 void VioGpuCommander::ThreadWorkRoutine(void)
 {
-    PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
 
     KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
@@ -961,6 +969,10 @@ void VioGpuCommander::ThreadWorkRoutine(void)
     }
 }
 
+#pragma code_seg(pop)
+
+PAGED_CODE_SEG_BEGIN
+
 void VioGpuCommander::CommandFinished()
 {
     PAGED_CODE();
@@ -970,6 +982,14 @@ void VioGpuCommander::CommandFinished()
     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
 }
 
+PAGED_CODE_SEG_END
+
+#pragma code_seg(push)
+#pragma code_seg()
+
+/* Both entered at DISPATCH_LEVEL, so neither may be pageable:
+ * PreemptHold from DxgkDdiPreemptCommand (documented DISPATCH_LEVEL),
+ * PreemptRelease from ReportDmaCompleted inside the response DPC. */
 void VioGpuCommander::PreemptHold(UINT *lastDequeued)
 {
     KIRQL oldIrql;
@@ -990,6 +1010,10 @@ void VioGpuCommander::PreemptRelease(UINT dropThrough)
     UnlockQueue(oldIrql);
     KeSetEvent(&m_QueueEvent, IO_NO_INCREMENT, FALSE);
 }
+
+#pragma code_seg(pop)
+
+PAGED_CODE_SEG_BEGIN
 
 NTSTATUS VioGpuCommander::Patch(const DXGKARG_PATCH *pPatch)
 {
@@ -1020,12 +1044,12 @@ NTSTATUS VioGpuCommander::Patch(const DXGKARG_PATCH *pPatch)
             // on one BAR offset, so each guest window aliases foreign
             // memory.
             //
-            // The test is the allocation CLASS, not IsKmdShmemPlaced(): this
-            // runs at DISPATCH_LEVEL and cannot take the allocation lock the
-            // escape holds, so testing the latch would still let a Patch that
-            // read it as clear overwrite the offset the escape is publishing.
-            // Every blob the escape places is mappable, so
-            // declining the whole class leaves no writer to race.
+            // The test is the allocation CLASS, not IsKmdShmemPlaced():
+            // Patch does not take the allocation lock the escape holds, so
+            // testing the latch would still let a Patch that read it as
+            // clear overwrite the offset the escape is publishing.  Every
+            // blob the escape places is mappable, so declining the whole
+            // class leaves no writer to race.
             if (allocation->IsMappable())
             {
                 ULONGLONG vidmmOff = allocList->PhysicalAddress.QuadPart - VioGpuAdapter::SHMEM_GPU_BASE_VA;

@@ -1034,15 +1034,13 @@ VioGpu3DReleaseSwizzlingRange(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_REL
 }
 #endif
 
-// DxgkDdiPatch / DxgkDdiSubmitCommand run at DISPATCH_LEVEL and must be
-// nonpageable: in the PAGE section they page out under memory pressure and
-// the next submission bugchecks D1 (EXECUTE fault at IRQL 2).
-#pragma code_seg(push)
-#pragma code_seg()
+// DxgkDdiPatch is documented at PASSIVE_LEVEL and pageable; PAGED_CODE()
+// is the tripwire in case dxgmms2 ever calls it higher than that.
 NTSTATUS
 APIENTRY
 VioGpu3DPatch(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PATCH *pPatch)
 {
+    PAGED_CODE();
 
     VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
     VIOGPU_ASSERT_CHK(pAdapter != NULL);
@@ -1059,6 +1057,11 @@ VioGpu3DPatch(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_PATCH *pPatch)
     return pAdapter->commander.Patch(pPatch);
 };
 
+// DxgkDdiSubmitCommand runs at DISPATCH_LEVEL and must be nonpageable: in
+// the PAGE section it pages out under memory pressure and the next
+// submission bugchecks D1 (EXECUTE fault at IRQL 2).
+#pragma code_seg(push)
+#pragma code_seg()
 _IRQL_requires_(DISPATCH_LEVEL)
 NTSTATUS
 APIENTRY
