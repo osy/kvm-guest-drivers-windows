@@ -1084,6 +1084,70 @@ BOOLEAN CtrlQueue::ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_c
     return TRUE;
 }
 
+// Unmap a blob's hostmem mapping and WAIT for the host to acknowledge it.
+// The plain ResourceUnmapBlob only queues: a full virtqueue silently fires
+// the completion callback without any host round trip, and the caller
+// cannot tell.  Recycling a BAR window is only safe once the host has
+// actually detached the old mapping -- otherwise the next blob mapped at
+// the same offset aliases the stale one -- so the release-window escape
+// uses this variant and keeps the window on any failure.
+BOOLEAN CtrlQueue::ResourceUnmapBlobSync(UINT res_id, UINT ctx_id)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_UNMAP_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_UNMAP_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr /*[0]*/);
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    if (QueueBuffer(vbuf) == (UINT)-1)
+    {
+        // Never reached the host; the callback already fired.
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_UNSUCCESSFUL);
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000); // 10 s
+    NTSTATUS status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out res_id=%u\n", __FUNCTION__, res_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+    ReleaseBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
+}
+
 PAGED_CODE_SEG_END
 
 void CtrlQueue::DestroyResource(UINT res_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)

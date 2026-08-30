@@ -202,6 +202,7 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     NTSTATUS UnmapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildPagingBuffer);
 
     NTSTATUS EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo);
+    NTSTATUS EscapeReleaseWindow(VioGpuDevice *pDevice);
     NTSTATUS EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy);
 
     VOID CreateBlob(UINT ctx_id);

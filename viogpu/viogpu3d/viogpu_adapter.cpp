@@ -1562,6 +1562,66 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
 
                 break;
             }
+        case VIOGPU_SHMEM_INFO:
+            {
+                size = sizeof(VIOGPU_SHMEM_INFO_REQ);
+                if (pVioGpuEscape->DataLength < size)
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR,
+                             ("%s buffer too small %d, should be at least %d\n",
+                              __FUNCTION__,
+                              pVioGpuEscape->DataLength,
+                              size));
+                    return STATUS_INVALID_BUFFER_SIZE;
+                }
+                KIRQL irql;
+                KeAcquireSpinLock(&m_PendingCreateLock, &irql);
+                pVioGpuEscape->ShmemInfo.TotalBytes = m_VioDev.shmem.available ? m_VioDev.shmem.length : 0;
+                pVioGpuEscape->ShmemInfo.UsedBytes = (ULONGLONG)m_ShmemUsedPages << PAGE_SHIFT;
+                KeReleaseSpinLock(&m_PendingCreateLock, irql);
+                break;
+            }
+        case VIOGPU_RES_RELEASE_WINDOW:
+            {
+                size = sizeof(VIOGPU_RES_RELEASE_REQ);
+                if (pVioGpuEscape->DataLength < size)
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR,
+                             ("%s buffer too small %d, should be at least %d\n",
+                              __FUNCTION__,
+                              pVioGpuEscape->DataLength,
+                              size));
+                    return STATUS_INVALID_BUFFER_SIZE;
+                }
+                // Cookie-first resolution and the open-on-device check,
+                // exactly as RES_INFO: this escape tears down the caller's
+                // mapping of the blob's BAR window.
+                VioGpuAllocation *allocation = NULL;
+                if (pVioGpuEscape->ResRelease.LookupCookie != 0)
+                {
+                    allocation = CookieMapLookup(pVioGpuEscape->ResRelease.LookupCookie);
+                }
+                if (allocation == NULL)
+                {
+                    allocation = AllocationFromHandle(pVioGpuEscape->ResRelease.ResHandle);
+                }
+                if (allocation == NULL)
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR, ("%s RES_RELEASE invalid handle %x\n", __FUNCTION__,
+                                                 pVioGpuEscape->ResRelease.ResHandle));
+                    return STATUS_INVALID_PARAMETER;
+                }
+                VioGpuDevice *pRelDevice = VioGpuDevice::FromHandle(pEscape->hDevice);
+                if (!allocation->IsOpenOn(pRelDevice))
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR,
+                             ("%s RES_RELEASE res_id=%d not open on device %p\n",
+                              __FUNCTION__, allocation->GetId(), pRelDevice));
+                    return STATUS_ACCESS_DENIED;
+                }
+                status = allocation->EscapeReleaseWindow(pRelDevice);
+                break;
+            }
         case VIOGPU_RES_BUSY:
             {
                 size = sizeof(VIOGPU_RES_BUSY_REQ);
@@ -3918,6 +3978,10 @@ ULONGLONG VioGpuAdapter::ShmemAlloc(SIZE_T size)
     {
         index = RtlFindClearBitsAndSet(&m_ShmemBitmap, pages, 0);
     }
+    if (index != 0xFFFFFFFF)
+    {
+        m_ShmemUsedPages += pages;
+    }
     KeReleaseSpinLock(&m_PendingCreateLock, irql);
     if (index == 0xFFFFFFFF)
     {
@@ -3940,6 +4004,7 @@ VOID VioGpuAdapter::ShmemFree(ULONGLONG offset, SIZE_T size)
     if (m_ShmemBitmapBuffer != NULL && index + pages <= m_ShmemPageCount)
     {
         RtlClearBits(&m_ShmemBitmap, index, pages);
+        m_ShmemUsedPages -= min(pages, m_ShmemUsedPages);
     }
     KeReleaseSpinLock(&m_PendingCreateLock, irql);
 }

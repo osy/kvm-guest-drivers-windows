@@ -289,6 +289,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     RTL_BITMAP m_ShmemBitmap;
     PULONG m_ShmemBitmapBuffer = NULL;
     ULONG m_ShmemPageCount = 0;
+    ULONG m_ShmemUsedPages = 0;
     // Where every ShmemAlloc search starts.  Deliberately a FIXED base,
     // not a rolling bump pointer -- see ShmemAlloc.
     ULONG m_ShmemSearchBase = 0;

@@ -117,6 +117,8 @@ typedef struct _VIOGPU_ADAPTERINFO
 
 #define VIOGPU_RES_INFO              0x100
 #define VIOGPU_RES_BUSY              0x101
+#define VIOGPU_SHMEM_INFO            0x102
+#define VIOGPU_RES_RELEASE_WINDOW    0x103
 
 #define VIOGPU_CTX_INIT              0x200
 
@@ -220,6 +222,36 @@ typedef struct _VIOGPU_RES_INFO_REQ
     ULONGLONG LookupCookie;
 } VIOGPU_RES_INFO_REQ;
 #pragma pack()
+#pragma pack(1)
+// Occupancy of the hostmem-BAR shmem suballocator (the window behind
+// ShmemAlloc).  The BAR is a fixed segment with no VidMm eviction, so the
+// bulk consumer -- the UMD's shmem-backed D3D12 heaps -- reads this to
+// stay clear of the tail that allocations with no fallback (ring upload
+// growth, map-shadow pool chunks) rely on.
+typedef struct _VIOGPU_SHMEM_INFO_REQ
+{
+    ULONGLONG TotalBytes; // out: shmem window size (0 = no shmem)
+    ULONGLONG UsedBytes;  // out: bytes currently allocated from it
+} VIOGPU_SHMEM_INFO_REQ;
+#pragma pack()
+
+#pragma pack(1)
+// Release a mappable blob's BAR window while the blob stays alive: the
+// calling process's user mapping is torn down, the host unmap is queued,
+// and the window returns to ShmemAlloc.  Legal whenever no Map is
+// outstanding -- D3D12's last Unmap deallocates the CPU VA range and a
+// later Map may return a different address -- and the host GPU reaches
+// the blob through its own memory, never through the BAR.  The next
+// RES_INFO re-places the blob and hands out a fresh UserVa.  Returns
+// STATUS_DEVICE_BUSY if another live process still holds a mapping.
+typedef struct _VIOGPU_RES_RELEASE_REQ
+{
+    D3DKMT_HANDLE ResHandle;
+    // Authoritative identity, resolved cookie-first exactly as RES_INFO.
+    ULONGLONG LookupCookie;
+} VIOGPU_RES_RELEASE_REQ;
+#pragma pack()
+
 
 #pragma pack(1)
 typedef struct _VIOGPU_RES_BUSY_REQ
@@ -292,6 +324,8 @@ typedef struct _VIOGPU_ESCAPE
 
         VIOGPU_RES_INFO_REQ ResourceInfo;
         VIOGPU_RES_BUSY_REQ ResourceBusy;
+        VIOGPU_SHMEM_INFO_REQ ShmemInfo;
+        VIOGPU_RES_RELEASE_REQ ResRelease;
 
         VIOGPU_CTX_INIT_REQ CtxInit;
 

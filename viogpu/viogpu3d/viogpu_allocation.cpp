@@ -1615,6 +1615,94 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo)
     return STATUS_SUCCESS;
 }
 
+// Release the KMD-owned BAR window of a live mappable blob: the reverse of
+// the placement EscapeResourceInfo performs, with the blob and its host
+// memory untouched.  Ordering mirrors the destructor: user VAs come down
+// first, then the host unmap is queued, then the window returns to
+// ShmemAlloc -- the control queue is FIFO, so a later blob MAP_BLOB'd into
+// the recycled window reaches the host after this one's unmap.  The next
+// EscapeResourceInfo re-places the blob and builds a fresh mapping.
+NTSTATUS VioGpuAllocation::EscapeReleaseWindow(VioGpuDevice *pDevice)
+{
+    PAGED_CODE();
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d\n", __FUNCTION__, m_Id));
+
+    auto lock_guard = LockGuard();
+
+    if (!m_IsBlob || !IsMappable())
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!m_KmdShmem.Placed)
+    {
+        // Nothing to release; idempotent so the UMD's bookkeeping may
+        // trail a racing destroy.
+        return STATUS_SUCCESS;
+    }
+
+    // The window backs every process's mapping of this blob, so it can only
+    // come down while the caller is the sole live mapper -- tearing it out
+    // from under another process would leave that process reading an
+    // unbacked BAR range.  Mappings of exited processes were already
+    // reclaimed by the OS and only their bookkeeping remains.
+    PEPROCESS self = PsGetCurrentProcess();
+    for (KmdShmemMapping *m = m_KmdShmem.Maps; m != NULL; m = m->Next)
+    {
+        if (m->Process != self && PsGetProcessExitStatus(m->Process) == STATUS_PENDING)
+        {
+            DbgPrint(TRACE_LEVEL_WARNING,
+                     ("%s res_id=%d window busy in another process\n", __FUNCTION__, m_Id));
+            return STATUS_DEVICE_BUSY;
+        }
+    }
+
+    for (KmdShmemMapping *m = m_KmdShmem.Maps; m != NULL;)
+    {
+        KmdShmemMapping *next = m->Next;
+        if (m->UserVa != NULL && m->Process == self)
+        {
+            MmUnmapLockedPages(m->UserVa, m->Mdl);
+        }
+        // Exited processes: the OS reclaimed their user VAs.  No
+        // MmUnlockPages either way: the PFN array was hand-built over the
+        // BAR range (see EscapeResourceInfo).
+        IoFreeMdl(m->Mdl);
+        ObDereferenceObject(m->Process);
+        ExFreePoolWithTag(m, VIOGPUTAG);
+        m = next;
+    }
+    m_KmdShmem.Maps = NULL;
+
+    // The host must ACKNOWLEDGE the unmap before the window is recycled:
+    // once ShmemFree hands the offset out, the next blob is mapped there,
+    // and a still-live host mapping would alias it (the plain queued unmap
+    // can be dropped silently on a full virtqueue).  The ctx comes from
+    // the caller's device binding, as the by-id unmap packet path uses.
+    if (m_Blob.Mapped)
+    {
+        UINT ctxId = 0;
+        auto pEntry = Find(pDevice);
+        if (pEntry != nullptr)
+        {
+            ctxId = pEntry->value.GetCtxId();
+        }
+        if (m_Id != 0 && !m_adapter->ctrlQueue.ResourceUnmapBlobSync(m_Id, ctxId))
+        {
+            // Host mapping still live: keep the window.  The user
+            // mappings are gone; the next RES_INFO rebuilds one over the
+            // unchanged placement.
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s res_id=%d host unmap failed; window kept\n", __FUNCTION__, m_Id));
+            return STATUS_UNSUCCESSFUL;
+        }
+        m_Blob.Mapped = FALSE;
+    }
+
+    m_adapter->ShmemFree(m_Blob.MapOffset, m_KmdShmem.MapSize);
+    m_KmdShmem.Placed = FALSE;
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS VioGpuAllocation::EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy)
 {
     PAGED_CODE();
