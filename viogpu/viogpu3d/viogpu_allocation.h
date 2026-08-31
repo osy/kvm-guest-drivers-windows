@@ -201,7 +201,11 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     NTSTATUS MapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildPagingBuffer);
     NTSTATUS UnmapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuildPagingBuffer);
 
-    NTSTATUS EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo);
+    // pMapDevice non-NULL also completes the blob's host mapping, synchronously,
+    // on that device's context -- the placement is only usable once the host has
+    // mapped memory behind the BAR window.  The blt-present path passes NULL: it
+    // reads the descriptor and must not establish a mapping of its own.
+    NTSTATUS EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioGpuDevice *pMapDevice);
     NTSTATUS EscapeReleaseWindow(VioGpuDevice *pDevice);
     NTSTATUS EscapeResourceBusy(VIOGPU_RES_BUSY_REQ *resBusy);
 
@@ -269,6 +273,7 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
   private:
     inline LinkedList<VioGpuDeviceAllocation>::Entry *Find(VioGpuDevice *pDevice);
     inline BOOLEAN MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    inline BOOLEAN MapBlobSyncLocked(VioGpuDevice *pDevice);
     inline BOOLEAN UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
 
     static VOID NTAPI DeferredReleaseWorker(PDEVICE_OBJECT DeviceObject, PVOID Context);

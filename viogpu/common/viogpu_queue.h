@@ -340,6 +340,7 @@ class CtrlQueue : public VioGpuQueue
 
     BOOLEAN ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
     BOOLEAN ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
+    BOOLEAN ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset);
     BOOLEAN ResourceUnmapBlobSync(UINT res_id, UINT ctx_id);
 
     BOOLEAN GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres);

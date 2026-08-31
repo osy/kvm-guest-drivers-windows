@@ -1558,7 +1558,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                     return STATUS_ACCESS_DENIED;
                 }
 
-                status = allocation->EscapeResourceInfo(&pVioGpuEscape->ResourceInfo);
+                status = allocation->EscapeResourceInfo(&pVioGpuEscape->ResourceInfo, pResDevice);
 
                 break;
             }

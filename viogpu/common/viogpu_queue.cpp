@@ -1054,6 +1054,81 @@ BOOLEAN CtrlQueue::ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, v
     return TRUE;
 }
 
+// Map a blob's host memory into the hostmem BAR at its placed offset and WAIT
+// for the host to acknowledge it.  The queued ResourceMapBlob only guarantees
+// the command was posted; callers that hand out the window as usable (the
+// RES_INFO placement escape) need the acknowledgement.  Because the control
+// queue is FIFO, the response also proves the resource's CREATE_BLOB was
+// processed, so a ring command may name the res_id as soon as this returns.
+BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d offset=%llx\n", __FUNCTION__, res_id, offset));
+
+    PGPU_RES_MAP_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_MAP_BLOB)AllocCmdResp(&vbuf, sizeof(*cmd), NULL, sizeof(GPU_RESP_MAP_INFO));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr /*[0]*/);
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+    cmd->offset = offset;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    if (QueueBuffer(vbuf) == (UINT)-1)
+    {
+        // Never reached the host; the callback already fired.
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_UNSUCCESSFUL);
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000); // 10 s
+    NTSTATUS status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out res_id=%u\n", __FUNCTION__, res_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+
+    // A host that answered but refused the map (bad offset, out of memory)
+    // left the window unbacked; success here is what lets the caller latch
+    // Mapped and hand the window out.
+    PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
+    bool error = resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC;
+    if (error)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("---> %s host rejected map res_id=%u resp=0x%x\n", __FUNCTION__, res_id, resp->type));
+    }
+    ReleaseBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return !error;
+}
+
 BOOLEAN CtrlQueue::ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     PAGED_CODE();

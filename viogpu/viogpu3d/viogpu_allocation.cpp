@@ -762,6 +762,28 @@ BOOLEAN VioGpuAllocation::MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *,
     return TRUE;
 }
 
+// Issue the host map and WAIT for the acknowledgement, so the caller can
+// treat the BAR window as backed the moment this returns; the queued
+// MapBlobLocked leaves that unknowable.
+BOOLEAN VioGpuAllocation::MapBlobSyncLocked(VioGpuDevice *pDevice)
+{
+    UINT ctxId = 0;
+    auto pEntry = Find(pDevice);
+    if (pEntry != nullptr)
+    {
+        ctxId = pEntry->value.GetCtxId();
+    }
+    if (!m_adapter->ctrlQueue.ResourceMapBlobSync(m_Id, ctxId, m_Blob.MapOffset))
+    {
+        // Nothing is mapped host-side; leaving Mapped clear keeps the
+        // paired unmap from believing there is a mapping to tear down.
+        DbgPrint(TRACE_LEVEL_ERROR, ("%s res_id=%d sync map failed\n", __FUNCTION__, m_Id));
+        return FALSE;
+    }
+    m_Blob.Mapped = TRUE;
+    return TRUE;
+}
+
 BOOLEAN VioGpuAllocation::UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     // The host treats RESOURCE_UNMAP_BLOB as a per-(res_id) operation rather
@@ -1468,7 +1490,7 @@ NTSTATUS VioGpuAllocation::UnmapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuil
     return STATUS_SUCCESS;
 }
 
-NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo)
+NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioGpuDevice *pMapDevice)
 {
     PAGED_CODE();
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s res_id=%d isBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));
@@ -1590,6 +1612,25 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo)
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         resInfo->UserVa = (ULONGLONG)(ULONG_PTR)userVa;
+
+        // The window is placed and mapped into this process, but it is only
+        // backed once the host has mapped the blob's memory behind it.  Do
+        // that here, synchronously, so RES_INFO is a complete answer: the UMD
+        // gets a usable window with no MAP_BLOB packet and no scheduler drain
+        // to learn when the packet ran.  The control queue is FIFO, so the
+        // acknowledgement also proves this blob's CREATE_BLOB was processed --
+        // a ring command may name the res_id as soon as this returns.
+        //
+        // Only a created blob can be mapped; the UMD's RES_INFO retry loop
+        // spins here until the create it issued has been queued.
+        if (pMapDevice != NULL && m_Blob.Created && !m_Blob.Mapped &&
+            !MapBlobSyncLocked(pMapDevice))
+        {
+            // The UMD would otherwise write into an unbacked BAR window.
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s res_id=%d host map failed -- failing RES_INFO\n", __FUNCTION__, m_Id));
+            return STATUS_DEVICE_NOT_READY;
+        }
     }
     else
     {

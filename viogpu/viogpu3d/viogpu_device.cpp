@@ -387,7 +387,9 @@ NTSTATUS VioGpuDevice::GenerateBltPresentUM(DXGKARG_PRESENT *pPresent, VioGpuAll
         blit.dst.alloc.Options3D = dst->m_3dOptions;
         blit.dst.alloc.Size = dst->m_Size;
     }
-    dst->EscapeResourceInfo(&blit.dst.res_info);
+    // Descriptor only: the blit reads the host resource directly, so this path
+    // must not establish a BAR mapping the UMD never asked for.
+    dst->EscapeResourceInfo(&blit.dst.res_info, NULL);
 
     INT dx = pPresent->SrcRect.left - pPresent->DstRect.left;
     INT dy = pPresent->SrcRect.top - pPresent->DstRect.top;
