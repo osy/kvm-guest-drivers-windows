@@ -52,6 +52,10 @@ typedef struct virtio_gpu_vbuffer
     char *resp_buf;
     int resp_size;
     LIST_ENTRY list_entry;
+    /* Links the vbuf on CtrlQueue::m_PendingBufs while it waits for ring
+     * descriptors.  A separate field because list_entry is claimed by
+     * VioGpuBuf's free/in-use bookkeeping for the vbuf's whole lifetime. */
+    LIST_ENTRY pending_entry;
 
     void (*complete_cb)(void *ctx, void *data_buf, void *resp_buf);
     void *complete_ctx;
@@ -205,6 +209,16 @@ class VioGpuQueue
         return m_pVirtQueue ? virtqueue_add_buf(m_pVirtQueue, sg, out_num, in_num, data, va_indirect, phys_indirect)
                             : -1;
     }
+    // Both meaningful only under the queue lock: Close() clears the
+    // virtqueue pointer under it.
+    bool IsActive()
+    {
+        return m_pVirtQueue != NULL;
+    }
+    UINT GetQueueSize()
+    {
+        return m_pVirtQueue ? virtio_get_queue_size(m_pVirtQueue) : 0;
+    }
     void *GetBuf(_Out_ UINT *len)
     {
         if (m_pVirtQueue)
@@ -274,7 +288,13 @@ class CtrlQueue : public VioGpuQueue
     {
         //RtlZeroMemory((void *)&m_FenceIdr[0], sizeof(m_FenceIdr));
         m_FenceIdr = 0;
+        InitializeListHead(&m_PendingBufs);
     };
+
+    // Shadows the non-virtual VioGpuQueue::Close: once the virtqueue is
+    // gone no drain pass will resubmit parked vbufs, so this also
+    // completes them locally to unblock their waiters.
+    void Close(void);
 
     PVOID AllocCmd(PGPU_VBUFFER *buf, int sz);
     PVOID AllocCmdResp(PGPU_VBUFFER *buf, int cmd_sz, PVOID resp_buf, int resp_sz);
@@ -333,8 +353,17 @@ class CtrlQueue : public VioGpuQueue
     void DestroyCtx(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
 
   private:
+    void SubmitPendingLocked();
+
     //volatile LONG64 m_FenceIdr[64];
     volatile LONG64 m_FenceIdr;
+
+    // Commands that hit -ENOSPC on the live ring, in submission order.
+    // QueueBuffer parks here and DequeueBuffer's drain resubmits, both
+    // under the queue lock.  While this is non-empty QueueBuffer must not
+    // AddBuf directly: the host executes the ring in order, so a direct
+    // add would let a newer command overtake every parked one.
+    LIST_ENTRY m_PendingBufs;
 };
 
 class CrsrQueue : public VioGpuQueue

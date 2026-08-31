@@ -1286,31 +1286,20 @@ void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_
 }
 
 #define SGLIST_SIZE 256
-UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
+// Build the descriptor list describing a vbuf's command, data, and response
+// buffers.  FALSE means the vbuf exceeds a hard limit (the PAGE_SIZE caps or
+// SGLIST_SIZE) and can never be submitted.  Deterministic in the vbuf's
+// fields, so a list that built here rebuilds identically when a parked vbuf
+// is resubmitted by SubmitPendingLocked.
+static BOOLEAN BuildVbufSGList(PGPU_VBUFFER buf, VirtIOBufferDescriptor sg[], UINT *poutcnt, UINT *pincnt)
 {
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
-
-    VirtIOBufferDescriptor sg[SGLIST_SIZE];
     UINT sgleft = SGLIST_SIZE;
     UINT outcnt = 0, incnt = 0;
-    UINT ret = 0;
-    KIRQL SavedIrql;
 
     if (buf->size > PAGE_SIZE)
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s size is too big %d\n", __FUNCTION__, buf->size));
-        // Don't leak the fence: fire the completion callback and release the
-        // vbuf (mirroring the AddBuf-failure arm) so the owning command
-        // advances and dxgkrnl sees the fence retire instead of timing the
-        // engine out (VidSchWaitForCompletionEvent TDR).
-        if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
-            buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
-        if (buf->auto_release)
-            ReleaseBuffer(buf);
-        // A previously deferred (kick=FALSE) buffer must not be stranded by
-        // this one's failure.
-        FlushKick();
-        return 0;
+        return FALSE;
     }
 
     if (BuildSGElement(&sg[outcnt + incnt], (PVOID)buf->buf, buf->size))
@@ -1334,14 +1323,7 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
                 if (sgleft == 0)
                 {
                     DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s no more sgelenamt spots left %d\n", __FUNCTION__, outcnt));
-                    // Retire the fence instead of leaking it (see size-guard above).
-                    if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
-                        buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
-                    if (buf->auto_release)
-                        ReleaseBuffer(buf);
-                    // See the size-guard arm: never strand a deferred buffer.
-                    FlushKick();
-                    return 0;
+                    return FALSE;
                 }
             }
         }
@@ -1350,7 +1332,7 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
     if (buf->resp_size > PAGE_SIZE)
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s resp_size is too big %d\n", __FUNCTION__, buf->resp_size));
-        return 0;
+        return FALSE;
     }
 
     if (buf->resp_size && (sgleft > 0))
@@ -1364,21 +1346,98 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s sgleft %d\n", __FUNCTION__, sgleft));
 
-    Lock(&SavedIrql);
-    int rc = AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0);
-    // Deferred-kick batching (kick=FALSE): the caller queues several buffers
-    // for one DMA body and kicks once at the end -- each kick is an MMIO VM
-    // exit.  On AddBuf failure kick anyway so a previously deferred buffer
-    // is never stranded behind this one's failure.
-    if (kick || rc < 0)
+    *poutcnt = outcnt;
+    *pincnt = incnt;
+    return TRUE;
+}
+
+UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    VirtIOBufferDescriptor sg[SGLIST_SIZE];
+    UINT outcnt = 0, incnt = 0;
+    KIRQL SavedIrql;
+
+    if (!BuildVbufSGList(buf, sg, &outcnt, &incnt))
     {
-        Kick();
+        // Don't leak the fence: fire the completion callback and release the
+        // vbuf (mirroring the AddBuf-failure arm) so the owning command
+        // advances and dxgkrnl sees the fence retire instead of timing the
+        // engine out (VidSchWaitForCompletionEvent TDR).
+        if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
+        {
+            buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
+        }
+        if (buf->auto_release)
+        {
+            ReleaseBuffer(buf);
+        }
+        // A previously deferred (kick=FALSE) buffer must not be stranded by
+        // this one's failure.
+        FlushKick();
+        return 0;
+    }
+
+    int rc = 0;
+    BOOLEAN pended = FALSE;
+
+    Lock(&SavedIrql);
+    if (!IsListEmpty(&m_PendingBufs) && IsActive())
+    {
+        // Older commands are already parked waiting for ring space; see
+        // m_PendingBufs -- adding directly would overtake them.
+        InsertTailList(&m_PendingBufs, &buf->pending_entry);
+        pended = TRUE;
+        if (kick)
+        {
+            Kick();
+        }
+    }
+    else
+    {
+        rc = AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0);
+        if (rc < 0 && rc != -1 && outcnt + incnt <= GetQueueSize())
+        {
+            // -ENOSPC on a live queue: every descriptor is held by an
+            // in-flight command.  Dropping the command here desynchronizes
+            // guest and host state -- the failure arm below completes the
+            // buffer locally, so to its caller a dropped command is
+            // indistinguishable from an executed one (a dropped
+            // RESOURCE_MAP_BLOB, for instance, leaves the UMD writing
+            // through a BAR window no host mapping backs).  Park it
+            // instead: the response DPC frees descriptors under this same
+            // lock (DequeueBuffer) and resubmits in FIFO order, and since
+            // -ENOSPC was observed under the lock those in-flight
+            // responses are still owed, so a drain pass is guaranteed.
+            // Excluded: a closed queue (AddBuf's -1, no space ever coming)
+            // and a command needing more descriptors than the whole ring
+            // holds, which no amount of draining can satisfy -- both fall
+            // through to the local completion below.
+            InsertTailList(&m_PendingBufs, &buf->pending_entry);
+            pended = TRUE;
+        }
+        // Deferred-kick batching (kick=FALSE): the caller queues several
+        // buffers for one DMA body and kicks once at the end -- each kick
+        // is an MMIO VM exit.  On AddBuf failure kick anyway so a
+        // previously deferred buffer is never stranded behind this one's
+        // failure.
+        if (kick || rc < 0)
+        {
+            Kick();
+        }
     }
     Unlock(SavedIrql);
 
+    if (pended)
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("<--> %s ring full, parked vbuf %p\n", __FUNCTION__, buf));
+        return 0;
+    }
+
     if (rc < 0)
     {
-        // Submission failed (queue closed, queue full, or otherwise).
+        // Submission failed (queue closed, or the command can never fit).
         // The vbuf is sitting on m_InUseBufs from AllocCmd but will never be
         // dequeued, so fire the callback to unblock any waiter -- exactly the
         // completion path's contract. Release the vbuf here only when it is
@@ -1399,11 +1458,38 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
         }
         return (UINT)-1;
     }
-    ret = (UINT)rc;
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s ret = %d\n", __FUNCTION__, rc));
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s ret = %d\n", __FUNCTION__, ret));
+    return (UINT)rc;
+}
 
-    return ret;
+// Resubmit parked vbufs in FIFO order.  Called with the queue lock held,
+// after GetBuf has just reclaimed descriptors.  Stops at the first vbuf
+// that still does not fit; the next response's drain pass retries.
+void CtrlQueue::SubmitPendingLocked()
+{
+    VirtIOBufferDescriptor sg[SGLIST_SIZE];
+    BOOLEAN added = FALSE;
+
+    while (!IsListEmpty(&m_PendingBufs))
+    {
+        PGPU_VBUFFER buf = CONTAINING_RECORD(m_PendingBufs.Flink, GPU_VBUFFER, pending_entry);
+        UINT outcnt = 0, incnt = 0;
+
+        // Cannot fail: the vbuf built successfully when it was parked and
+        // BuildVbufSGList is deterministic in the vbuf's fields.
+        BuildVbufSGList(buf, sg, &outcnt, &incnt);
+        if (AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0) < 0)
+        {
+            break;
+        }
+        RemoveHeadList(&m_PendingBufs);
+        added = TRUE;
+    }
+    if (added)
+    {
+        Kick();
+    }
 }
 
 PGPU_VBUFFER CtrlQueue::DequeueBuffer(_Out_ UINT *len)
@@ -1414,6 +1500,12 @@ PGPU_VBUFFER CtrlQueue::DequeueBuffer(_Out_ UINT *len)
     KIRQL SavedIrql;
     Lock(&SavedIrql);
     buf = (PGPU_VBUFFER)GetBuf(len);
+    if (buf != NULL && !IsListEmpty(&m_PendingBufs))
+    {
+        // GetBuf freed this response's descriptors; parked commands may
+        // fit now.
+        SubmitPendingLocked();
+    }
     Unlock(SavedIrql);
     if (buf == NULL)
     {
@@ -1422,6 +1514,42 @@ PGPU_VBUFFER CtrlQueue::DequeueBuffer(_Out_ UINT *len)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 
     return buf;
+}
+
+void CtrlQueue::Close(void)
+{
+    VioGpuQueue::Close();
+
+    // The virtqueue is gone, so no drain pass will ever resubmit the
+    // parked vbufs: complete them locally under the same contract as
+    // QueueBuffer's failure arm so their waiters unblock.  QueueBuffer
+    // parks only while IsActive(), so nothing is added behind this drain.
+    LIST_ENTRY parked;
+    InitializeListHead(&parked);
+    KIRQL SavedIrql;
+
+    Lock(&SavedIrql);
+    while (!IsListEmpty(&m_PendingBufs))
+    {
+        InsertTailList(&parked, RemoveHeadList(&m_PendingBufs));
+    }
+    Unlock(SavedIrql);
+
+    // Callbacks fire outside the queue lock: they wake waiters and may
+    // release buffers.
+    while (!IsListEmpty(&parked))
+    {
+        PGPU_VBUFFER buf = CONTAINING_RECORD(RemoveHeadList(&parked), GPU_VBUFFER, pending_entry);
+
+        if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
+        {
+            buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
+        }
+        if (buf->auto_release)
+        {
+            ReleaseBuffer(buf);
+        }
+    }
 }
 
 void VioGpuQueue::ReleaseBuffer(PGPU_VBUFFER buf)
