@@ -420,15 +420,18 @@ NTSTATUS VioGpuDod::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_DEVI
     PBYTE edid = NULL;
 
     edid = m_pHWDevice->GetEdidData();
+    // Bound the copy by what actually backs the pointer: the built-in fallback
+    // EDID is one 128-byte block, so bounding by EDID_RAW_BLOCK_SIZE would
+    // serve adjacent .data for any offset past block 0.
+    ULONG edidSize = m_pHWDevice->GetEdidSize();
 
     if (!edid)
     {
         return STATUS_GRAPHICS_CHILD_DESCRIPTOR_NOT_SUPPORTED;
     }
-    else if (pDeviceDescriptor->DescriptorOffset < EDID_RAW_BLOCK_SIZE)
+    else if (pDeviceDescriptor->DescriptorOffset < edidSize)
     {
-        ULONG len = min(pDeviceDescriptor->DescriptorLength,
-                        (EDID_RAW_BLOCK_SIZE - pDeviceDescriptor->DescriptorOffset));
+        ULONG len = min(pDeviceDescriptor->DescriptorLength, (edidSize - pDeviceDescriptor->DescriptorOffset));
         RtlCopyMemory(pDeviceDescriptor->DescriptorBuffer, (edid + pDeviceDescriptor->DescriptorOffset), len);
         pDeviceDescriptor->DescriptorLength = len;
         return STATUS_SUCCESS;
@@ -2174,6 +2177,7 @@ VioGpuAdapter::VioGpuAdapter(_In_ VioGpuDod *pVioGpuDod)
     m_CurrentModeIndex = 0;
     m_CustomModeIndex = 0;
     RtlZeroMemory(m_EDIDs, sizeof(m_EDIDs));
+    m_EdidSize = 0;
     m_bEDID = FALSE;
     m_ModeInfo = NULL;
     m_ModeCount = 0;
@@ -2379,6 +2383,19 @@ PBYTE VioGpuAdapter::GetEdidData()
     PAGED_CODE();
 
     return m_bEDID ? m_EDIDs : (PBYTE)(g_gpu_edid);
+}
+
+ULONG VioGpuAdapter::GetEdidSize(void)
+{
+    PAGED_CODE();
+
+    if (!m_bEDID)
+    {
+        return EDID_V1_BLOCK_SIZE;
+    }
+    ULONG announced = (1 + ((PEDID_DATA_V1)m_EDIDs)->ExtensionFlag[0]) * EDID_V1_BLOCK_SIZE;
+    ULONG transferred = m_EdidSize - (m_EdidSize % EDID_V1_BLOCK_SIZE);
+    return min(announced, transferred);
 }
 
 PBYTE VioGpuAdapter::GetCTA861Data(void)
@@ -3050,9 +3067,11 @@ BOOLEAN VioGpuAdapter::GetEdids(void)
 
     PGPU_VBUFFER vbuf = NULL;
 
-    for (UINT32 i = 0; i < m_u32NumScanouts; i++)
+    // One EDID buffer serves the single displayed child, so keep the first
+    // scanout that answers rather than letting a later one overwrite it.
+    for (UINT32 i = 0; i < m_u32NumScanouts && !m_bEDID; i++)
     {
-        if (m_CtrlQueue.AskEdidInfo(&vbuf, i) && m_CtrlQueue.GetEdidInfo(vbuf, i, m_EDIDs))
+        if (m_CtrlQueue.AskEdidInfo(&vbuf, i) && m_CtrlQueue.GetEdidInfo(vbuf, i, m_EDIDs, &m_EdidSize))
         {
             m_bEDID = TRUE;
         }

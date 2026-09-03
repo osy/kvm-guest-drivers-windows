@@ -1352,8 +1352,10 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
         pDescribeAllocation->Format = VioGpuDxgiFormatToD3DDDI(m_SharedFormat);
         pDescribeAllocation->MultisampleMethod.NumQualityLevels = 0;
         pDescribeAllocation->MultisampleMethod.NumSamples = 1;
-        pDescribeAllocation->RefreshRate.Numerator = 60;
-        pDescribeAllocation->RefreshRate.Denominator = 1;
+        // Same rate as every other allocation: a primary described at a
+        // different rate than the committed mode makes the compositor
+        // treat the device as stale.
+        pDescribeAllocation->RefreshRate = m_adapter->vidpn.GetActiveRefreshRate();
         return STATUS_SUCCESS;
     }
 
@@ -1392,18 +1394,7 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
         pDescribeAllocation->MultisampleMethod.NumSamples = 1;
     }
 
-    // Refresh rate: active VidPN mode's rate if a source is pinned,
-    // otherwise 60/1 as a safe default.
-    D3DDDI_RATIONAL refresh = m_adapter->vidpn.GetActiveRefreshRate();
-    if (refresh.Numerator && refresh.Denominator)
-    {
-        pDescribeAllocation->RefreshRate = refresh;
-    }
-    else
-    {
-        pDescribeAllocation->RefreshRate.Numerator = 60;
-        pDescribeAllocation->RefreshRate.Denominator = 1;
-    }
+    pDescribeAllocation->RefreshRate = m_adapter->vidpn.GetActiveRefreshRate();
 
     return STATUS_SUCCESS;
 };

@@ -877,7 +877,7 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
     // Bound the copy by what actually backs the pointer: the built-in fallback
     // EDID is one 128-byte block, so bounding by EDID_RAW_BLOCK_SIZE would
     // serve adjacent .data for any offset past block 0.
-    ULONG edidSize = vidpn.GetEdidSize();
+    ULONG edidSize = vidpn.GetEdidSize(ChildUid);
 
     if (!edid)
     {

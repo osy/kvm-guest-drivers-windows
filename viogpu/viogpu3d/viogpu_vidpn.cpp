@@ -45,6 +45,10 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
     m_CurrentModeIndex = 0;
     m_CustomModeIndex = 0;
     m_pFrameBuf = NULL;
+    RtlZeroMemory(m_EDIDs, sizeof(m_EDIDs));
+    RtlZeroMemory(m_EdidSize, sizeof(m_EdidSize));
+    m_EdidRefresh.Numerator = 0;
+    m_EdidRefresh.Denominator = 0;
 
     // The destructor runs on ANY remove -- including a device whose
     // Start() failed before these were ever assigned.  Leaving them as
@@ -60,9 +64,10 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
     // and TryPromoteFlip re-checks the latch anyway, so a coalesced signal
     // can never strand an armed flip.
     KeInitializeEvent(&m_flipReadyEvent, SynchronizationEvent, FALSE);
-    // Auto-reset periodic tick; armed by the flip thread (see FlipThread for
-    // why the vsync cadence must not come from a wait timeout).
-    KeInitializeTimerEx(&m_vsyncTimer, SynchronizationTimer);
+    // Auto-reset periodic tick; the timer behind it is allocated in Start
+    // and armed by the flip thread (see FlipThread for why the vsync
+    // cadence must not come from a wait timeout).
+    KeInitializeEvent(&m_vsyncEvent, SynchronizationEvent, FALSE);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 }
@@ -101,6 +106,14 @@ VioGpuVidPN::~VioGpuVidPN()
         KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, NULL);
         ObDereferenceObject(m_pFlipThread);
         m_pFlipThread = NULL;
+    }
+
+    // The thread is gone, so nothing re-arms the timer; cancel it and wait
+    // for an in-flight callback before the event it signals goes away.
+    if (m_vsyncTimer)
+    {
+        ExDeleteTimer(m_vsyncTimer, TRUE, TRUE, NULL);
+        m_vsyncTimer = NULL;
     }
 
     // Non-paged: instructions executed while m_sourceLock is held must not
@@ -180,6 +193,16 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
 
     DbgPrint(TRACE_LEVEL_INFORMATION,
              ("<--- %s ColorFormat = %d\n", __FUNCTION__, m_CurrentModes[0].DispInfo.ColorFormat));
+
+    if (m_vsyncTimer == NULL)
+    {
+        m_vsyncTimer = ExAllocateTimer(VsyncTimerCallback, this, EX_TIMER_HIGH_RESOLUTION);
+        if (m_vsyncTimer == NULL)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("%s: failed to allocate the vsync timer\n", __FUNCTION__));
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
 
     HANDLE threadHandle = 0;
     m_shouldFlipStop = false;
@@ -1152,21 +1175,19 @@ VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalIn
     pVideoSignalInfo->VideoStandard = D3DKMDT_VSS_OTHER;
     pVideoSignalInfo->TotalSize.cx = pModeInfo->VisScreenWidth;
     pVideoSignalInfo->TotalSize.cy = pModeInfo->VisScreenHeight;
+    pVideoSignalInfo->ActiveSize = pVideoSignalInfo->TotalSize;
 
-#if 1
-    pVideoSignalInfo->VSyncFreq.Numerator = 148500000;
-    pVideoSignalInfo->VSyncFreq.Denominator = 2475000;
-    pVideoSignalInfo->HSyncFreq.Numerator = 67500;
+    // Every mode runs at the host display's refresh rate (from the EDID's
+    // preferred timing; 60 Hz when the host gave none). The raster has no
+    // blanking, so the line and pixel rates follow from the visible size.
+    D3DDDI_RATIONAL rate = GetActiveRefreshRate();
+    pVideoSignalInfo->VSyncFreq = rate;
+    pVideoSignalInfo->HSyncFreq.Numerator =
+        (UINT)(((ULONGLONG)rate.Numerator * pModeInfo->VisScreenHeight) / rate.Denominator);
     pVideoSignalInfo->HSyncFreq.Denominator = 1;
-    pVideoSignalInfo->PixelRate = 148500000;
-#else
-
-    pVideoSignalInfo->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    pVideoSignalInfo->VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    pVideoSignalInfo->HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    pVideoSignalInfo->HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-    pVideoSignalInfo->PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
-#endif
+    pVideoSignalInfo->PixelRate =
+        (SIZE_T)(((ULONGLONG)rate.Numerator * pModeInfo->VisScreenWidth * pModeInfo->VisScreenHeight) /
+                 rate.Denominator);
     pVideoSignalInfo->ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
 }
 
@@ -1218,10 +1239,7 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
                       LONG_PTR(hVidPnTargetModeSet)));
             return Status;
         }
-        // A freshly created mode carries D3DKMDT_DIMENSION_NOTSPECIFIED, so the
-        // raster has to be built before ActiveSize can be taken from TotalSize.
         BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo);
-        pVidPnTargetModeInfo->VideoSignalInfo.ActiveSize = pVidPnTargetModeInfo->VideoSignalInfo.TotalSize;
 
         pVidPnTargetModeInfo->Preference = D3DKMDT_MP_NOTPREFERRED; // TODO: another logic for prefferred mode. Maybe
                                                                     // the pinned source mode
@@ -1883,7 +1901,7 @@ PBYTE VioGpuVidPN::GetEdidData(UINT Id)
     {
         return NULL;
     }
-    return m_bEDID ? m_EDIDs[Id] : (PBYTE)(g_gpu_edid);
+    return m_EdidSize[Id] ? m_EDIDs[Id] : (PBYTE)(g_gpu_edid);
 }
 
 BOOLEAN VioGpuVidPN::GetDisplayInfo(void)
@@ -1925,7 +1943,132 @@ int VioGpuVidPN::ProcessEdid(void)
     {
         FixEdid();
     }
+    ParseEdidTiming();
     return AddEdidModes();
+}
+
+// The host encodes the window's mode as the first detailed timing
+// descriptor, or -- when the pixel clock exceeds that descriptor's 655.35
+// MHz field, which any large window on a 120 Hz HiDPI display does -- as a
+// DisplayID detailed timing in an extension block. Both give the exact
+// refresh rate as pixel clock over total raster.
+void VioGpuVidPN::ParseEdidTiming(void)
+{
+    PAGED_CODE();
+
+    D3DDDI_RATIONAL rate = {0, 0};
+    m_EdidRefresh = rate;
+
+    // The built-in EDID's descriptor encodes a 59.27 Hz raster; without a
+    // host EDID there is nothing to match, so leave the rate unset and let
+    // the 60 Hz default stand.
+    if (!m_EdidSize[0])
+    {
+        return;
+    }
+
+    PUCHAR edid = GetEdidData(0);
+    ULONG size = GetEdidSize(0);
+    PEDID_DATA_V1 base = (PEDID_DATA_V1)edid;
+    ULONGLONG clockHz = 0;
+    ULONG htotal = 0, vtotal = 0, hactive = 0;
+
+    for (int i = 0; i < 4; i++)
+    {
+        PEDID_DETAILED_DESCRIPTOR d = &base->EDIDDetailedTimings[i];
+        if (d->PixelClock == 0)
+        {
+            continue;
+        }
+        hactive = d->HorizontalActiveLow | (d->horizontalActiveHigh << 8);
+        ULONG hblank = d->HorizontalBlankingLow | (d->HorizontalBlankingHigh << 8);
+        ULONG vactive = d->VerticalActiveLow | (d->VerticalActiveHigh << 8);
+        ULONG vblank = d->VerticalBlankingLow | (d->VerticalBlankingHigh << 8);
+        clockHz = (ULONGLONG)d->PixelClock * 10000;
+        htotal = hactive + hblank;
+        vtotal = vactive + vblank;
+        break;
+    }
+
+    for (ULONG blk = 1; clockHz == 0 && blk <= base->ExtensionFlag[0] && (blk + 1) * EDID_V1_BLOCK_SIZE <= size;
+         blk++)
+    {
+        PUCHAR did = edid + blk * EDID_V1_BLOCK_SIZE;
+        if (did[0] != 0x70) // DisplayID extension tag
+        {
+            continue;
+        }
+        // DisplayID 1.x carries the timing as a type I block (tag 0x03,
+        // pixel clock in 10 kHz units); DisplayID 2.x as a type VII block
+        // (tag 0x22, same layout, pixel clock in 1 kHz units).
+        BOOLEAN v2 = did[1] >= 0x20;
+        UCHAR timingTag = v2 ? 0x22 : 0x03;
+        ULONGLONG clockUnitHz = v2 ? 1000 : 10000;
+        // did[1] version, did[2] section length, did[3] product type,
+        // did[4] extension count; data blocks start at did[5] as
+        // {tag, revision, length, payload}.
+        ULONG end = min(5 + (ULONG)did[2], EDID_V1_BLOCK_SIZE - 1);
+        for (ULONG off = 5; off + 3 <= end;)
+        {
+            UCHAR tag = did[off], blen = did[off + 2];
+            if (off + 3 + blen > end)
+            {
+                break;
+            }
+            if (tag == timingTag && blen >= 20)
+            {
+                // Every field is stored minus one, the pixel clock included.
+                PUCHAR t = did + off + 3;
+                clockHz = ((ULONGLONG)(t[0] | (t[1] << 8) | (t[2] << 16)) + 1) * clockUnitHz;
+                hactive = (t[4] | (t[5] << 8)) + 1;
+                ULONG hblank = (t[6] | (t[7] << 8)) + 1;
+                ULONG vactive = (t[12] | (t[13] << 8)) + 1;
+                ULONG vblank = (t[14] | (t[15] << 8)) + 1;
+                htotal = hactive + hblank;
+                vtotal = vactive + vblank;
+                break;
+            }
+            off += 3 + blen;
+        }
+    }
+
+    if (clockHz && htotal && vtotal)
+    {
+        ULONGLONG num = clockHz;
+        ULONGLONG den = (ULONGLONG)htotal * vtotal;
+        ULONGLONG a = num, b = den;
+        while (b)
+        {
+            ULONGLONG r = a % b;
+            a = b;
+            b = r;
+        }
+        num /= a;
+        den /= a;
+        // Reject rasters outside 10..1000 Hz (garbage or overflow).
+        if (num >= 10 * den && num <= 1000 * den)
+        {
+            // The host's pixel clock is truncated to 10 kHz, so a 120 Hz
+            // display arrives as 119.998 Hz. Windows derives 120/1 for the
+            // same display from the EDID's standard timings, and DWM's
+            // primary must agree with the pinned mode in value, so snap to
+            // the integer rate when within 0.05 Hz of it; otherwise report
+            // millihertz.
+            ULONGLONG mHz = (num * 1000 + den / 2) / den;
+            ULONGLONG hz = (mHz + 500) / 1000;
+            if (mHz >= hz * 1000 - 50 && mHz <= hz * 1000 + 50)
+            {
+                rate.Numerator = (UINT)hz;
+                rate.Denominator = 1;
+            }
+            else
+            {
+                rate.Numerator = (UINT)mHz;
+                rate.Denominator = 1000;
+            }
+        }
+    }
+    m_EdidRefresh = rate;
 }
 
 BOOLEAN VioGpuVidPN::UpdateModes(USHORT xres, USHORT yres, int &cnt)
@@ -1972,7 +2115,7 @@ void VioGpuVidPN::FixEdid(void)
 PBYTE VioGpuVidPN::GetCTA861Data(void)
 {
     PAGED_CODE();
-    if (m_bEDID)
+    if (m_EdidSize[0])
     {
         PEDID_DATA_V1 edid_data = (PEDID_DATA_V1)m_EDIDs;
         if (edid_data->ExtensionFlag)
@@ -1992,6 +2135,23 @@ PBYTE VioGpuVidPN::GetCTA861Data(void)
     return NULL;
 }
 
+ULONG VioGpuVidPN::GetEdidSize(UINT Id)
+{
+    PAGED_CODE();
+
+    if (Id >= MAX_CHILDREN)
+    {
+        return 0;
+    }
+    if (!m_EdidSize[Id])
+    {
+        return EDID_V1_BLOCK_SIZE;
+    }
+    ULONG announced = (1 + ((PEDID_DATA_V1)m_EDIDs[Id])->ExtensionFlag[0]) * EDID_V1_BLOCK_SIZE;
+    ULONG transferred = m_EdidSize[Id] - (m_EdidSize[Id] % EDID_V1_BLOCK_SIZE);
+    return min(announced, transferred);
+}
+
 BOOLEAN VioGpuVidPN::GetEdids(void)
 {
     PAGED_CODE();
@@ -2000,11 +2160,11 @@ BOOLEAN VioGpuVidPN::GetEdids(void)
 
     PGPU_VBUFFER vbuf = NULL;
 
-    for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts; i++)
+    for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts && i < MAX_CHILDREN; i++)
     {
-        if (m_pAdapter->ctrlQueue.AskEdidInfo(&vbuf, i) && m_pAdapter->ctrlQueue.GetEdidInfo(vbuf, i, m_EDIDs[i]))
+        if (m_pAdapter->ctrlQueue.AskEdidInfo(&vbuf, i))
         {
-            m_bEDID = TRUE;
+            m_pAdapter->ctrlQueue.GetEdidInfo(vbuf, i, m_EDIDs[i], &m_EdidSize[i]);
         }
         m_pAdapter->ctrlQueue.ReleaseBuffer(vbuf);
     }
@@ -2433,12 +2593,11 @@ void VioGpuVidPN::Flip()
 
 D3DDDI_RATIONAL VioGpuVidPN::GetActiveRefreshRate() const
 {
-    D3DDDI_RATIONAL rate = {0, 0};
-    // m_ModeInfo/m_CurrentModeIndex point at the active mode. Our
-    // builds emit a fixed 60 Hz signal (see BuildVideoSignalInfo);
-    // surface that to UMD when a source is pinned, otherwise leave
-    // the rate unset so the caller picks a default.
-    if (m_ModeInfo && m_CurrentModeIndex < m_ModeCount)
+    // Every mode carries the host display's refresh rate, so the active
+    // rate does not depend on which mode is pinned; 60 Hz stands in when
+    // the host EDID gave none.
+    D3DDDI_RATIONAL rate = m_EdidRefresh;
+    if (rate.Numerator == 0 || rate.Denominator == 0)
     {
         rate.Numerator = 60;
         rate.Denominator = 1;
@@ -2451,7 +2610,7 @@ void VioGpuVidPN::FlipThread(void *ctx)
     VIOGPU_ASSERT_CHK(KeGetCurrentIrql() < DISPATCH_LEVEL);
 
     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
-    PVOID waitObjects[2] = {&vidpn->m_vsyncTimer, &vidpn->m_flipReadyEvent};
+    PVOID waitObjects[2] = {&vidpn->m_vsyncEvent, &vidpn->m_flipReadyEvent};
 
     // This thread IS the display: it emits every scanout and reports every
     // vsync.  At default priority it starves whenever a benchmark saturates
@@ -2481,20 +2640,15 @@ void VioGpuVidPN::FlipThread(void *ctx)
         // ticking no matter how often the event fires.
         //
         // Re-program only when a mode change alters the refresh rate.  The
-        // ms rounding of KeSetTimerEx's Period is fine: this is a synthetic
-        // cadence for dxgkrnl, not a hardware vblank.
+        // period is exact in 100 ns units: dxgkrnl and DWM pace against the
+        // rate the mode advertises, and a cadence off by a few percent
+        // (120 Hz programmed as 8 ms is 125 Hz) drifts against it.  A
+        // high-resolution timer's due time must be relative.
         LONGLONG period100ns = VsyncPeriodFromRefresh(vidpn->GetActiveRefreshRate());
         if (period100ns != vidpn->m_vsyncTimerPeriod100ns)
         {
             vidpn->m_vsyncTimerPeriod100ns = period100ns;
-            LARGE_INTEGER due;
-            due.QuadPart = -period100ns;
-            LONG periodMs = (LONG)((period100ns + 5000) / 10000);
-            if (periodMs < 1)
-            {
-                periodMs = 1;
-            }
-            KeSetTimerEx(&vidpn->m_vsyncTimer, due, periodMs, NULL);
+            ExSetTimer(vidpn->m_vsyncTimer, -period100ns, period100ns, NULL);
         }
 
         // Timer tick -> Flip() (vsync interrupt + promote).  Fence-retire
@@ -2525,7 +2679,17 @@ void VioGpuVidPN::FlipThread(void *ctx)
         }
     }
 
-    KeCancelTimer(&vidpn->m_vsyncTimer);
+    ExCancelTimer(vidpn->m_vsyncTimer, NULL);
+}
+
+// Runs at DISPATCH_LEVEL on every expiry of the periodic vsync timer.  It
+// only wakes the flip thread; like OnPresentTokenRetired it must stay in
+// non-paged code.
+VOID VioGpuVidPN::VsyncTimerCallback(PEX_TIMER Timer, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Timer);
+    VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(Context);
+    KeSetEvent(&vidpn->m_vsyncEvent, IO_NO_INCREMENT, FALSE);
 }
 
 void VioGpuVidPN::OnPresentTokenRetired()

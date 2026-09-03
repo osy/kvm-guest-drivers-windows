@@ -145,6 +145,9 @@ class VioGpuAdapter : IVioGpuPCI
         return m_Id;
     }
     PBYTE GetEdidData(void);
+    // Valid bytes behind GetEdidData: the base block plus the extension
+    // blocks it announces, bounded by what the host actually transferred.
+    ULONG GetEdidSize(void);
     PBYTE GetCTA861Data(void);
 
   protected:
@@ -184,6 +187,9 @@ class VioGpuAdapter : IVioGpuPCI
     USHORT m_CustomModeIndex;
     ULONG m_Id;
     BYTE m_EDIDs[EDID_RAW_BLOCK_SIZE];
+    // Bytes the host transferred into m_EDIDs; 0 when the built-in EDID
+    // stands in.
+    ULONG m_EdidSize;
     BOOLEAN m_bEDID;
 
     VirtIODevice m_VioDev;

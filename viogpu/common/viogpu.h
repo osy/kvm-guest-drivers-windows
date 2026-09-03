@@ -308,7 +308,11 @@ typedef struct virtio_gpu_resp_edid
 #pragma pack()
 
 #define EDID_V1_BLOCK_SIZE       128
-#define EDID_RAW_BLOCK_SIZE      256
+// Room for the base block plus three extension blocks: QEMU emits a
+// CTA-861 extension and, when the preferred timing does not fit a detailed
+// timing descriptor, a DisplayID extension after it. The fourth block is
+// headroom for hosts that append one more.
+#define EDID_RAW_BLOCK_SIZE      512
 
 /* VIRTIO_GPU_CMD_GET_CAPSET_INFO */
 #define VIRTIO_GPU_MAX_CAPSET_ID 63

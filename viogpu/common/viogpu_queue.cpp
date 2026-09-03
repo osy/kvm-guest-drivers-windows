@@ -402,7 +402,7 @@ BOOLEAN CtrlQueue::AskEdidInfo(PGPU_VBUFFER *buf, UINT id)
     return TRUE;
 }
 
-BOOLEAN CtrlQueue::GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid)
+BOOLEAN CtrlQueue::GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid, PULONG size)
 {
     PAGED_CODE();
 
@@ -420,25 +420,30 @@ BOOLEAN CtrlQueue::GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid)
         return FALSE;
     }
 
-    // Trust resp->size as the bound: the host advertised how many bytes
-    // of resp->edid it actually filled. Clamp to the response buffer
-    // size and to EDID_RAW_BLOCK_SIZE; zero-fill the rest so callers
+    // Each GET_EDID response carries the EDID of the requested scanout
+    // starting at resp->edid[0]. Trust resp->size as the bound: the host
+    // advertised how many bytes it actually filled. Clamp to the response
+    // buffer and to EDID_RAW_BLOCK_SIZE, and zero-fill the rest so callers
     // never parse uninitialized tail bytes shaped by a malicious host.
     ULONG host_size = resp->size;
     if (host_size > sizeof(resp->edid))
     {
         host_size = sizeof(resp->edid);
     }
-    ULONG offset = (ULONG)id * EDID_V1_BLOCK_SIZE;
-    ULONG available = (host_size > offset) ? (host_size - offset) : 0;
-    ULONG to_copy = min(available, (ULONG)EDID_RAW_BLOCK_SIZE);
-    if (to_copy)
+    ULONG to_copy = min(host_size, (ULONG)EDID_RAW_BLOCK_SIZE);
+    if (to_copy < EDID_V1_BLOCK_SIZE)
     {
-        RtlCopyMemory(edid, resp->edid + offset, to_copy);
+        DbgPrint(TRACE_LEVEL_VERBOSE, (" %s short EDID (%u bytes)\n", __FUNCTION__, to_copy));
+        return FALSE;
     }
+    RtlCopyMemory(edid, resp->edid, to_copy);
     if (to_copy < EDID_RAW_BLOCK_SIZE)
     {
         RtlZeroMemory(edid + to_copy, EDID_RAW_BLOCK_SIZE - to_copy);
+    }
+    if (size)
+    {
+        *size = to_copy;
     }
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 

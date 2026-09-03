@@ -65,12 +65,11 @@ class VioGpuVidPN
 
     BOOLEAN GpuObjectAttach(UINT res_id, VioGpuObj *obj);
     PBYTE GetEdidData(UINT Idx);
-    // Valid bytes behind GetEdidData: the host EDID is a full raw block, the
-    // built-in fallback is a single 128-byte block.
-    ULONG GetEdidSize(void)
-    {
-        return m_bEDID ? EDID_RAW_BLOCK_SIZE : EDID_V1_BLOCK_SIZE;
-    }
+    // Valid bytes behind GetEdidData: the base block plus the extension
+    // blocks it announces, bounded by what the host actually transferred.
+    // Serving bytes past that (zero fill) as descriptor data makes dxgkrnl
+    // distrust the EDID.
+    ULONG GetEdidSize(UINT Idx);
 
     PBYTE GetCTA861Data(void);
     void SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo);
@@ -78,6 +77,7 @@ class VioGpuVidPN
     int ProcessEdid(void);
     void FixEdid(void);
     BOOLEAN GetEdids(void);
+    void ParseEdidTiming(void);
     int AddEdidModes(void);
     BOOLEAN UpdateModes(USHORT xres, USHORT yres, int &cnt);
     void SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres);
@@ -146,8 +146,8 @@ class VioGpuVidPN
         SetScanoutSource(res, zero, 0);
     }
 
-    // Currently-committed refresh rate, or {0,0} if no source mode is
-    // pinned. Caller is responsible for choosing a default.
+    // Refresh rate every mode runs at: the host EDID's preferred timing,
+    // or 60/1 when the host gave none. Never {0,0}.
     D3DDDI_RATIONAL GetActiveRefreshRate() const;
 
   private:
@@ -206,7 +206,14 @@ class VioGpuVidPN
     USHORT m_CurrentModeIndex;
     USHORT m_CustomModeIndex;
     BYTE m_EDIDs[MAX_CHILDREN][EDID_RAW_BLOCK_SIZE];
-    BOOLEAN m_bEDID;
+    // Bytes the host transferred into m_EDIDs[i]; 0 when that scanout has
+    // no host EDID and the built-in one stands in.
+    ULONG m_EdidSize[MAX_CHILDREN];
+    // Refresh rate of the preferred timing the host advertised in the EDID
+    // at monitor arrival: every target mode is reported and vsync'd at it.
+    // dxgkrnl reads the monitor descriptor only at arrival, so a change of
+    // host display takes effect at the next driver start.
+    D3DDDI_RATIONAL m_EdidRefresh;
 
     DXGK_DISPLAY_INFORMATION m_SystemDisplayInfo;
     D3DDDI_VIDEO_PRESENT_SOURCE_ID m_SystemDisplaySourceId;
@@ -272,6 +279,10 @@ class VioGpuVidPN
     // vsync tick (which would add up to a full refresh period of latency).
     KEVENT m_flipReadyEvent;
 
+    // Signalled by every expiry of m_vsyncTimer (from its DISPATCH_LEVEL
+    // callback) so the flip thread waits on one auto-reset event per tick.
+    KEVENT m_vsyncEvent;
+
     // Periodic vsync timer.  The vsync cadence MUST be independent of the
     // fence-completion wakes above: a single KeWaitForSingleObject with the
     // period as a relative timeout restarts the period on EVERY wake, and
@@ -280,8 +291,14 @@ class VioGpuVidPN
     // refresh period and the vsync interrupt stops entirely.  Per MSDN, an
     // MMIO flip completes ONLY when the CRTC_VSYNC interrupt reports its
     // address, so starving the tick freezes every queued flip.  A periodic
-    // KTIMER keeps ticking no matter how often the event fires.
-    KTIMER m_vsyncTimer;
+    // timer keeps ticking no matter how often the event fires.  It is a
+    // high-resolution EX_TIMER: its period is programmed in 100 ns units
+    // and honoured to within a clock tick at the raised clock rate, whereas
+    // a KTIMER period is whole milliseconds expiring on the default ~15.6
+    // ms clock, which turns 120 Hz into 125 Hz with a tick's worth of
+    // jitter on top.
+    PEX_TIMER m_vsyncTimer = NULL;
+    static EXT_CALLBACK VsyncTimerCallback;
 
     // Period the timer is currently programmed with (100ns units), so the
     // flip thread re-arms it only when a mode change alters the refresh
