@@ -2005,7 +2005,8 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
     UINT sglsize = sizeof(SCATTER_GATHER_LIST) + (sizeof(SCATTER_GATHER_ELEMENT) * pages);
     size = pages * PAGE_SIZE;
 
-    DbgPrint(TRACE_LEVEL_WARNING, ("%s mapping 0x%llx - %u\n", __FUNCTION__, pPAddr->QuadPart, size));
+    DbgPrint(TRACE_LEVEL_WARNING,
+             ("%s mapping 0x%llx - %u\n", __FUNCTION__, pPAddr ? pPAddr->QuadPart : 0LL, size));
 
     if ((pPAddr == NULL) || pPAddr->QuadPart == 0LL)
     {
@@ -2032,11 +2033,15 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
         }
         m_bMapped = TRUE;
     }
+    // Close() releases the allocation or the mapping by m_Size, so it has to
+    // describe them from the moment they exist, not only once Init succeeds.
+    m_Size = size;
 
     m_pMdl = IoAllocateMdl(m_pVAddr, size, FALSE, FALSE, NULL);
     if (!m_pMdl)
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("%s insufficient resources to allocate MDLs\n", __FUNCTION__));
+        Close();
         return FALSE;
     }
     if (m_bSystemMemory == TRUE)
@@ -2049,15 +2054,22 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             DbgPrint(TRACE_LEVEL_FATAL, ("%s Failed to lock pages with error %x\n", __FUNCTION__, GetExceptionCode()));
+            // Nothing is locked, so Close() must neither unlock the pages nor
+            // free the MDL a second time.
             IoFreeMdl(m_pMdl);
+            m_pMdl = NULL;
+            Close();
             return FALSE;
         }
     }
     m_pSGList = reinterpret_cast<PSCATTER_GATHER_LIST>(new (NonPagedPoolNx) BYTE[sglsize]);
-    m_pSGList->NumberOfElements = 0;
-    m_pSGList->Reserved = 0;
-    //       m_pSAddr = reinterpret_cast<BYTE*>
-    //    (MmGetSystemAddressForMdlSafe(m_pMdl, NormalPagePriority | MdlMappingNoExecute));
+    if (!m_pSGList)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s insufficient resources to allocate a %u byte scatter-gather list\n", __FUNCTION__, sglsize));
+        Close();
+        return FALSE;
+    }
 
     RtlZeroMemory(m_pSGList, sglsize);
     buf = PAGE_ALIGN(m_pVAddr);
@@ -2077,7 +2089,6 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
         buf = (PVOID)((LONG_PTR)(buf) + PAGE_SIZE);
         m_pSGList->NumberOfElements++;
     }
-    m_Size = size;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 
     return TRUE;
@@ -2120,15 +2131,20 @@ void VioGpuMemSegment::Close(void)
     {
         delete[] m_pVAddr;
     }
-    else
+    else if (m_pVAddr)
     {
         UnmapFrameBuffer(m_pVAddr, (ULONG)m_Size);
-        m_bMapped = FALSE;
     }
+    m_bMapped = FALSE;
     m_pVAddr = NULL;
 
     delete[] reinterpret_cast<PBYTE>(m_pSGList);
     m_pSGList = NULL;
+
+    // A closed segment must describe no memory: this object is reused across a
+    // HWClose/HWInit pair, and GetSize() gates VioGpuObj::Init.
+    m_bSystemMemory = FALSE;
+    m_Size = 0;
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
@@ -2168,7 +2184,7 @@ BOOLEAN VioGpuObj::Init(_In_ UINT size, VioGpuMemSegment *pSegment)
     if (size > pSegment->GetSize())
     {
         DbgPrint(TRACE_LEVEL_FATAL,
-                 ("<--- %s segment size too small = %Iu (%u)\n", __FUNCTION__, m_pSegment->GetSize(), size));
+                 ("<--- %s segment size too small = %Iu (%u)\n", __FUNCTION__, pSegment->GetSize(), size));
         return FALSE;
     }
     m_pSegment = pSegment;

@@ -841,12 +841,17 @@ void VioGpuVidPN::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURREN
     if (!obj)
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to allocate frame buffer object\n", __FUNCTION__));
+        m_pAdapter->ctrlQueue.DestroyResource(resid, NotifyResourceDestroyed, &m_pAdapter->resourceIdr);
         return;
     }
     if (!obj->Init(size, &m_pAdapter->frameSegment))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to init obj size = %d\n", __FUNCTION__, size));
         delete obj;
+        // The resource already exists on the host and nothing else frees one
+        // the mode set never adopted; every mode too large for the frame
+        // segment comes through here.
+        m_pAdapter->ctrlQueue.DestroyResource(resid, NotifyResourceDestroyed, &m_pAdapter->resourceIdr);
         return;
     }
 

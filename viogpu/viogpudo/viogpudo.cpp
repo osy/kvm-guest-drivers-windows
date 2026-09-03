@@ -3712,10 +3712,14 @@ BOOLEAN VioGpuAdapter::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, C
     resid = m_Idr.GetId();
     m_CtrlQueue.CreateResource(resid, format, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight);
     obj = new (NonPagedPoolNx) VioGpuObj();
-    if (!obj->Init(size, &m_FrameSegment))
+    if (!obj || !obj->Init(size, &m_FrameSegment))
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to init obj size = %d\n", __FUNCTION__, size));
         delete obj;
+        // The host resource outlives this call otherwise: no other path frees
+        // a frame buffer the mode set never adopted.
+        m_CtrlQueue.DestroyResource(resid, NULL, NULL);
+        m_Idr.PutId(resid);
         return FALSE;
     }
 
@@ -3753,11 +3757,13 @@ BOOLEAN VioGpuAdapter::CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
     resid = (UINT)m_Idr.GetId();
     m_CtrlQueue.CreateResource(resid, format, POINTER_SIZE, POINTER_SIZE);
     obj = new (NonPagedPoolNx) VioGpuObj();
-    if (!obj->Init(size, &m_CursorSegment))
+    if (!obj || !obj->Init(size, &m_CursorSegment))
     {
         VioGpuDbgBreak();
         DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to init obj size = %d\n", __FUNCTION__, size));
         delete obj;
+        m_CtrlQueue.DestroyResource(resid, NULL, NULL);
+        m_Idr.PutId(resid);
         return FALSE;
     }
     if (!GpuObjectAttach(resid, obj))
@@ -3765,6 +3771,8 @@ BOOLEAN VioGpuAdapter::CreateCursor(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPoin
         VioGpuDbgBreak();
         DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s Failed to attach gpu object\n", __FUNCTION__));
         delete obj;
+        m_CtrlQueue.DestroyResource(resid, NULL, NULL);
+        m_Idr.PutId(resid);
         return FALSE;
     }
     m_pCursorBuf = obj;
