@@ -99,7 +99,9 @@ HKR,,TypesSupported,%REG_DWORD%,7
 HKR,, HWCursor,                    %REG_DWORD%, 0
 HKR,, FlexResolution,              %REG_DWORD%, 1
 HKR,, UsePhysicalMemory,           %REG_DWORD%, 0
-HKR,, UserModeDriverName,          %REG_MULTI_SZ%, %13%\neptune_umd.dll,%13%\neptune_umd.dll,%13%\neptune_umd.dll,%13%\neptune_umd.dll
+; The D3D9 slot is "<>" (dxgkrnl's no-driver token): Windows then serves
+; Direct3D 9 through D3D9On12 on top of the D3D12 UMD.
+HKR,, UserModeDriverName,          %REG_MULTI_SZ%, "<>",%13%\neptune_umd.dll,%13%\neptune_umd.dll,%13%\neptune_umd.dll
 INX_WOW_UMDNAME
 HKR,, VulkanDriverName,            %REG_SZ%,       %13%\virtio_icd.json
 

@@ -127,6 +127,20 @@ build additionally packages the two ARM64X view DLLs
 see *ARM64X* below. Any 64-bit build additionally packages
 `neptune_umd_x86.dll` when `MESA_X86_PREFIX` is set; see *WOW64* below.
 
+Windows requires the UMD DLLs' file version to equal the INF `DriverVer`
+(`Device.Graphics.AdapterBase.DriverVersion`). The KMD stamps
+`$(_NT_TARGET_MAJ).$(_RHEL_RELEASE_VERSION_).$(_BUILD_MAJOR_VERSION_).$(_BUILD_MINOR_VERSION_)`
+(`build\Driver.RHEL.props`); pass the same value to the Mesa build as
+`NPT_UMD_VERSION` (build-mesa `build.cmd` forwards it as `-Dnpt_umd_version`),
+which stamps `neptune_umd.dll` and, through `make-arm64x.bat`, the ARM64X
+forwarder.
+
+The INF registers no Direct3D 9 UMD: the D3D9 slot of `UserModeDriverName` is
+the token `<>`, which dxgkrnl reports as "no driver" and which makes the D3D9
+runtime serve Direct3D 9 through `D3D9On12` on top of the D3D12 UMD. Any other
+value in that slot (a UMD without `OpenAdapter`, `d3d9on12.dll` itself, an empty
+string) either fails device creation or hides the adapter entirely.
+
 The package is test-signed during the build. If you sign manually, sign the
 `.sys` and `.cat` with `build\VirtIOTestCert.pfx` (`signtool sign /fd SHA256`).
 

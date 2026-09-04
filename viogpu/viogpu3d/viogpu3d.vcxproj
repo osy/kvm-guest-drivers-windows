@@ -593,7 +593,7 @@
     <!-- %25 is an escaped '%': MSBuild would otherwise read %13 as a hex
          character escape and eat the dirid. -->
     <Substitution Include="INX_WOW_UMDNAME">
-      <ReplaceWith>HKR,, UserModeDriverNameWow,       %25REG_MULTI_SZ%25, %2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll</ReplaceWith>
+      <ReplaceWith>HKR,, UserModeDriverNameWow,       %25REG_MULTI_SZ%25, &quot;&lt;&gt;&quot;,%2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll</ReplaceWith>
     </Substitution>
   </ItemGroup>
   <ItemGroup Condition="'$(UseNeptuneWow)'!='true'">
