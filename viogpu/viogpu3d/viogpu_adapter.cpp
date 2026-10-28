@@ -3630,6 +3630,7 @@ void VioGpuAdapter::ConfigChanged(void)
     if (events_read & VIRTIO_GPU_EVENT_DISPLAY)
     {
         vidpn.GetDisplayInfo();
+        vidpn.AddCustomMonitorMode(0);
         events_clear |= VIRTIO_GPU_EVENT_DISPLAY;
         virtio_set_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_clear), &events_clear, sizeof(events_clear));
 

@@ -2374,6 +2374,66 @@ void VioGpuVidPN::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
     SetVideoModeInfo(m_CustomModeIndex, &tmpModeInfo);
 }
 
+// dxgkrnl builds a monitor's source mode set from RecommendMonitorModes once,
+// when the monitor arrives, and accepts no target mode outside it.  A host
+// size that arrives later only reaches the custom slot, so add it to the set
+// of the monitor that is already there.
+void VioGpuVidPN::AddCustomMonitorMode(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId)
+{
+    PAGED_CODE();
+
+    CONST DXGK_MONITOR_INTERFACE *pMonitorInterface;
+    NTSTATUS Status = m_pDxgkInterface->DxgkCbQueryMonitorInterface(m_pDxgkInterface->DeviceHandle,
+                                                                    DXGK_MONITOR_INTERFACE_VERSION_V1,
+                                                                    &pMonitorInterface);
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("%s DxgkCbQueryMonitorInterface failed with Status = 0x%X\n", __FUNCTION__, Status));
+        return;
+    }
+
+    D3DKMDT_HMONITORSOURCEMODESET hMonitorSourceModeSet;
+    CONST DXGK_MONITORSOURCEMODESET_INTERFACE *pMonitorSourceModeSetInterface;
+    Status = pMonitorInterface->pfnAcquireMonitorSourceModeSet(m_pDxgkInterface->DeviceHandle,
+                                                               TargetId,
+                                                               &hMonitorSourceModeSet,
+                                                               &pMonitorSourceModeSetInterface);
+    if (!NT_SUCCESS(Status))
+    {
+        // No monitor yet: RecommendMonitorModes will offer the slot when it arrives.
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s pfnAcquireMonitorSourceModeSet failed with Status = 0x%X\n", __FUNCTION__, Status));
+        return;
+    }
+
+    PVIDEO_MODE_INFORMATION pModeInfo = &m_ModeInfo[m_CustomModeIndex];
+    D3DKMDT_MONITOR_SOURCE_MODE *pMonitorSourceMode = NULL;
+    Status = pMonitorSourceModeSetInterface->pfnCreateNewModeInfo(hMonitorSourceModeSet, &pMonitorSourceMode);
+    if (NT_SUCCESS(Status))
+    {
+        BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pModeInfo);
+        pMonitorSourceMode->Origin = D3DKMDT_MCO_DRIVER;
+        pMonitorSourceMode->Preference = D3DKMDT_MP_NOTPREFERRED;
+        pMonitorSourceMode->ColorBasis = D3DKMDT_CB_SRGB;
+        pMonitorSourceMode->ColorCoeffDynamicRanges.FirstChannel = 8;
+        pMonitorSourceMode->ColorCoeffDynamicRanges.SecondChannel = 8;
+        pMonitorSourceMode->ColorCoeffDynamicRanges.ThirdChannel = 8;
+        pMonitorSourceMode->ColorCoeffDynamicRanges.FourthChannel = 8;
+
+        Status = pMonitorSourceModeSetInterface->pfnAddMode(hMonitorSourceModeSet, pMonitorSourceMode);
+        if (!NT_SUCCESS(Status))
+        {
+            NTSTATUS TempStatus = pMonitorSourceModeSetInterface->pfnReleaseModeInfo(hMonitorSourceModeSet,
+                                                                                     pMonitorSourceMode);
+            UNREFERENCED_PARAMETER(TempStatus);
+            NT_ASSERT(NT_SUCCESS(TempStatus));
+        }
+    }
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s %dx%d Status = 0x%X\n", __FUNCTION__, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, Status));
+
+    pMonitorInterface->pfnReleaseMonitorSourceModeSet(m_pDxgkInterface->DeviceHandle, hMonitorSourceModeSet);
+}
+
 PAGED_CODE_SEG_END
 
 //
