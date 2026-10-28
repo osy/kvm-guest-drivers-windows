@@ -1943,21 +1943,16 @@ int VioGpuVidPN::ProcessEdid(void)
     if (virtio_is_feature_enabled(m_pAdapter->m_u64HostFeatures, VIRTIO_GPU_F_EDID))
     {
         GetEdids();
-        // The host sizes the EDID for the window as it was at boot.  The
-        // window is resized at will, but the monitor keeps that size, and
-        // Windows derives its recommended scaling from it and the current
-        // mode, so the scaling changed with every resize.  Leave the size
-        // undefined, as the built-in EDID does.
-        if (m_EdidSize[0])
-        {
-            ClearEdidImageSize();
-        }
     }
     else
     {
         FixEdid();
     }
     ParseEdidTiming();
+    if (m_EdidSize[0])
+    {
+        NormalizeHostEdid();
+    }
     return AddEdidModes();
 }
 
@@ -2112,6 +2107,59 @@ void VioGpuVidPN::FixEdid(void)
     PAGED_CODE();
 
     ((PEDID_DATA_V1)GetEdidData(0))->ExtensionFlag[0] = 0;
+    ClearEdidImageSize();
+}
+
+// The host generates its EDID for the window as it is when the EDID is read:
+// the image size, the preferred timing, and -- for a size too large for a
+// detailed timing descriptor -- a DisplayID extension in its place.  Windows
+// keeps a monitor's resolution and scaling under a key that includes the EDID
+// checksum, so a boot at another window size was a new monitor that had
+// neither.  Once the refresh rate has been read from it, hand Windows the same
+// EDID whatever the size.  The image size is left undefined, as the built-in
+// EDID does, because Windows derives its recommended scaling from it and the
+// current mode, so the scaling would follow the window instead.
+void VioGpuVidPN::NormalizeHostEdid(void)
+{
+    PAGED_CODE();
+
+    // 1024x768 at 60 Hz (VESA DMT), the mode the driver prefers.
+    static const UCHAR PreferredTiming[sizeof(EDID_DETAILED_DESCRIPTOR)] =
+        {0x64, 0x19, 0x00, 0x40, 0x41, 0x00, 0x26, 0x30, 0x18, 0x88, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18};
+    static const UCHAR DummyDescriptor[sizeof(EDID_DETAILED_DESCRIPTOR)] = {0x00, 0x00, 0x00, 0x10};
+
+    PUCHAR buf = GetEdidData(0);
+    PEDID_DATA_V1 pdata = (PEDID_DATA_V1)buf;
+    EDID_DETAILED_DESCRIPTOR desc[4];
+    UINT count = 0;
+
+    // The preferred timing first, then the display descriptors (range limits,
+    // name, ...) in their order, whichever slots the host put them in.
+    RtlCopyMemory(&desc[count++], PreferredTiming, sizeof(PreferredTiming));
+    for (UINT i = 0; i < 4 && count < 4; i++)
+    {
+        PEDID_DISPLAY_DESCRIPTOR disp = (PEDID_DISPLAY_DESCRIPTOR)&pdata->EDIDDetailedTimings[i];
+        if (pdata->EDIDDetailedTimings[i].PixelClock == 0 && disp->Tag[3] != 0x10)
+        {
+            RtlCopyMemory(&desc[count++], disp, sizeof(desc[0]));
+        }
+    }
+    while (count < 4)
+    {
+        RtlCopyMemory(&desc[count++], DummyDescriptor, sizeof(DummyDescriptor));
+    }
+    RtlCopyMemory(pdata->EDIDDetailedTimings, desc, sizeof(desc));
+
+    // Keep the extensions before the DisplayID block.
+    for (ULONG blk = 1; blk <= pdata->ExtensionFlag[0]; blk++)
+    {
+        if ((blk + 1) * EDID_V1_BLOCK_SIZE > m_EdidSize[0] || buf[blk * EDID_V1_BLOCK_SIZE] == 0x70)
+        {
+            pdata->ExtensionFlag[0] = (UCHAR)(blk - 1);
+            break;
+        }
+    }
+
     ClearEdidImageSize();
 }
 

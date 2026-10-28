@@ -77,6 +77,7 @@ class VioGpuVidPN
     int ProcessEdid(void);
     void FixEdid(void);
     void ClearEdidImageSize(void);
+    void NormalizeHostEdid(void);
     BOOLEAN GetEdids(void);
     void ParseEdidTiming(void);
     int AddEdidModes(void);
