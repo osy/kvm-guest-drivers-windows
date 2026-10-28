@@ -1943,6 +1943,15 @@ int VioGpuVidPN::ProcessEdid(void)
     if (virtio_is_feature_enabled(m_pAdapter->m_u64HostFeatures, VIRTIO_GPU_F_EDID))
     {
         GetEdids();
+        // The host sizes the EDID for the window as it was at boot.  The
+        // window is resized at will, but the monitor keeps that size, and
+        // Windows derives its recommended scaling from it and the current
+        // mode, so the scaling changed with every resize.  Leave the size
+        // undefined, as the built-in EDID does.
+        if (m_EdidSize[0])
+        {
+            ClearEdidImageSize();
+        }
     }
     else
     {
@@ -2102,13 +2111,19 @@ void VioGpuVidPN::FixEdid(void)
 {
     PAGED_CODE();
 
+    ((PEDID_DATA_V1)GetEdidData(0))->ExtensionFlag[0] = 0;
+    ClearEdidImageSize();
+}
+
+void VioGpuVidPN::ClearEdidImageSize(void)
+{
+    PAGED_CODE();
+
     UCHAR Sum = 0;
     PUCHAR buf = GetEdidData(0);
-    ;
     PEDID_DATA_V1 pdata = (PEDID_DATA_V1)buf;
     pdata->MaximumHorizontalImageSize[0] = 0;
     pdata->MaximumVerticallImageSize[0] = 0;
-    pdata->ExtensionFlag[0] = 0;
     pdata->Checksum[0] = 0;
     for (ULONG i = 0; i < EDID_V1_BLOCK_SIZE; i++)
     {
