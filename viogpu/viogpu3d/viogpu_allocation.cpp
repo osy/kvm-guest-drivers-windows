@@ -169,6 +169,7 @@ static BOOLEAN IsLinear32BppVirtioFormat(ULONG format)
         case VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM:
         case VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM:
         case VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM:
+        case VIRTIO_GPU_FORMAT_R10G10B10A2_UNORM:
             return TRUE;
         default:
             return FALSE;
@@ -830,6 +831,8 @@ D3DDDIFORMAT VioGpuToD3DDDIColorFormat(virtio_gpu_formats format)
             return D3DDDIFMT_A8B8G8R8;
         case VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM:
             return D3DDDIFMT_X8B8G8R8;
+        case VIRTIO_GPU_FORMAT_R10G10B10A2_UNORM:
+            return D3DDDIFMT_A2B10G10R10;
     }
     DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Unsupported color format %d\n", __FUNCTION__, format));
     return D3DDDIFMT_X8B8G8R8;
@@ -1275,6 +1278,7 @@ static D3DDDIFORMAT VioGpuDxgiFormatToD3DDDI(UINT dxgiFormat)
     case 87: /* DXGI_FORMAT_B8G8R8A8_UNORM */ return D3DDDIFMT_A8R8G8B8;
     case 88: /* DXGI_FORMAT_B8G8R8X8_UNORM */ return D3DDDIFMT_X8R8G8B8;
     case 28: /* DXGI_FORMAT_R8G8B8A8_UNORM */ return D3DDDIFMT_A8B8G8R8;
+    case 24: /* DXGI_FORMAT_R10G10B10A2_UNORM */ return D3DDDIFMT_A2B10G10R10;
     default:                                  return D3DDDIFMT_A8R8G8B8;
     }
 }
