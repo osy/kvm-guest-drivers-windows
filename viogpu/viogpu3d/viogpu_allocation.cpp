@@ -42,6 +42,11 @@ void VioGpuAllocation::InitCommon(VioGpuAdapter *adapter)
     m_deferReleaseCount = 0;
     m_deferReleaseQueued = 0;
     KeInitializeDpc(&m_deferReleaseDpc, VioGpuAllocation::DeferredReleaseDpc, this);
+    // Listed for ReplayHostResources; it skips blobs, so read as one until
+    // the constructor says otherwise.
+    m_IsBlob = TRUE;
+    m_HostGeneration = m_adapter->GetHostGeneration();
+    m_adapter->TrackAllocation(this, TRUE);
 }
 
 VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_OPTIONS *options, ULONGLONG size)
@@ -385,6 +390,7 @@ VioGpuAllocation::~VioGpuAllocation(void)
     m_adapter->PendingCreateRemove(this);
     m_adapter->KmtMapRemoveByAllocation(this);
     m_adapter->CookieMapRemoveByAllocation(this);
+    m_adapter->TrackAllocation(this, FALSE);
 
     // Tear down the KMD-owned shmem mappings (WDDM2).  A user VA must be
     // unmapped in the process it was mapped into before the BAR window is
@@ -573,6 +579,50 @@ void VioGpuAllocation::DetachBacking()
 
     m_adapter->ctrlQueue.DetachBacking(m_Id);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void VioGpuAllocation::ReplayHostResource()
+{
+    PAGED_CODE();
+
+    if (m_IsBlob || m_Id == 0)
+    {
+        return;
+    }
+
+    auto lock_guard = LockGuard();
+
+    m_adapter->ctrlQueue.CreateResource3D(m_Id, &m_3dOptions);
+    m_HostGeneration = m_adapter->GetHostGeneration();
+    if (!m_BackingAttached)
+    {
+        return;
+    }
+
+    // The pages the host had: GpuMmu residency (HandlePageTableUpdate) or a
+    // paging MDL (AttachBacking).  The queue takes ownership of the array.
+    const size_t total = (size_t)((m_Size + PAGE_SIZE - 1) >> PAGE_SHIFT);
+    const BOOLEAN fromGpummu = m_GpummuPages != NULL && m_GpummuFilled == total;
+    const size_t count = fromGpummu ? total : m_pageCount;
+    if (count == 0 || (!fromGpummu && m_pMDL == NULL))
+    {
+        m_BackingAttached = FALSE;
+        return;
+    }
+    GPU_MEM_ENTRY *ents = new (NonPagedPoolNx) GPU_MEM_ENTRY[count];
+    if (ents == NULL)
+    {
+        m_BackingAttached = FALSE;
+        return;
+    }
+    for (size_t i = 0; i < count; i++)
+    {
+        ents[i].addr = fromGpummu ? m_GpummuPages[i]
+                                  : (ULONGLONG)MmGetMdlPfnArray(m_pMDL)[m_pageOffset + i] << PAGE_SHIFT;
+        ents[i].length = PAGE_SIZE;
+        ents[i].padding = 0;
+    }
+    m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)count);
 }
 
 void VioGpuAllocation::HandlePageTableUpdate(const DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE *upt)
