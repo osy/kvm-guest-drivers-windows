@@ -108,6 +108,12 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
 
     DEVICE_POWER_STATE m_MonitorPowerState;
     DEVICE_POWER_STATE m_AdapterPowerState;
+    // Set by the D3 teardown: the host lost everything (see RequestAdapterReset).
+    BOOLEAN m_HostStateLost = FALSE;
+    // Every live VioGpuAllocation (TrackAllocation / ReplayHostResources).
+    LIST_ENTRY m_LiveAllocations;
+    KSPIN_LOCK m_LiveAllocationsLock;
+    volatile LONG m_HostGeneration = 0;
     DRIVER_STATUS_FLAG m_Flags;
 
     DXGKARG_SETPOINTERSHAPE m_PointerShape;
@@ -361,6 +367,36 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     // sync-up under the interrupt lock for the same atomicity reason as the
     // preempt ack above.  Returns the fence id everything was synced to.
     UINT ResetFenceStateFromTimeout(void);
+
+    // Power-up after D3.  D3 resets the virtio device, which makes the host
+    // drop every resource and context it held for us (after a hibernation
+    // the host is a freshly started device anyway), while dxgkrnl, DWM and
+    // the UMDs still hold allocations and contexts that refer to them.
+    // Nothing on the guest side can re-create the UMDs' host state, so ask
+    // dxgkrnl for an adapter-wide reset (as after a TDR): every device is
+    // lost and re-created against the fresh host.  Raised from the flip
+    // thread shortly after D0 (see VioGpuVidPN::Powerup).
+    void RequestAdapterReset(void);
+
+    // The adapter reset makes every DEVICE drop its allocations, but the
+    // ones dxgkrnl owns itself (shared primary, shadow and staging surfaces:
+    // DxgkDdiGetStandardAllocationDriverData) live on, and DWM re-opens
+    // them by res_id.  Those are plain RESOURCE_CREATE_3D resources the KMD
+    // fully describes, so re-create them (and re-attach their guest pages)
+    // on the fresh host at D0.  Every live allocation is tracked for this.
+    void TrackAllocation(VioGpuAllocation *allocation, BOOLEAN live);
+    void ReplayHostResources(void);
+
+    // Counts host losses (D3 -> D0).  An allocation remembers the generation
+    // its host object belongs to; one from an older generation that was not
+    // replayed (an app's shared surface: its host blob and the Neptune
+    // context that exported it are gone) cannot be opened any more --
+    // VioGpuDevice::OpenAllocation fails the open instead of handing the UMD
+    // a res_id the host does not know (DWM dies on that).
+    LONG GetHostGeneration() const
+    {
+        return m_HostGeneration;
+    }
 
     // ---- present-fence tokens (render -> flip ordering) ------------------
     //
