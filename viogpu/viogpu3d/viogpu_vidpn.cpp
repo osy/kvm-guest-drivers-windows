@@ -2755,7 +2755,8 @@ void VioGpuVidPN::FlipThread(void *ctx)
 
     for (;;)
     {
-        // The vsync tick comes from a PERIODIC timer, not from a wait
+        // The vsync tick comes from a timer on its own schedule (re-armed
+        // only by the tick itself, see ArmVsyncTimer), not from a wait
         // timeout.  A relative timeout restarts the full period on every
         // wake, and m_flipReadyEvent fires on every present-fence completion
         // adapter-wide (one per ID3D11Fence::SetEventOnCompletion, from
@@ -2764,10 +2765,11 @@ void VioGpuVidPN::FlipThread(void *ctx)
         // MMIO-flip contract (DxgkDdiSetVidPnSourceAddress: completion is
         // reported only by the CRTC_VSYNC interrupt's effective scan
         // address) every queued flip stops completing: the screen freezes on
-        // one frame while rendering continues.  The periodic timer keeps
-        // ticking no matter how often the event fires.
+        // one frame while rendering continues.  The timer keeps ticking
+        // no matter how often the event fires.
         //
-        // Re-program only when a mode change alters the refresh rate.  The
+        // Programmed here at start and when a mode change alters the
+        // refresh rate; each tick then re-arms it (ArmVsyncTimer).  The
         // period is exact in 100 ns units: dxgkrnl and DWM pace against the
         // rate the mode advertises, and a cadence off by a few percent
         // (120 Hz programmed as 8 ms is 125 Hz) drifts against it.  A
@@ -2776,7 +2778,7 @@ void VioGpuVidPN::FlipThread(void *ctx)
         if (period100ns != vidpn->m_vsyncTimerPeriod100ns)
         {
             vidpn->m_vsyncTimerPeriod100ns = period100ns;
-            ExSetTimer(vidpn->m_vsyncTimer, -period100ns, period100ns, NULL);
+            vidpn->ArmVsyncTimer(TRUE);
         }
 
         // Timer tick -> Flip() (vsync interrupt + promote).  Fence-retire
@@ -2799,6 +2801,9 @@ void VioGpuVidPN::FlipThread(void *ctx)
         }
         if (wait == STATUS_WAIT_0)
         {
+            // First thing on the tick, so the work below does not move the
+            // next slot.
+            vidpn->ArmVsyncTimer(FALSE);
             vidpn->Flip();
         }
         else
@@ -2810,7 +2815,26 @@ void VioGpuVidPN::FlipThread(void *ctx)
     ExCancelTimer(vidpn->m_vsyncTimer, NULL);
 }
 
-// Runs at DISPATCH_LEVEL on every expiry of the periodic vsync timer.  It
+// Arm the one-shot vsync timer for the next slot of the absolute schedule
+// (see m_nextVsyncDue).  restart: the schedule starts one period from now
+// (thread start, refresh-rate change).  Otherwise it advances one period
+// from the previous slot; a thread that fell more than a period behind
+// resynchronises instead of firing a burst of catch-up ticks.  Flip thread
+// only (PASSIVE).
+void VioGpuVidPN::ArmVsyncTimer(BOOLEAN restart)
+{
+    const ULONGLONG period = (ULONGLONG)m_vsyncTimerPeriod100ns;
+    const ULONGLONG now = KeQueryInterruptTime();
+    m_nextVsyncDue = restart ? now + period : m_nextVsyncDue + period;
+    if ((LONGLONG)(m_nextVsyncDue - now) <= 0)
+    {
+        m_nextVsyncDue = now + period;
+    }
+    // A high-resolution timer's due time must be relative.
+    ExSetTimer(m_vsyncTimer, -(LONGLONG)(m_nextVsyncDue - now), 0, NULL);
+}
+
+// Runs at DISPATCH_LEVEL on every expiry of the vsync timer.  It
 // only wakes the flip thread; like OnPresentTokenRetired it must stay in
 // non-paged code.
 VOID VioGpuVidPN::VsyncTimerCallback(PEX_TIMER Timer, PVOID Context)

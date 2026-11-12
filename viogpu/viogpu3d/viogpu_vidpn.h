@@ -286,27 +286,39 @@ class VioGpuVidPN
     // callback) so the flip thread waits on one auto-reset event per tick.
     KEVENT m_vsyncEvent;
 
-    // Periodic vsync timer.  The vsync cadence MUST be independent of the
+    // Vsync timer (one-shot, re-armed by each tick for the next slot of
+    // m_nextVsyncDue's schedule).  The vsync cadence MUST be independent of the
     // fence-completion wakes above: a single KeWaitForSingleObject with the
     // period as a relative timeout restarts the period on EVERY wake, and
     // present-fence completions arrive per ID3D11Fence::SetEventOnCompletion
     // from every process -- under load their inter-arrival stays below the
     // refresh period and the vsync interrupt stops entirely.  Per MSDN, an
     // MMIO flip completes ONLY when the CRTC_VSYNC interrupt reports its
-    // address, so starving the tick freezes every queued flip.  A periodic
-    // timer keeps ticking no matter how often the event fires.  It is a
-    // high-resolution EX_TIMER: its period is programmed in 100 ns units
-    // and honoured to within a clock tick at the raised clock rate, whereas
+    // address, so starving the tick freezes every queued flip.  A self-
+    // re-arming timer keeps ticking no matter how often the event fires.
+    // It is a high-resolution EX_TIMER: its due time is programmed in 100 ns
+    // units and honoured to within a clock tick at the raised clock rate, whereas
     // a KTIMER period is whole milliseconds expiring on the default ~15.6
     // ms clock, which turns 120 Hz into 125 Hz with a tick's worth of
     // jitter on top.
     PEX_TIMER m_vsyncTimer = NULL;
     static EXT_CALLBACK VsyncTimerCallback;
 
-    // Period the timer is currently programmed with (100ns units), so the
-    // flip thread re-arms it only when a mode change alters the refresh
-    // rate.
+    // Vsync period in effect (100ns units), so the flip thread restarts
+    // the schedule only when a mode change alters the refresh rate.
     LONGLONG m_vsyncTimerPeriod100ns = 0;
+
+    // Interrupt time (KeQueryInterruptTime) of the next vsync tick.  The
+    // tick is a ONE-SHOT timer re-armed for the next slot of this absolute
+    // schedule, not a periodic EX_TIMER: in a Windows 11 ARM64 guest under
+    // QEMU/HVF the periodic high-resolution timer was measured expiring
+    // every 13.8-15.4 ms for a 13.33 ms (75 Hz) period and 17.1-17.4 ms for
+    // 16.67 ms (60 Hz) -- 4-15 % slow, and every missing vsync is a frame
+    // DWM can never show.  Re-arming relative to the slot rather than to
+    // the expiry keeps the average rate exact; a late expiry only shortens
+    // the next interval.
+    ULONGLONG m_nextVsyncDue = 0;
+    void ArmVsyncTimer(BOOLEAN restart);
 
     // Diagnostics for the bounded fallback: a flip promoted without its token
     // means a completion was lost.  Must stay zero in healthy operation.
