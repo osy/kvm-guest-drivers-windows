@@ -2642,11 +2642,11 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
         }
     }
 
-    // Blob primaries (the blt-present standing dmabuf set via
-    // SetScanoutSource) scan out by res_id through SetScanoutBlob and carry
-    // no guest PrimaryAddress, so flush them regardless of address; only 3D
-    // primaries are gated on a non-zero MMIO-flip address.
-    if (res != NULL && (address.QuadPart != 0 || res->IsBlob()))
+    // Both kinds of primary scan out by res_id (SetScanoutBlob for blobs,
+    // SetScanout for 3D resources); the address only feeds the vsync report
+    // and is still 0 for a primary latched by a present before the first
+    // SetVidPnSourceAddress, so it must not gate the scanout.
+    if (res != NULL)
     {
         res->FlushToScreen(0);
     }
