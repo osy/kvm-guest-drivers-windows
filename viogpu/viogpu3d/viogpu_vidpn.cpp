@@ -269,6 +269,16 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
         m_pFlipThread = NULL;
     }
 
+    // The flip thread is gone: drop the latched primary and any pending
+    // flip, so a later Start cannot scan out a resource the virtio reset
+    // took away from the host (TryPromoteFlip shows whatever is latched).
+    if (m_sourceRes)
+    {
+        m_sourceRes->Release();
+        m_sourceRes = NULL;
+    }
+    m_shouldFlip = 0;
+
     BlackOutScreen(&m_CurrentModes[SourceId]);
     DestroyFrameBufferObj(TRUE);
 
