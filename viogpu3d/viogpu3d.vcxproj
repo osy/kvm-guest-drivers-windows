@@ -503,176 +503,141 @@
     </FilesToPackage>
   </ItemGroup>
   <ItemGroup>
-    <Inf Include="viogpu3d.inx" />
+    <!-- Stamp the INF on every build. Its contents depend on which user-mode
+         files are packaged and on the revision stamps, not only on the INX,
+         and the substitutions below edit the stamped file in place. -->
+    <Inf Include="viogpu3d.inx">
+      <MinimalRebuildFromTracking>false</MinimalRebuildFromTracking>
+    </Inf>
   </ItemGroup>
-  <!--  <ItemGroup Condition="'$(BUILD_RESOLUTIONS_USERMODE)'!=''"> -->
-  <PropertyGroup Condition="Exists('$(MESA_PREFIX)\bin\neptune_umd.dll')">
-    <UseNeptuneArm64x Condition="'$(Platform)'=='ARM64' AND '$(MESA_ARM64X_PREFIX)'!='' AND Exists('$(MESA_ARM64X_PREFIX)\neptune_umd_ec.dll')">true</UseNeptuneArm64x>
-    <NeptuneUmdSource Condition="'$(UseNeptuneArm64x)'=='true'">$(MESA_ARM64X_PREFIX)\neptune_umd.dll</NeptuneUmdSource>
-    <NeptuneUmdSource Condition="'$(UseNeptuneArm64x)'!='true'">$(MESA_PREFIX)\bin\neptune_umd.dll</NeptuneUmdSource>
-    <!-- 32-bit (WOW64) user-mode driver, for x86 D3D apps on an x64 or ARM64
-         guest. An ARM64X image is PE32+ and has no 32-bit view, so this is a
-         separate x86 build. Pointless on a 32-bit KMD, where it would be the
-         native UMD rather than the WOW one. -->
-    <UseNeptuneWow Condition="'$(Platform)'!='Win32' AND '$(MESA_X86_PREFIX)'!='' AND Exists('$(MESA_X86_PREFIX)\bin\neptune_umd.dll')">true</UseNeptuneWow>
-    <NeptuneWowUmdSource>$(MESA_X86_PREFIX)\bin\neptune_umd.dll</NeptuneWowUmdSource>
-    <!-- Staged under a distinct name: it shares the DriverStore directory with
-         the 64-bit UMD (dirid 13 has no WoW64 redirection) and dirid 13 forbids
-         renaming in CopyFiles, so the rename has to happen at build time. -->
-    <NeptuneWowUmd>$(IntDir)neptune_umd_x86.dll</NeptuneWowUmd>
+  <!-- User-mode driver files.
+
+       VIOGPU_UMD_DIR (an environment variable or an MSBuild property) names a
+       flat directory that holds the user-mode half of the package under its
+       final file names. The three base files are required. Each optional set
+       is packaged when it is present, and the INF gains the matching lines:
+
+         neptune_umd.dll, vulkan_virtio.dll, virtio_icd.json   required
+         neptune_umd_arm64.dll + neptune_umd_ec.dll            ARM64X Direct3D views
+         vulkan_virtio_arm64.dll + vulkan_virtio_ec.dll        ARM64X Vulkan views
+         neptune_umd_x86.dll                                   WOW64 Direct3D driver
+
+       Without VIOGPU_UMD_DIR the driver still compiles and links, which is
+       enough for working on it in Visual Studio, but no package is assembled. -->
+  <PropertyGroup>
+    <UmdDir>$(VIOGPU_UMD_DIR)</UmdDir>
+    <UmdDir Condition="'$(UmdDir)'!='' AND !HasTrailingSlash('$(UmdDir)')">$(UmdDir)\</UmdDir>
+    <UseUmd Condition="'$(UmdDir)'!=''">true</UseUmd>
+    <UseNeptuneArm64x Condition="'$(UseUmd)'=='true' AND Exists('$(UmdDir)neptune_umd_ec.dll')">true</UseNeptuneArm64x>
+    <UseVulkanArm64x Condition="'$(UseUmd)'=='true' AND Exists('$(UmdDir)vulkan_virtio_ec.dll')">true</UseVulkanArm64x>
+    <UseNeptuneWow Condition="'$(UseUmd)'=='true' AND Exists('$(UmdDir)neptune_umd_x86.dll')">true</UseNeptuneWow>
   </PropertyGroup>
-  <!-- ARM64X Vulkan ICD: the same forwarder scheme as the UMD, so x64 and
-       ARM64EC Vulkan apps load the arm64ec venus build through the EC view. -->
-  <PropertyGroup Condition="Exists('$(MESA_PREFIX)\bin\vulkan_virtio.dll')">
-    <UseVulkanArm64x Condition="'$(Platform)'=='ARM64' AND '$(MESA_ARM64X_PREFIX)'!='' AND Exists('$(MESA_ARM64X_PREFIX)\vulkan_virtio_ec.dll')">true</UseVulkanArm64x>
-    <VulkanIcdSource Condition="'$(UseVulkanArm64x)'=='true'">$(MESA_ARM64X_PREFIX)\vulkan_virtio.dll</VulkanIcdSource>
-    <VulkanIcdSource Condition="'$(UseVulkanArm64x)'!='true'">$(MESA_PREFIX)\bin\vulkan_virtio.dll</VulkanIcdSource>
+  <PropertyGroup Condition="'$(UseUmd)'!='true'">
+    <Feature_PackOne>false</Feature_PackOne>
+    <EnableInf2cat>false</EnableInf2cat>
   </PropertyGroup>
-  <ItemGroup Condition="Exists('$(MESA_PREFIX)\bin\vulkan_virtio.dll')">
-    <FilesToPackage Include="$(ProjectDir)icd\virtio_icd.json">
+  <ItemGroup Condition="'$(UseUmd)'=='true'">
+    <UmdFile Include="$(UmdDir)neptune_umd.dll;$(UmdDir)vulkan_virtio.dll;$(UmdDir)virtio_icd.json" />
+    <UmdFile Condition="'$(UseNeptuneArm64x)'=='true'" Include="$(UmdDir)neptune_umd_arm64.dll;$(UmdDir)neptune_umd_ec.dll" />
+    <UmdFile Condition="'$(UseVulkanArm64x)'=='true'" Include="$(UmdDir)vulkan_virtio_arm64.dll;$(UmdDir)vulkan_virtio_ec.dll" />
+    <UmdFile Condition="'$(UseNeptuneWow)'=='true'" Include="$(UmdDir)neptune_umd_x86.dll" />
+    <FilesToPackage Include="@(UmdFile)">
       <PackageRelativeDirectory>
       </PackageRelativeDirectory>
     </FilesToPackage>
-    <FilesToPackage Include="$(VulkanIcdSource)">
-      <PackageRelativeDirectory>
-      </PackageRelativeDirectory>
-    </FilesToPackage>
-    <FilesToPackage Include="$(NeptuneUmdSource)">
-      <PackageRelativeDirectory>
-      </PackageRelativeDirectory>
-    </FilesToPackage>
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseNeptuneArm64x)'=='true'">
-    <FilesToPackage Include="$(MESA_ARM64X_PREFIX)\neptune_umd_arm64.dll">
-      <PackageRelativeDirectory>
-      </PackageRelativeDirectory>
-    </FilesToPackage>
-    <FilesToPackage Include="$(MESA_ARM64X_PREFIX)\neptune_umd_ec.dll">
-      <PackageRelativeDirectory>
-      </PackageRelativeDirectory>
-    </FilesToPackage>
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseVulkanArm64x)'=='true'">
-    <FilesToPackage Include="$(MESA_ARM64X_PREFIX)\vulkan_virtio_arm64.dll">
-      <PackageRelativeDirectory>
-      </PackageRelativeDirectory>
-    </FilesToPackage>
-    <FilesToPackage Include="$(MESA_ARM64X_PREFIX)\vulkan_virtio_ec.dll">
-      <PackageRelativeDirectory>
-      </PackageRelativeDirectory>
-    </FilesToPackage>
-    <PackOne_Files Include="$(MESA_ARM64X_PREFIX)\vulkan_virtio_arm64.dll" />
-    <PackOne_Files Include="$(MESA_ARM64X_PREFIX)\vulkan_virtio_ec.dll" />
-    <Substitution Include="INX_VK_ARM64X_NATIVE_SRCDISK">
-      <ReplaceWith>vulkan_virtio_arm64.dll = 1,,</ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_VK_ARM64X_EC_SRCDISK">
-      <ReplaceWith>vulkan_virtio_ec.dll = 1,,</ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_VK_ARM64X_NATIVE_COPY">
-      <ReplaceWith>vulkan_virtio_arm64.dll,,,0</ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_VK_ARM64X_EC_COPY">
-      <ReplaceWith>vulkan_virtio_ec.dll,,,0</ReplaceWith>
-    </Substitution>
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseVulkanArm64x)'!='true'">
-    <Substitution Include="INX_VK_ARM64X_NATIVE_SRCDISK">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_VK_ARM64X_EC_SRCDISK">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_VK_ARM64X_NATIVE_COPY">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_VK_ARM64X_EC_COPY">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseNeptuneWow)'=='true'">
-    <FilesToPackage Include="$(NeptuneWowUmd)">
-      <PackageRelativeDirectory>
-      </PackageRelativeDirectory>
-    </FilesToPackage>
-  </ItemGroup>
-  <ItemGroup Condition="Exists('$(MESA_PREFIX)\bin\vulkan_virtio.dll')">
     <PackOne_Files Include="..\viogpuap\$(OutDir)viogpuap.exe" />
     <PackOne_Files Include="..\viogpuap\$(OutDir)viogpuap.pdb" />
     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.exe" />
     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.pdb" />
-    <PackOne_Files Include="$(ProjectDir)icd\virtio_icd.json" />
-    <PackOne_Files Include="$(VulkanIcdSource)" />
+    <PackOne_Files Include="@(UmdFile)" />
   </ItemGroup>
-  <ItemGroup Condition="Exists('$(NeptuneUmdSource)')">
-    <PackOne_Files Include="$(NeptuneUmdSource)" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseNeptuneArm64x)'=='true'">
-    <PackOne_Files Include="$(MESA_ARM64X_PREFIX)\neptune_umd_arm64.dll" />
-    <PackOne_Files Include="$(MESA_ARM64X_PREFIX)\neptune_umd_ec.dll" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseNeptuneWow)'=='true'">
-    <PackOne_Files Include="$(NeptuneWowUmd)" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseNeptuneArm64x)'=='true'">
+  <!-- INF lines for the optional user-mode files. A substitution without a
+       value removes its placeholder. -->
+  <ItemGroup>
     <Substitution Include="INX_ARM64X_NATIVE_SRCDISK">
-      <ReplaceWith>neptune_umd_arm64.dll = 1,,</ReplaceWith>
+      <ReplaceWith Condition="'$(UseNeptuneArm64x)'=='true'">neptune_umd_arm64.dll = 1,,</ReplaceWith>
     </Substitution>
     <Substitution Include="INX_ARM64X_EC_SRCDISK">
-      <ReplaceWith>neptune_umd_ec.dll = 1,,</ReplaceWith>
+      <ReplaceWith Condition="'$(UseNeptuneArm64x)'=='true'">neptune_umd_ec.dll = 1,,</ReplaceWith>
     </Substitution>
     <Substitution Include="INX_ARM64X_NATIVE_COPY">
-      <ReplaceWith>neptune_umd_arm64.dll,,,0</ReplaceWith>
+      <ReplaceWith Condition="'$(UseNeptuneArm64x)'=='true'">neptune_umd_arm64.dll,,,0</ReplaceWith>
     </Substitution>
     <Substitution Include="INX_ARM64X_EC_COPY">
-      <ReplaceWith>neptune_umd_ec.dll,,,0</ReplaceWith>
+      <ReplaceWith Condition="'$(UseNeptuneArm64x)'=='true'">neptune_umd_ec.dll,,,0</ReplaceWith>
     </Substitution>
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseNeptuneWow)'=='true'">
+    <Substitution Include="INX_VK_ARM64X_NATIVE_SRCDISK">
+      <ReplaceWith Condition="'$(UseVulkanArm64x)'=='true'">vulkan_virtio_arm64.dll = 1,,</ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_EC_SRCDISK">
+      <ReplaceWith Condition="'$(UseVulkanArm64x)'=='true'">vulkan_virtio_ec.dll = 1,,</ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_NATIVE_COPY">
+      <ReplaceWith Condition="'$(UseVulkanArm64x)'=='true'">vulkan_virtio_arm64.dll,,,0</ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_EC_COPY">
+      <ReplaceWith Condition="'$(UseVulkanArm64x)'=='true'">vulkan_virtio_ec.dll,,,0</ReplaceWith>
+    </Substitution>
+    <!-- The 32-bit driver has its own name because it shares the DriverStore
+         directory with the 64-bit one: dirid 13 has no WoW64 redirection and
+         forbids renaming in CopyFiles. -->
     <Substitution Include="INX_WOW_SRCDISK">
-      <ReplaceWith>neptune_umd_x86.dll = 1,,</ReplaceWith>
+      <ReplaceWith Condition="'$(UseNeptuneWow)'=='true'">neptune_umd_x86.dll = 1,,</ReplaceWith>
     </Substitution>
     <Substitution Include="INX_WOW_COPY">
-      <ReplaceWith>neptune_umd_x86.dll,,,0</ReplaceWith>
+      <ReplaceWith Condition="'$(UseNeptuneWow)'=='true'">neptune_umd_x86.dll,,,0</ReplaceWith>
     </Substitution>
     <!-- %25 is an escaped '%': MSBuild would otherwise read %13 as a hex
          character escape and eat the dirid. -->
     <Substitution Include="INX_WOW_UMDNAME">
-      <ReplaceWith>HKR,, UserModeDriverNameWow,       %25REG_MULTI_SZ%25, &quot;&lt;&gt;&quot;,%2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll</ReplaceWith>
+      <ReplaceWith Condition="'$(UseNeptuneWow)'=='true'">HKR,, UserModeDriverNameWow,       %25REG_MULTI_SZ%25, &quot;&lt;&gt;&quot;,%2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll,%2513%25\neptune_umd_x86.dll</ReplaceWith>
     </Substitution>
   </ItemGroup>
-  <ItemGroup Condition="'$(UseNeptuneWow)'!='true'">
-    <Substitution Include="INX_WOW_SRCDISK">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_WOW_COPY">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_WOW_UMDNAME">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-  </ItemGroup>
-  <ItemGroup Condition="'$(UseNeptuneArm64x)'!='true'">
-    <Substitution Include="INX_ARM64X_NATIVE_SRCDISK">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_ARM64X_EC_SRCDISK">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_ARM64X_NATIVE_COPY">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-    <Substitution Include="INX_ARM64X_EC_COPY">
-      <ReplaceWith></ReplaceWith>
-    </Substitution>
-  </ItemGroup>
-  <Target Name="StageNeptuneWowUmd" BeforeTargets="PrepareForBuild" Condition="'$(UseNeptuneWow)'=='true'" Inputs="$(NeptuneWowUmdSource)" Outputs="$(NeptuneWowUmd)">
-    <Message Text="Staging WOW64 user-mode driver $(NeptuneWowUmdSource) as $(NeptuneWowUmd)" Importance="High" />
-    <Copy SourceFiles="$(NeptuneWowUmdSource)" DestinationFiles="$(NeptuneWowUmd)" SkipUnchangedFiles="true" />
+  <Target Name="CheckUmdDir" BeforeTargets="PrepareForBuild">
+    <Warning Condition="'$(UseUmd)'!='true'" Text="VIOGPU_UMD_DIR is not set: building viogpu3d.sys without assembling a driver package. See README.md." />
+    <Error Condition="'$(UseUmd)'=='true' AND !Exists('%(UmdFile.FullPath)')" Text="VIOGPU_UMD_DIR: %(UmdFile.Identity) is missing." />
+    <Error Condition="'$(UseUmd)'=='true' AND Exists('$(UmdDir)neptune_umd_arm64.dll') AND '$(UseNeptuneArm64x)'!='true'" Text="VIOGPU_UMD_DIR: neptune_umd_arm64.dll is present without neptune_umd_ec.dll." />
+    <Error Condition="'$(UseUmd)'=='true' AND Exists('$(UmdDir)vulkan_virtio_arm64.dll') AND '$(UseVulkanArm64x)'!='true'" Text="VIOGPU_UMD_DIR: vulkan_virtio_arm64.dll is present without vulkan_virtio_ec.dll." />
+    <Error Condition="('$(UseNeptuneArm64x)'=='true' OR '$(UseVulkanArm64x)'=='true') AND '$(Platform)'!='ARM64'" Text="VIOGPU_UMD_DIR holds ARM64X user-mode files, which only an ARM64 driver can package." />
+    <Error Condition="'$(UseNeptuneWow)'=='true' AND '$(Platform)'=='Win32'" Text="VIOGPU_UMD_DIR holds neptune_umd_x86.dll, the WOW64 driver of a 64-bit package; a 32-bit driver packages it as neptune_umd.dll." />
   </Target>
-  <Target Name="UpdateVulkanIcdJsons" BeforeTargets="PrepareForBuild" Condition="'$(MESA_PREFIX)' != '' AND Exists('$(ProjectDir)tools\update_icd_jsons.ps1')">
-    <Message Text="Updating Vulkan ICD JSONs from $(MESA_PREFIX)" Importance="High" />
-    <Exec Command="%25SystemRoot%25\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)tools\update_icd_jsons.ps1&quot; -MesaPrefix &quot;$(MESA_PREFIX)&quot;" />
+  <!-- Revision stamps.
+
+       The INF header names the commits the package was built from, and the
+       product version string of viogpu3d.sys names the driver's own. Both are
+       optional environment variables or MSBuild properties:
+
+         VIOGPU_KMD_REVISION    this repository; read from git when unset
+         VIOGPU_UMD_REVISION    the Mesa fork behind VIOGPU_UMD_DIR
+
+       A value is a bare token such as 0123456789, with a trailing + when the
+       tree had uncommitted changes. Anything missing is stamped "unknown". -->
+  <Target Name="StampRevisions" BeforeTargets="StampInf;ResourceCompile">
+    <PropertyGroup>
+      <KmdRevision>$(VIOGPU_KMD_REVISION)</KmdRevision>
+      <UmdRevision>$(VIOGPU_UMD_REVISION)</UmdRevision>
+    </PropertyGroup>
+    <Exec Condition="'$(KmdRevision)'==''" Command="git -C &quot;$(MSBuildProjectDirectory)&quot; describe --always --abbrev=10 --dirty=+ --exclude=* 2&gt;nul" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="KmdRevision" />
+    </Exec>
+    <PropertyGroup>
+      <KmdRevision Condition="'$(KmdRevision)'==''">unknown</KmdRevision>
+      <UmdRevision Condition="'$(UmdRevision)'==''">unknown</UmdRevision>
+    </PropertyGroup>
+    <Message Text="Revisions: viogpu-wddm $(KmdRevision), mesa $(UmdRevision)" Importance="High" />
+    <ItemGroup>
+      <Substitution Include="INX_REVISION_KMD">
+        <ReplaceWith>$(KmdRevision)</ReplaceWith>
+      </Substitution>
+      <Substitution Include="INX_REVISION_UMD">
+        <ReplaceWith>$(UmdRevision)</ReplaceWith>
+      </Substitution>
+    </ItemGroup>
+    <ItemGroup Condition="'$(KmdRevision)'!='unknown'">
+      <ResourceCompile>
+        <PreprocessorDefinitions>VIOGPU_REVISION=git-$(KmdRevision);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      </ResourceCompile>
+    </ItemGroup>
   </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Import Project="$(MSBuildProjectDirectory)\..\build\Driver.Common.targets" />

@@ -5,6 +5,10 @@
 ;
 ; viogpu3d.inf
 ;
+; Built from:
+;   viogpu-wddm     INX_REVISION_KMD
+;   mesa            INX_REVISION_UMD
+;
 
 [Version]
 Signature="$Windows NT$"
@@ -27,8 +31,6 @@ VioGpu3D_Files.Usermode = 13 ; DriverStore
 [SourceDisksFiles]
 viogpu3d.sys = 1,,f
 neptune_umd.dll = 1,,
-;viogpu_wgl.dll = 1,,
-z.dll = 1,,
 virtio_icd.json = 1,,
 vulkan_virtio.dll = 1,,
 vgpusrv.exe = 1,,
@@ -50,8 +52,6 @@ viogpu3d.sys,,,2
 
 [VioGpu3D_Files.Usermode]
 neptune_umd.dll,,,0
-;viogpu_wgl.dll,,,0
-;z.dll,,,0
 vulkan_virtio.dll,,,0
 virtio_icd.json,,,0
 vgpusrv.exe,,,0

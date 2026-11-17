@@ -96,3 +96,18 @@
 #define VER_LEGALCOPYRIGHT_STR     VENDOR_VIRTIO_COPYRIGHT
 #define VER_COMPANYNAME_STR        VENDOR_VIRTIO_COMPANY
 #define VER_PRODUCTNAME_STR        VENDOR_VIRTIO_PRODUCT
+
+/*
+ * Source revision (optional)
+ *
+ * VIOGPU_REVISION is a bare token such as git-0123456789. It is appended to
+ * the product version string, so that a binary names the commit it was built
+ * from; the file version string stays the plain number.
+ */
+#ifdef VIOGPU_REVISION
+#define VENDOR_VERSION_STR         STRINGIFY(VENDOR_VIRTIO_1) "." STRINGIFY(VENDOR_VIRTIO_2) "." STRINGIFY(VENDOR_VIRTIO_3) "." STRINGIFY(VENDOR_VIRTIO_4)
+#undef  VER_FILEVERSION_STR
+#undef  VER_PRODUCTVERSION_STR
+#define VER_FILEVERSION_STR        VENDOR_VERSION_STR
+#define VER_PRODUCTVERSION_STR     VENDOR_VERSION_STR " (" STRINGIFY(VIOGPU_REVISION) ")"
+#endif
