@@ -49,8 +49,10 @@ goto parse
 :parsed
 if not defined DRIVERS set "DRIVERS=all"
 
+rem The machine architecture, from the registry: PROCESSOR_ARCHITECTURE describes
+rem the calling process, and an x64 process on an ARM64 machine reports AMD64.
 set "HOST_ARCH=%PROCESSOR_ARCHITECTURE%"
-if defined PROCESSOR_ARCHITEW6432 set "HOST_ARCH=%PROCESSOR_ARCHITEW6432%"
+for /f "tokens=3" %%a in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v PROCESSOR_ARCHITECTURE 2^>nul') do set "HOST_ARCH=%%a"
 
 rem The WDK's InfVerif and ApiValidator steps load x86-only binaries that fail
 rem on ARM64 hosts after a successful compile and link, which aborts packaging.
