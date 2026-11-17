@@ -228,6 +228,35 @@ build (step 1):
 The result is a single driver whose UMD loads for both native-arm64 and
 x64-emulated Direct3D applications.
 
+### The Vulkan ICD
+
+The same applies to the Venus Vulkan ICD: an x64-emulated or ARM64EC Vulkan
+application cannot load the native-arm64 `vulkan_virtio.dll`. To ship an ARM64X
+ICD as well:
+
+1. Build Venus in the arm64ec configuration too, by passing
+   `-Dvulkan-drivers=virtio` instead of `-Dvulkan-drivers=` in step 1 above.
+2. Run `src\virtio\vulkan\tools\make-arm64x-vk.bat` from the Mesa fork on the
+   two `vulkan_virtio.dll` builds, writing into the same `<ARM64X-DIR>`:
+
+   ```
+   src\virtio\vulkan\tools\make-arm64x-vk.bat ^
+     <PREFIX>\bin\vulkan_virtio.dll <PREFIX-EC>\bin\vulkan_virtio.dll ^
+     <ARM64X-DIR>
+   ```
+
+   A code-less forwarder does not work for an ICD, because the Vulkan loader
+   resolves the entry points with `GetProcAddress` and a forwarded export is
+   looked up on the default DLL search path, which does not include the
+   DriverStore. So the front `vulkan_virtio.dll` is a small ARM64X loader stub
+   that loads `vulkan_virtio_arm64.dll` or `vulkan_virtio_ec.dll` from its own
+   directory.
+3. With `MESA_ARM64X_PREFIX` pointing at that directory, the ARM64 KMD build
+   packages the stub as `vulkan_virtio.dll` together with the two payloads, and
+   adds them to the catalog and the INF. If
+   `%MESA_ARM64X_PREFIX%\vulkan_virtio_ec.dll` is missing, the build falls back
+   to the native-arm64 `vulkan_virtio.dll` from `MESA_PREFIX`.
+
 ## WOW64 (32-bit applications on a 64-bit guest)
 
 32-bit x86 Direct3D applications run as WOW64 processes on both x64 and ARM64

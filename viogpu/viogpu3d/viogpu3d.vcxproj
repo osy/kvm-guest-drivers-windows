@@ -521,12 +521,19 @@
          renaming in CopyFiles, so the rename has to happen at build time. -->
     <NeptuneWowUmd>$(IntDir)neptune_umd_x86.dll</NeptuneWowUmd>
   </PropertyGroup>
+  <!-- ARM64X Vulkan ICD: the same forwarder scheme as the UMD, so x64 and
+       ARM64EC Vulkan apps load the arm64ec venus build through the EC view. -->
+  <PropertyGroup Condition="Exists('$(MESA_PREFIX)\bin\vulkan_virtio.dll')">
+    <UseVulkanArm64x Condition="'$(Platform)'=='ARM64' AND '$(MESA_ARM64X_PREFIX)'!='' AND Exists('$(MESA_ARM64X_PREFIX)\vulkan_virtio_ec.dll')">true</UseVulkanArm64x>
+    <VulkanIcdSource Condition="'$(UseVulkanArm64x)'=='true'">$(MESA_ARM64X_PREFIX)\vulkan_virtio.dll</VulkanIcdSource>
+    <VulkanIcdSource Condition="'$(UseVulkanArm64x)'!='true'">$(MESA_PREFIX)\bin\vulkan_virtio.dll</VulkanIcdSource>
+  </PropertyGroup>
   <ItemGroup Condition="Exists('$(MESA_PREFIX)\bin\vulkan_virtio.dll')">
     <FilesToPackage Include="$(ProjectDir)icd\virtio_icd.json">
       <PackageRelativeDirectory>
       </PackageRelativeDirectory>
     </FilesToPackage>
-    <FilesToPackage Include="$(MESA_PREFIX)\bin\vulkan_virtio.dll">
+    <FilesToPackage Include="$(VulkanIcdSource)">
       <PackageRelativeDirectory>
       </PackageRelativeDirectory>
     </FilesToPackage>
@@ -545,6 +552,44 @@
       </PackageRelativeDirectory>
     </FilesToPackage>
   </ItemGroup>
+  <ItemGroup Condition="'$(UseVulkanArm64x)'=='true'">
+    <FilesToPackage Include="$(MESA_ARM64X_PREFIX)\vulkan_virtio_arm64.dll">
+      <PackageRelativeDirectory>
+      </PackageRelativeDirectory>
+    </FilesToPackage>
+    <FilesToPackage Include="$(MESA_ARM64X_PREFIX)\vulkan_virtio_ec.dll">
+      <PackageRelativeDirectory>
+      </PackageRelativeDirectory>
+    </FilesToPackage>
+    <PackOne_Files Include="$(MESA_ARM64X_PREFIX)\vulkan_virtio_arm64.dll" />
+    <PackOne_Files Include="$(MESA_ARM64X_PREFIX)\vulkan_virtio_ec.dll" />
+    <Substitution Include="INX_VK_ARM64X_NATIVE_SRCDISK">
+      <ReplaceWith>vulkan_virtio_arm64.dll = 1,,</ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_EC_SRCDISK">
+      <ReplaceWith>vulkan_virtio_ec.dll = 1,,</ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_NATIVE_COPY">
+      <ReplaceWith>vulkan_virtio_arm64.dll,,,0</ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_EC_COPY">
+      <ReplaceWith>vulkan_virtio_ec.dll,,,0</ReplaceWith>
+    </Substitution>
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseVulkanArm64x)'!='true'">
+    <Substitution Include="INX_VK_ARM64X_NATIVE_SRCDISK">
+      <ReplaceWith></ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_EC_SRCDISK">
+      <ReplaceWith></ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_NATIVE_COPY">
+      <ReplaceWith></ReplaceWith>
+    </Substitution>
+    <Substitution Include="INX_VK_ARM64X_EC_COPY">
+      <ReplaceWith></ReplaceWith>
+    </Substitution>
+  </ItemGroup>
   <ItemGroup Condition="'$(UseNeptuneWow)'=='true'">
     <FilesToPackage Include="$(NeptuneWowUmd)">
       <PackageRelativeDirectory>
@@ -557,7 +602,7 @@
     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.exe" />
     <PackOne_Files Include="..\viogpusc\$(OutDir)vgpusrv.pdb" />
     <PackOne_Files Include="$(ProjectDir)icd\virtio_icd.json" />
-    <PackOne_Files Include="$(MESA_PREFIX)\bin\vulkan_virtio.dll" />
+    <PackOne_Files Include="$(VulkanIcdSource)" />
   </ItemGroup>
   <ItemGroup Condition="Exists('$(NeptuneUmdSource)')">
     <PackOne_Files Include="$(NeptuneUmdSource)" />
