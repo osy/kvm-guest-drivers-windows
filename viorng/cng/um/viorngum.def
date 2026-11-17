@@ -1,7 +1,0 @@
-
-LIBRARY "viorngum"
-
-EXPORTS
-
-	GetRngInterface
-

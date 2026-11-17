@@ -1,9 +1,0 @@
-
-LIBRARY "viocrypt-prov"
-
-EXPORTS
-
-	Register
-    Unregister
-
-

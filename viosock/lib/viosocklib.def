@@ -1,8 +1,0 @@
-
-LIBRARY "viosocklib"
-
-EXPORTS
-
-	WSPStartup
-	InstallProtocol
-	DeinstallProtocol
