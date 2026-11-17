@@ -12,7 +12,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "viogpudo", "viogpudo\viogpu
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "VirtIO", "VirtIO", "{62C5FC16-EF77-47C2-8FF2-0123AB31C55E}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "VirtioLib", "..\VirtIO\VirtioLib.vcxproj", "{01D87C47-437A-4A16-8FD9-33FA5C99339E}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "VirtioLib", "VirtIO\VirtioLib.vcxproj", "{01D87C47-437A-4A16-8FD9-33FA5C99339E}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "viogpusc", "viogpusc\viogpusc.vcxproj", "{D572573A-7D73-404D-8DFA-7727278C242E}"
 EndProject

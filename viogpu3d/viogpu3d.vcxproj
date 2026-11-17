@@ -170,7 +170,7 @@
     <DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <Import Project="$(MSBuildProjectDirectory)\viogpu3d.props" />
-  <Import Project="$(MSBuildProjectDirectory)\..\..\build\Driver.Common.props" />
+  <Import Project="$(MSBuildProjectDirectory)\..\build\Driver.Common.props" />
   <!-- viogpu3d's DDInstall uses DIRID 13 (DriverStore), introduced in 10.0.16299.
        Gate the Win10 InfArch on that build number so the [Manufacturer] decoration
        satisfies InfVerif rule 1199 the same way the Win11 config does by default. -->
@@ -269,10 +269,10 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|Win32'">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>..\viogpu3d\trace.h</WppScanConfigurationData>
@@ -287,10 +287,10 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Release|Win32'">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>..\viogpu3d\trace.h</WppScanConfigurationData>
@@ -305,10 +305,10 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|ARM64'">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -318,10 +318,10 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Release|ARM64'">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -331,49 +331,49 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|x64 '">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\objfre_win10_x86\amd64\</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\objfre_win10_x86\amd64\</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Release|x64 '">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\objfre_win11_x86\amd64\</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\objfre_win11_x86\amd64\</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
     </ClCompile>
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
     </ClCompile>
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent />
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Debug|Win32'">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>..\viogpu3d\trace.h</WppScanConfigurationData>
@@ -386,24 +386,24 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
     </ClCompile>
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent />
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Debug|ARM64'">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -413,10 +413,10 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Debug|Win32'">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>..\viogpu3d\trace.h</WppScanConfigurationData>
@@ -430,24 +430,24 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
     </ClCompile>
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent />
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Debug|ARM64'">
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)\displib.lib;virtiolib.lib</AdditionalDependencies>
-      <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -675,7 +675,7 @@
     <Exec Command="%25SystemRoot%25\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)tools\update_icd_jsons.ps1&quot; -MesaPrefix &quot;$(MESA_PREFIX)&quot;" />
   </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <Import Project="$(MSBuildProjectDirectory)\..\..\build\Driver.Common.targets" />
+  <Import Project="$(MSBuildProjectDirectory)\..\build\Driver.Common.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
