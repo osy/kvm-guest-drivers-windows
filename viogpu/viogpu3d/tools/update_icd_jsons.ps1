@@ -32,8 +32,12 @@ foreach ($src in (Get-ChildItem -Path $sourceDir -Filter '*.json')) {
     throw "Missing ICD DLL: $dllPath"
   }
 
+  # The DLL is staged next to the JSON in the DriverStore.  The Vulkan loader
+  # loads a bare file name through the system search path (which does not
+  # include the DriverStore; recent loaders fail it with ERROR_INVALID_PARAMETER),
+  # and resolves a relative path against the manifest's directory.
   $dllName = Split-Path $libraryPath -Leaf
-  $obj.ICD.library_path = $dllName
+  $obj.ICD.library_path = '.\' + $dllName
   $json = $obj | ConvertTo-Json -Depth 10
 
   # Drop Mesa's architecture suffix so the staged name is arch-agnostic
