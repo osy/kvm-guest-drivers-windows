@@ -411,6 +411,8 @@ virtio_gpu_formats ColorFormat(UINT format)
             return VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM;
         case D3DDDIFMT_X8B8G8R8:
             return VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM;
+        case D3DDDIFMT_A2B10G10R10:
+            return VIRTIO_GPU_FORMAT_R10G10B10A2_UNORM;
     }
     DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Unsupported color format %d\n", __FUNCTION__, format));
     return VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
