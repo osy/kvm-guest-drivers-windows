@@ -759,6 +759,27 @@ NTSTATUS VioGpuDevice::OpenAllocation(_In_ CONST DXGKARG_OPENALLOCATION *pOpenAl
             openAllocationInfo->hDeviceSpecificAllocation = NULL;
             continue;
         }
+        // Its host object died with the host state at D3 and was not
+        // re-created (VioGpuAdapter::GetHostGeneration): fail the open, as
+        // for a resource of a removed device, and undo this call's opens.
+        if (allocation->m_HostGeneration != m_pAdapter->GetHostGeneration())
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("<---> %s res_id=%d belongs to a lost host state; open refused\n",
+                      __FUNCTION__,
+                      allocation->GetId()));
+            for (UINT j = 0; j < i; j++)
+            {
+                VioGpuDeviceAllocation *opened =
+                    VioGpuDeviceAllocation::FromHandle(pOpenAllocation->pOpenAllocation[j].hDeviceSpecificAllocation);
+                if (opened != NULL)
+                {
+                    opened->GetAllocation()->Close(opened);
+                }
+                pOpenAllocation->pOpenAllocation[j].hDeviceSpecificAllocation = NULL;
+            }
+            return STATUS_INVALID_PARAMETER;
+        }
         VioGpuDeviceAllocation *devAlloc = allocation->Open(this);
         openAllocationInfo->hDeviceSpecificAllocation = devAlloc->ToHandle();
         // Remember the D3DKMT-handle binding: escapes and later DDIs

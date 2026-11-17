@@ -78,6 +78,15 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // PASSIVE_LEVEL.
     void ReleaseDeferred();
 
+    // D3 -> D0 (VioGpuAdapter::ReplayHostResources): the host forgot this
+    // resource.  Non-blob (RESOURCE_CREATE_3D) allocations only: re-create
+    // it and re-attach the guest pages it had.
+    void ReplayHostResource();
+    // Link in VioGpuAdapter's list of live allocations.
+    LIST_ENTRY m_LiveEntry;
+    // VioGpuAdapter::GetHostGeneration when the host object was (re)created.
+    LONG m_HostGeneration;
+
     inline UINT GetId(void) const
     {
         return m_Id;

@@ -43,6 +43,9 @@ class VioGpuVidPN
     NTSTATUS AcquirePostDisplayOwnership();
     void ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId, DXGK_DISPLAY_INFORMATION *pDisplayInfo);
     void Powerdown();
+    // D3 -> D0: run the flip/vsync thread again and, a few vsyncs later,
+    // ask for an adapter reset (VioGpuAdapter::RequestAdapterReset).
+    void Powerup();
 
     NTSTATUS IsVidPnSourceModeFieldsValid(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode) const;
     NTSTATUS IsVidPnPathFieldsValid(CONST D3DKMDT_VIDPN_PRESENT_PATH *pPath) const;
@@ -325,4 +328,14 @@ class VioGpuVidPN
     // fill fresh objects with 0xCD rather than zeroes.
     PETHREAD m_pFlipThread = NULL;
     BOOL m_shouldFlipStop = false;
+
+    // Start / stop (and wait for) the flip thread: StartDevice and D0 start
+    // it, D3 stops it.  Idempotent.
+    NTSTATUS StartFlipThread();
+    void StopFlipThread();
+
+    // Vsync ticks left before the flip thread asks for the adapter reset
+    // after a power-up (0 = none pending).  The request is not made inside
+    // DxgkDdiSetPowerState: dxgkrnl is still powering the adapter up then.
+    volatile LONG m_resetAfterTicks = 0;
 };

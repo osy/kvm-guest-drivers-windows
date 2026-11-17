@@ -204,17 +204,82 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
         }
     }
 
+    Status = StartFlipThread();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    return Status;
+}
+
+NTSTATUS VioGpuVidPN::StartFlipThread()
+{
+    PAGED_CODE();
+
+    if (m_pFlipThread != NULL)
+    {
+        return STATUS_SUCCESS;
+    }
+
     HANDLE threadHandle = 0;
     m_shouldFlipStop = false;
-    Status = PsCreateSystemThread(&threadHandle, (ACCESS_MASK)0, NULL, (HANDLE)0, NULL, VioGpuVidPN::FlipThread, this);
+    NTSTATUS Status = PsCreateSystemThread(&threadHandle,
+                                           (ACCESS_MASK)0,
+                                           NULL,
+                                           (HANDLE)0,
+                                           NULL,
+                                           VioGpuVidPN::FlipThread,
+                                           this);
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s: PsCreateSystemThread failed with %x\n", __FUNCTION__, Status));
+        return Status;
+    }
 
     ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)(&m_pFlipThread), NULL);
 
     ZwClose(threadHandle);
 
-    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
-
     return Status;
+}
+
+void VioGpuVidPN::StopFlipThread()
+{
+    PAGED_CODE();
+
+    m_shouldFlipStop = true;
+    if (m_pFlipThread == NULL)
+    {
+        return;
+    }
+
+    // The thread checks the flag after every wake; wake it now rather than
+    // at its next vsync tick, and wait until it is gone: what follows (D3:
+    // the virtio device is reset) must not race a scanout it is emitting.
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(1000, -10000);
+    KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+    while (KeWaitForSingleObject(m_pFlipThread, Executive, KernelMode, FALSE, &timeout) == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("---> %s: flip thread has not exited after 1s; still waiting\n", __FUNCTION__));
+        KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+    }
+
+    ObDereferenceObject(m_pFlipThread);
+    m_pFlipThread = NULL;
+}
+
+void VioGpuVidPN::Powerup()
+{
+    PAGED_CODE();
+
+    NTSTATUS Status = StartFlipThread();
+    DbgPrint(TRACE_LEVEL_FATAL, ("<---> %s flip thread restarted (%x)\n", __FUNCTION__, Status));
+    if (NT_SUCCESS(Status))
+    {
+        // ~0.5 s at 60 Hz: past the power-up, before apps do much against
+        // the empty host.
+        InterlockedExchange(&m_resetAfterTicks, 30);
+    }
 }
 
 NTSTATUS VioGpuVidPN::AcquirePostDisplayOwnership()
@@ -287,10 +352,13 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
 
 void VioGpuVidPN::Powerdown()
 {
+    // Stop the flip thread before the device goes away (it used to be only
+    // flagged here and was never started again, see Powerup).
+    StopFlipThread();
+    InterlockedExchange(&m_resetAfterTicks, 0);
     DestroyFrameBufferObj(TRUE);
     m_CurrentModes[0].Flags.FrameBufferIsActive = FALSE;
     m_CurrentModes[0].FrameBuffer.Ptr = NULL;
-    m_shouldFlipStop = true;
 }
 
 NTSTATUS VioGpuVidPN::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitVidPn)
@@ -2800,6 +2868,11 @@ void VioGpuVidPN::FlipThread(void *ctx)
         if (wait == STATUS_WAIT_0)
         {
             vidpn->Flip();
+            // Power-up after D3 (Powerup): the host forgot everything.
+            if (vidpn->m_resetAfterTicks > 0 && InterlockedDecrement(&vidpn->m_resetAfterTicks) == 0)
+            {
+                vidpn->m_pAdapter->RequestAdapterReset();
+            }
         }
         else
         {

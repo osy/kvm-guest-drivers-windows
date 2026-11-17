@@ -312,6 +312,98 @@ UINT VioGpuAdapter::ResetFenceStateFromTimeout(void)
     return ctx.FenceId;
 }
 
+// Interrupt lock held (DxgkCbNotifyInterrupt may only be called from the ISR
+// or a SynchronizeExecution routine).
+static BOOLEAN RequestAdapterResetSyncRoutine(PVOID ctx_void)
+{
+    DXGKRNL_INTERFACE *dxgk = (DXGKRNL_INTERFACE *)ctx_void;
+
+    // A page fault that "put the GPU in a state that requires a full adapter
+    // reset" is the documented way for a driver to ask for an adapter-wide
+    // TDR; no packet is to blame, so the fence is marked invalid.
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
+    interrupt.InterruptType = DXGK_INTERRUPT_DMA_PAGE_FAULTED;
+    interrupt.DmaPageFaulted.FaultedFenceId = 0;
+    interrupt.DmaPageFaulted.PageFaultFlags = (DXGK_PAGE_FAULT_FLAGS)(DXGK_PAGE_FAULT_FENCE_INVALID |
+                                                                      DXGK_PAGE_FAULT_ADAPTER_RESET_REQUIRED);
+    interrupt.DmaPageFaulted.FaultedVirtualAddress = 0;
+    interrupt.DmaPageFaulted.NodeOrdinal = 0;
+    interrupt.DmaPageFaulted.EngineOrdinal = 0;
+    interrupt.DmaPageFaulted.FaultErrorCode.IsDeviceSpecificCode = 1;
+    interrupt.DmaPageFaulted.FaultErrorCode.DeviceSpecificCode = 0xD3D0; // "host state lost at D3 -> D0"
+    dxgk->DxgkCbNotifyInterrupt(dxgk->DeviceHandle, &interrupt);
+    dxgk->DxgkCbQueueDpc(dxgk->DeviceHandle);
+    return TRUE;
+}
+
+void VioGpuAdapter::RequestAdapterReset(void)
+{
+    DbgPrint(TRACE_LEVEL_FATAL, ("<---> %s host state was lost at D3: requesting an adapter reset\n", __FUNCTION__));
+    BOOLEAN bRet;
+    m_DxgkInterface.DxgkCbSynchronizeExecution(m_DxgkInterface.DeviceHandle,
+                                               RequestAdapterResetSyncRoutine,
+                                               &m_DxgkInterface,
+                                               0,
+                                               &bRet);
+}
+
+void VioGpuAdapter::TrackAllocation(VioGpuAllocation *allocation, BOOLEAN live)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&m_LiveAllocationsLock, &irql);
+    if (live)
+    {
+        InsertTailList(&m_LiveAllocations, &allocation->m_LiveEntry);
+    }
+    else
+    {
+        RemoveEntryList(&allocation->m_LiveEntry);
+    }
+    KeReleaseSpinLock(&m_LiveAllocationsLock, irql);
+}
+
+void VioGpuAdapter::ReplayHostResources(void)
+{
+    // Take a reference on every KMD-described (non-blob) allocation under the
+    // lock, replay them at PASSIVE_LEVEL without it.  The GPU is idle at D0,
+    // so the population does not change underneath; the bound is a guard.
+    ULONG cap = 0, n = 0;
+    KIRQL irql;
+    KeAcquireSpinLock(&m_LiveAllocationsLock, &irql);
+    for (LIST_ENTRY *e = m_LiveAllocations.Flink; e != &m_LiveAllocations; e = e->Flink)
+    {
+        cap++;
+    }
+    KeReleaseSpinLock(&m_LiveAllocationsLock, irql);
+    if (cap == 0)
+    {
+        return;
+    }
+    VioGpuAllocation **list = new (NonPagedPoolNx) VioGpuAllocation *[cap];
+    if (list == NULL)
+    {
+        return;
+    }
+    KeAcquireSpinLock(&m_LiveAllocationsLock, &irql);
+    for (LIST_ENTRY *e = m_LiveAllocations.Flink; e != &m_LiveAllocations && n < cap; e = e->Flink)
+    {
+        VioGpuAllocation *a = CONTAINING_RECORD(e, VioGpuAllocation, m_LiveEntry);
+        if (!a->IsBlob() && a->TryAddRef())
+        {
+            list[n++] = a;
+        }
+    }
+    KeReleaseSpinLock(&m_LiveAllocationsLock, irql);
+
+    for (ULONG i = 0; i < n; i++)
+    {
+        list[i]->ReplayHostResource();
+        list[i]->Release();
+    }
+    delete[] list;
+    DbgPrint(TRACE_LEVEL_FATAL, ("<---> %s re-created %u of %u allocations on the host\n", __FUNCTION__, n, cap));
+}
+
 BOOLEAN VioGpuAdapter::ReportDmaCompleted(UINT fenceId, UINT node, UINT engine)
 {
     FENCE_REPORT_CONTEXT ctx = {};
@@ -469,6 +561,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     KeInitializeSpinLock(&m_PendingCreateLock);
     InitializeListHead(&m_PendingCreateList);
     InitializeListHead(&m_KmtMapList);
+    InitializeListHead(&m_LiveAllocations);
+    KeInitializeSpinLock(&m_LiveAllocationsLock);
     InitializeListHead(&m_CookieMapList);
     KeInitializeSpinLock(&m_GateLock);
     InitializeListHead(&m_GateList);
@@ -792,6 +886,18 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
                     {
                         VioGpuAdapterInit();
                     }
+                    // Back from D3 (sleep, hibernation): the D3 teardown
+                    // stopped the flip/vsync thread and reset the device.
+                    // Run the thread again (no vsync = no flip ever
+                    // completes, the screen stays dark) and have dxgkrnl
+                    // re-create everything the host forgot.
+                    if (m_HostStateLost && IsHardwareInit())
+                    {
+                        m_HostStateLost = FALSE;
+                        InterlockedIncrement(&m_HostGeneration);
+                        ReplayHostResources();
+                        vidpn.Powerup();
+                    }
                 }
                 break;
             case PowerDeviceD1:
@@ -809,6 +915,7 @@ NTSTATUS VioGpuAdapter::SetPowerState(_In_ ULONG HardwareUid,
                 {
                     vidpn.Powerdown();
                     VioGpuAdapterClose();
+                    m_HostStateLost = TRUE;
                 }
                 break;
         }
@@ -3115,10 +3222,14 @@ void VioGpuAdapter::VioGpuAdapterClose()
                 return TRUE;
             },
             this, 0, &syncRet);
-        virtio_device_reset(&m_VioDev);
-        virtio_delete_queues(&m_VioDev);
+        // Close the queue objects first (under their locks): a submitter
+        // still running (commander, cursor, a late scanout) must find no
+        // virtqueue rather than add buffers to vring memory that
+        // virtio_delete_queues is about to free.
         ctrlQueue.Close();
         m_CursorQueue.Close();
+        virtio_device_reset(&m_VioDev);
+        virtio_delete_queues(&m_VioDev);
         virtio_device_shutdown(&m_VioDev);
         vidpn.Powerdown();
     }
