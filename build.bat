@@ -90,6 +90,11 @@ exit /b 0
 
 rem %1 driver, %2 OS, %3 platform
 :build
+if /I "%~2"=="Win11" if /I "%~3"=="x86" (
+  echo.
+  echo ==== Skipping %~1 ^| Win11 ^| x86, Windows 11 has no x86 version ====
+  exit /b 0
+)
 set "TARGET=%~1"
 if /I not "%ACTION%"=="Build" set "TARGET=%~1:%ACTION%"
 if /I "%~1"=="all" set "TARGET=%ACTION%"

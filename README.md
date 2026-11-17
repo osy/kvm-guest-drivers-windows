@@ -60,6 +60,8 @@ next to `build.bat`.
 
 The installable package goes to `Install\<os>\<arch>\`. A Debug build goes to
 `Install_Debug\<os>\<arch>\` instead. `<arch>` is `x86`, `amd64` or `ARM64`.
+Windows 11 has no x86 version, so x86 is built for Win10 only, and
+`build.bat` skips any Win11 x86 combination.
 
 On an ARM64 build host, `build.bat` turns off the WDK's InfVerif and
 ApiValidator steps. The WDK runs x86-only binaries for both, and on ARM64 they
@@ -174,10 +176,6 @@ first regenerates the Vulkan ICD manifest for that prefix
 (`viogpu3d\tools\update_icd_jsons.ps1`, written to `viogpu3d\icd\`). It then
 packages `neptune_umd.dll`, `vulkan_virtio.dll` and `virtio_icd.json` into the
 driver.
-
-`viogpu.sln` maps the Win11 ARM64 and x86 configurations of `viogpu3d` to
-its Win10 ones. Those builds therefore produce `Install\Win10\<arch>\`, which
-is the package to install on Windows 11 as well.
 
 The package in `Install\<os>\<arch>\` contains `viogpu3d.sys`, `viogpu3d.inf`,
 `viogpu3d.cat`, `vgpusrv.exe`, `viogpuap.exe`, and the user-mode driver files.
